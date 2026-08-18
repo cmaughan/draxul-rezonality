@@ -1,0 +1,16 @@
+glslangValidator runtime tools
+================================
+
+The platform glslangValidator binaries in tools/ are preserved from the
+original VkLive project so Rezonality retains its established live GLSL to
+SPIR-V compiler behavior. They originate from KhronosGroup/glslang and are
+distributed under its BSD-3-Clause license:
+
+https://github.com/KhronosGroup/glslang
+https://github.com/KhronosGroup/glslang/blob/main/LICENSE.txt
+
+Windows SHA-256:
+860191CE525FB8D7A17F68930C583E3B0639E4413829E1C9286CA6F0ED263707
+
+macOS SHA-256:
+2EA180EFDCADB9F63369F02C026D82ACE2EADB49749257B38CAF9DAD47E6EFDE

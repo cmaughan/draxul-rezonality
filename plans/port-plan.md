@@ -1,6 +1,6 @@
 # Rezonality Draxul plugin port plan
 
-Status: planned  
+Status: slice 1 implemented
 Priority: failure-tolerant live editing first  
 Target plugin: `dev.draxul.rezonality`
 
@@ -207,6 +207,8 @@ Acceptance:
 
 ### Slice 1 - Fault-tolerant single-pass live shader
 
+Status: implemented in plugin version 0.2.0.
+
 This is the first renderer slice, not a throwaway triangle.
 
 Deliver:
@@ -217,7 +219,9 @@ Deliver:
 - implement one per-pane reload coordinator and dependency fingerprint watcher;
 - compile candidate GLSL to SPIR-V off the UI thread;
 - create Vulkan or translated Metal pipeline state on the render thread;
-- render a full-pane `screen_rect` through a plugin-owned final target;
+- render a full-pane `screen_rect` through the borrowed continuation target,
+  constrained to the pane viewport/scissor; plugin-owned offscreen targets
+  arrive with the named-surface/multipass slice where they are required;
 - preserve the last valid pipeline after syntax, include, or link errors;
 - expose `building`, `live`, and concise `error` presentation status;
 - make `rezonality_reload` bypass the debounce and rebuild immediately.
@@ -234,10 +238,19 @@ Tests:
 
 Manual check:
 
-1. Open Rezonality beside a terminal editing the fixture shader.
-2. Save a valid color change and watch it update automatically.
-3. Break the shader and confirm the old image remains.
-4. Repair it and confirm rendering catches up without restarting Draxul.
+1. Create Rezonality in a server-backed Session with `draxul tab create` or a
+   plugin split; do not use the standalone `draxul --plugin` launch when the
+   check needs terminal/editor panes.
+2. Open Rezonality beside a terminal editing the fixture shader.
+3. Save a valid color change and watch it update automatically.
+4. Break the shader and confirm the old image remains.
+5. Repair it and confirm rendering catches up without restarting Draxul.
+
+Implementation note: the worker owns file fingerprinting, scene discovery,
+process execution, SPIR-V compilation, and candidate publication. Vulkan/Metal
+pipeline preparation and atomic generation swaps occur only in render
+callbacks. Replaced GPU generations retain a bit for every Draxul frame slot
+that used them and are destroyed only as those slots are reused.
 
 ### Slice 2 - Scenegraph surfaces and multipass rendering
 

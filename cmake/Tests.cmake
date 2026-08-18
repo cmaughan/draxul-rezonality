@@ -5,8 +5,17 @@ file(GLOB _rezonality_test_sources CONFIGURE_DEPENDS
 draxul_add_test_target(
     draxul-test-rezonality rezonality 1
     ${_rezonality_test_sources}
+    "${_rezonality_root}/src/live_project.cpp"
     "${_rezonality_root}/src/rezonality_plugin.cpp")
 target_link_libraries(draxul-test-rezonality PRIVATE
     Draxul::PluginSDK
-    Draxul::PluginSupport::Adapter)
-
+    Draxul::PluginSupport::Adapter
+    nlohmann_json::nlohmann_json)
+if(APPLE)
+    target_link_libraries(draxul-test-rezonality PRIVATE
+        spirv-cross-msl
+        "-framework Metal"
+        "-framework Foundation")
+else()
+    target_link_libraries(draxul-test-rezonality PRIVATE Vulkan::Vulkan)
+endif()

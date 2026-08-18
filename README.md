@@ -6,24 +6,51 @@ viewer for shader and scene editing. It will render inside a Draxul pane using
 Vulkan on Windows and Metal on macOS while projects are edited from any other
 terminal or editor pane.
 
-The repository currently contains the buildable dynamic-plugin scaffold and
-the researched port plan. The live renderer is the next functional slice.
+The first live-renderer slice is implemented. Rezonality loads the original
+VkLive `simple` project, compiles its GLSL off the UI thread with the preserved
+`glslangValidator` tool, and renders its `screen_rect` into the Draxul pane on
+Vulkan or Metal. Saving a shader triggers a debounced rebuild. A bad edit is
+reported in the pane status while the last successfully prepared GPU pipeline
+continues rendering; repairing the file advances to the next generation
+without restarting Draxul.
 
 ```text
 draxul tab create --space <space-id> --name Rezonality \
   --plugin dev.draxul.rezonality --json
 ```
 
-When project loading lands, instances will accept a bounded JSON configuration
-like this:
+Use that server mutation form for live editing: it creates a shared plugin tab
+inside a normal Draxul Session, where terminal/editor panes remain available.
+Launching `draxul --plugin dev.draxul.rezonality` directly creates an explicit
+standalone product window; that mode is useful for focused viewing and render
+tests, but intentionally has no server-owned shell panes to split into.
+
+Instances accept a bounded JSON configuration like this:
 
 ```json
 {
   "project_path": "D:/art/my-shader-project",
   "scenegraph": "default.scenegraph",
-  "auto_reload": true
+  "auto_reload": true,
+  "compile_debounce_ms": 150
 }
 ```
+
+Omit `project_path` to open the bundled `examples/simple` project. Use the
+pane action **Reload Rezonality Project** to bypass the debounce and force a
+rebuild. The status progresses through `building`, `ready`, and `live`; errors
+include the attempted generation and source location.
+
+Typical live-edit check:
+
+```text
+draxul tab create --space <space-id> --name Rezonality \
+  --plugin dev.draxul.rezonality \
+  --plugin-config '{"project_path":"D:/art/my-shader-project"}' --json
+```
+
+Edit `screen.frag` from another Draxul terminal and save it. No embedded editor
+or application menu is involved.
 
 ## Product boundary
 
