@@ -23,11 +23,17 @@ if(COMMAND draxul_apply_sanitizers)
     draxul_apply_msvc_parallel_pdb_fix(draxul-rezonality-plugin)
 endif()
 
+file(GLOB _rezonality_test_sources CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/rezonality_*_tests.cpp")
+
 draxul_register_bundled_plugin(
     ID dev.draxul.rezonality
     TARGET draxul-rezonality-plugin
     MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/plugin.toml"
     FEATURE DRAXUL_ENABLE_REZONALITY
     DEPENDENCY_MODE STRICT
-    PRODUCT_TARGETS draxul-rezonality-plugin)
+    PRODUCT_TARGETS draxul-rezonality-plugin
+    TEST_SOURCES ${_rezonality_test_sources}
+    TEST_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Tests.cmake")
+
 
