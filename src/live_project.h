@@ -19,18 +19,58 @@ struct ProjectOptions
     std::filesystem::path project_path;
     std::filesystem::path scenegraph = "default.scenegraph";
     bool auto_reload = true;
+    bool paused = false;
     uint32_t compile_debounce_ms = 150;
 };
 
 struct ShaderBuild
 {
+    enum class SurfaceFormat
+    {
+        Color8,
+        Color16Float,
+        Color32Float,
+        Depth32,
+    };
+
+    struct Surface
+    {
+        std::string name;
+        std::filesystem::path path;
+        SurfaceFormat format = SurfaceFormat::Color8;
+        float scale_x = 1.0f;
+        float scale_y = 1.0f;
+        float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        bool target = false;
+        uint32_t image_width = 0;
+        uint32_t image_height = 0;
+        std::vector<uint8_t> image_pixels;
+    };
+
+    struct Sampler
+    {
+        std::string surface;
+        bool previous_frame = false;
+    };
+
+    struct Pass
+    {
+        std::string name;
+        std::filesystem::path vertex_path;
+        std::filesystem::path fragment_path;
+        std::vector<uint32_t> vertex_spirv;
+        std::vector<uint32_t> fragment_spirv;
+        std::vector<std::string> targets;
+        std::vector<Sampler> samplers;
+        float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        bool has_clear = false;
+    };
+
     uint64_t generation = 0;
     std::filesystem::path project_path;
     std::filesystem::path scenegraph_path;
-    std::filesystem::path vertex_path;
-    std::filesystem::path fragment_path;
-    std::vector<uint32_t> vertex_spirv;
-    std::vector<uint32_t> fragment_spirv;
+    std::vector<Surface> surfaces;
+    std::vector<Pass> passes;
 };
 
 struct BuildResult

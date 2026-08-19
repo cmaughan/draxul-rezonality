@@ -1,4 +1,5 @@
 #include "live_project.h"
+#include "image_loader.h"
 
 #include <nlohmann/json.hpp>
 
@@ -302,8 +303,8 @@ ProcessResult run_process(const std::vector<fs::path>& arguments)
 struct SceneDescription
 {
     fs::path scenegraph;
-    fs::path vertex;
-    fs::path fragment;
+    std::vector<ShaderBuild::Surface> surfaces;
+    std::vector<ShaderBuild::Pass> passes;
 };
 
 std::optional<std::string> first_match(const std::string& source,
@@ -313,6 +314,83 @@ std::optional<std::string> first_match(const std::string& source,
     if (!std::regex_search(source, match, expression) || match.size() < 2)
         return std::nullopt;
     return match[1].str();
+}
+
+std::string without_comments(std::string source)
+{
+    static const std::regex comments(R"(//[^\r\n]*)");
+    return std::regex_replace(source, comments, "");
+}
+
+size_t matching_brace(std::string_view source, size_t open)
+{
+    size_t depth = 0;
+    for (size_t index = open; index < source.size(); ++index)
+    {
+        if (source[index] == '{')
+            ++depth;
+        else if (source[index] == '}' && --depth == 0)
+            return index;
+    }
+    return std::string_view::npos;
+}
+
+std::vector<std::string> parse_list(
+    const std::string& body, std::string_view key)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(([^)]*)\))");
+    const auto matched = first_match(body, expression);
+    if (!matched)
+        return {};
+    std::vector<std::string> values;
+    std::istringstream stream(*matched);
+    std::string value;
+    while (std::getline(stream, value, ','))
+    {
+        value = trim(value);
+        if (!value.empty())
+            values.push_back(std::move(value));
+    }
+    return values;
+}
+
+void parse_vec4(const std::string& body, std::string_view key,
+    float (&value)[4], bool* found = nullptr)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+    {
+        if (found)
+            *found = false;
+        return;
+    }
+    for (size_t index = 0; index < 4; ++index)
+        value[index] = std::stof(match[index + 1].str());
+    if (found)
+        *found = true;
+}
+
+std::vector<std::pair<std::string, std::string>> named_blocks(
+    const std::string& source, std::string_view kind)
+{
+    std::vector<std::pair<std::string, std::string>> blocks;
+    const std::regex header("(^|[\\r\\n])\\s*" + std::string(kind)
+        + R"(\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{)");
+    for (auto begin = std::sregex_iterator(source.begin(), source.end(), header);
+         begin != std::sregex_iterator(); ++begin)
+    {
+        const auto& match = *begin;
+        const size_t open = static_cast<size_t>(match.position() + match.length() - 1);
+        const size_t close = matching_brace(source, open);
+        if (close == std::string::npos)
+            continue;
+        blocks.emplace_back(match[2].str(),
+            source.substr(open + 1, close - open - 1));
+    }
+    return blocks;
 }
 
 std::optional<SceneDescription> load_scene(const ProjectOptions& options,
@@ -329,26 +407,93 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         return std::nullopt;
     }
 
-    // This is the single-pass subset of VkLive's existing scene grammar. The
-    // complete MPC grammar is ported in the following multipass slice; keeping
-    // the spelling here identical lets real projects move across unchanged.
+    const std::string parsed = without_comments(*source);
     static const std::regex vertex_expression(
         R"(\bvs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
     static const std::regex fragment_expression(
         R"(\bfs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
-    const auto vertex = first_match(*source, vertex_expression);
-    const auto fragment = first_match(*source, fragment_expression);
-    if (!vertex || !fragment)
-    {
-        error = "Single-pass scenegraph must declare both vs: and fs:";
-        diagnostic_line = 1;
-        return std::nullopt;
-    }
 
     SceneDescription description;
     description.scenegraph = scenegraph;
-    description.vertex = options.project_path / fs::u8path(*vertex);
-    description.fragment = options.project_path / fs::u8path(*fragment);
+    for (const auto& [name, body] : named_blocks(parsed, "surface"))
+    {
+        ShaderBuild::Surface surface;
+        surface.name = name;
+        if (const auto path = first_match(body,
+                std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
+            surface.path = options.project_path / fs::u8path(*path);
+        if (const auto format = first_match(body,
+                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))")))
+        {
+            if (*format == "rgba16f")
+                surface.format = ShaderBuild::SurfaceFormat::Color16Float;
+            else if (*format == "rgba32f")
+                surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+            else if (format->find("depth") != std::string::npos)
+                surface.format = ShaderBuild::SurfaceFormat::Depth32;
+        }
+        const std::regex scale_expression(
+            R"(\bscale\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+))");
+        std::smatch scale;
+        if (std::regex_search(body, scale, scale_expression))
+        {
+            surface.scale_x = std::stof(scale[1].str());
+            surface.scale_y = std::stof(scale[2].str());
+        }
+        parse_vec4(body, "clear", surface.clear);
+        description.surfaces.push_back(std::move(surface));
+    }
+
+    for (const auto& [name, body] : named_blocks(parsed, "pass"))
+    {
+        const auto vertex = first_match(body, vertex_expression);
+        const auto fragment = first_match(body, fragment_expression);
+        if (!vertex || !fragment)
+        {
+            error = "Pass '" + name + "' must declare both vs: and fs:";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        if (const auto geometry = first_match(body,
+                std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))"));
+            geometry && *geometry != "screen_rect")
+        {
+            error = "Pass '" + name + "' uses model geometry; models arrive in slice 3";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        ShaderBuild::Pass pass;
+        pass.name = name;
+        pass.vertex_path = options.project_path / fs::u8path(*vertex);
+        pass.fragment_path = options.project_path / fs::u8path(*fragment);
+        pass.targets = parse_list(body, "targets");
+        if (pass.targets.empty())
+            pass.targets.push_back("default_color");
+        for (std::string sampler : parse_list(body, "samplers"))
+        {
+            ShaderBuild::Sampler parsed_sampler;
+            if (!sampler.empty() && sampler.front() == '!')
+            {
+                parsed_sampler.previous_frame = true;
+                sampler.erase(sampler.begin());
+            }
+            parsed_sampler.surface = std::move(sampler);
+            pass.samplers.push_back(std::move(parsed_sampler));
+        }
+        parse_vec4(body, "clear", pass.clear, &pass.has_clear);
+        description.passes.push_back(std::move(pass));
+    }
+    if (description.passes.empty())
+    {
+        error = "Scenegraph must declare at least one enabled pass";
+        diagnostic_line = 1;
+        return std::nullopt;
+    }
+    for (auto& pass : description.passes)
+        for (const auto& target : pass.targets)
+            if (target != "default_color" && target != "default_depth")
+                for (auto& surface : description.surfaces)
+                    surface.target = surface.target || surface.name == target;
     return description;
 }
 
@@ -472,6 +617,7 @@ std::optional<ProjectOptions> parse_project_options(
             scenegraph_explicit = true;
         }
         options.auto_reload = config.value("auto_reload", true);
+        options.paused = config.value("paused", false);
         options.compile_debounce_ms = std::clamp(
             config.value("compile_debounce_ms", 150u), 25u, 5000u);
     }
@@ -565,7 +711,9 @@ uint64_t LiveProject::project_fingerprint() const
             const auto extension = entry.path().extension().string();
             if (extension == ".toml" || extension == ".scenegraph"
                 || extension == ".vert" || extension == ".frag"
-                || extension == ".glsl" || extension == ".h")
+                || extension == ".glsl" || extension == ".h"
+                || extension == ".png" || extension == ".jpg"
+                || extension == ".jpeg" || extension == ".bmp")
                 files.push_back(entry.path());
         }
     }
@@ -619,26 +767,41 @@ BuildResult LiveProject::build(uint64_t generation) const
     candidate.generation = generation;
     candidate.project_path = options_.project_path;
     candidate.scenegraph_path = scene->scenegraph;
-    candidate.vertex_path = scene->vertex;
-    candidate.fragment_path = scene->fragment;
-    const fs::path vertex_output = output_directory
-        / ("vertex-" + std::to_string(generation) + ".spv");
-    const fs::path fragment_output = output_directory
-        / ("fragment-" + std::to_string(generation) + ".spv");
-    if (!compile_shader(compiler, options_.project_path,
-            candidate.vertex_path, vertex_output, candidate.vertex_spirv,
-            result.diagnostic_path, result.diagnostic_line, result.error)
-        || !compile_shader(compiler, options_.project_path,
-            candidate.fragment_path, fragment_output,
-            candidate.fragment_spirv, result.diagnostic_path,
-            result.diagnostic_line, result.error))
+    candidate.surfaces = scene->surfaces;
+    candidate.passes = scene->passes;
+    for (auto& surface : candidate.surfaces)
     {
+        if (!surface.path.empty()
+            && !load_rgba8_image(surface.path, surface.image_width,
+                surface.image_height, surface.image_pixels, result.error))
+        {
+            result.diagnostic_path = surface.path;
+            return result;
+        }
+    }
+    for (size_t index = 0; index < candidate.passes.size(); ++index)
+    {
+        auto& pass = candidate.passes[index];
+        const std::string stem = std::to_string(generation) + "-"
+            + std::to_string(index);
+        const fs::path vertex_output
+            = output_directory / ("vertex-" + stem + ".spv");
+        const fs::path fragment_output
+            = output_directory / ("fragment-" + stem + ".spv");
+        if (!compile_shader(compiler, options_.project_path,
+                pass.vertex_path, vertex_output, pass.vertex_spirv,
+                result.diagnostic_path, result.diagnostic_line, result.error)
+            || !compile_shader(compiler, options_.project_path,
+                pass.fragment_path, fragment_output, pass.fragment_spirv,
+                result.diagnostic_path, result.diagnostic_line, result.error))
+        {
+            fs::remove(vertex_output, ec);
+            fs::remove(fragment_output, ec);
+            return result;
+        }
         fs::remove(vertex_output, ec);
         fs::remove(fragment_output, ec);
-        return result;
     }
-    fs::remove(vertex_output, ec);
-    fs::remove(fragment_output, ec);
     result.build = std::move(candidate);
     return result;
 }

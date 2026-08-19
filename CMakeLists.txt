@@ -39,6 +39,8 @@ elseif(NOT TARGET Vulkan::Vulkan)
 endif()
 
 set(_rezonality_sources
+    src/image_loader.cpp
+    src/image_loader.h
     src/live_project.cpp
     src/live_project.h
     src/rezonality_plugin.cpp)
@@ -48,6 +50,7 @@ target_link_libraries(draxul-rezonality-plugin PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
     nlohmann_json::nlohmann_json)
+target_include_directories(draxul-rezonality-plugin PRIVATE ${stb_SOURCE_DIR})
 if(APPLE)
     set_source_files_properties(src/rezonality_plugin.cpp
         PROPERTIES LANGUAGE OBJCXX)
@@ -56,7 +59,10 @@ if(APPLE)
         "-framework Metal"
         "-framework Foundation")
 else()
-    target_link_libraries(draxul-rezonality-plugin PRIVATE Vulkan::Vulkan)
+    target_link_libraries(draxul-rezonality-plugin PRIVATE
+        Vulkan::Vulkan
+        Draxul::PluginSupport::VulkanResources
+        GPUOpen::VulkanMemoryAllocator)
 endif()
 set_target_properties(draxul-rezonality-plugin PROPERTIES
     PREFIX ""

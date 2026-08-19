@@ -1,0 +1,12 @@
+surface: Color { scale: (1, 1, 1) format: default_color }
+surface: Depth { scale: (1, 1, 1) format: default_depth }
+pass: Background {
+    targets: (Color, Depth)
+    clear: (0.02, 0.03, 0.08, 1.0)
+    geometry: background { path: screen_rect vs: screen.vert fs: screen.frag }
+}
+pass: Composite {
+    samplers: (Color)
+    targets: (default_color, default_depth)
+    geometry: copy { path: screen_rect vs: copy.vert fs: copy.frag }
+}

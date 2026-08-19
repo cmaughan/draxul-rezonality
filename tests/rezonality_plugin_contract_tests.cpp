@@ -150,6 +150,18 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     CHECK(tick.ok == 1);
     CHECK(tick.next_tick_delay_ns == DRAXUL_PLUGIN_NO_DEADLINE);
 
+    DraxulPluginInputEventV2 pause{};
+    pause.struct_size = sizeof(pause);
+    pause.kind = DRAXUL_PLUGIN_INPUT_KEY;
+    pause.logical_key = 32;
+    pause.pressed = 1;
+    CHECK(api->handle_input(instance, &pause) == 1);
+    CHECK(presentation_status(instance, presentation).find("paused")
+        != std::string::npos);
+    CHECK(api->handle_input(instance, &pause) == 1);
+    CHECK(presentation_status(instance, presentation).find("paused")
+        == std::string::npos);
+
     api->quiesce_instance(instance);
     CHECK(api->tick(instance, &tick_info).ok == 0);
     api->destroy_instance(instance);
@@ -245,4 +257,56 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
     api->quiesce_instance(instance);
     api->destroy_instance(instance);
     fs::remove_all(fixture, ec);
+}
+
+TEST_CASE("Rezonality compiles every staged multipass example",
+    "[rezonality][integration][multipass]")
+{
+    const auto* api = draxul_plugin_query_v2(DRAXUL_PLUGIN_ABI_VERSION);
+    REQUIRE(api != nullptr);
+    const std::string directory = plugin_root().string();
+    for (const std::string_view example : { "default", "blend_waves",
+             "deferred_shading", "protoplanetary_disc" })
+    {
+        DYNAMIC_SECTION(example)
+        {
+            HostState host_state;
+            DraxulPluginHostApiV2 host{};
+            host.struct_size = sizeof(host);
+            host.abi_version = DRAXUL_PLUGIN_ABI_VERSION;
+            host.host_context = &host_state;
+            host.request_redraw = &request_redraw;
+            host.request_tick = &request_tick;
+            host.notify_presentation_changed = &request_noop;
+            host.log = &log_noop;
+            host.query_service = &query_service_noop;
+            const std::string config = nlohmann::json{
+                { "project_path",
+                    (plugin_root() / "examples" / example).string() },
+                { "auto_reload", false },
+                { "compile_debounce_ms", 25 },
+            }.dump();
+            DraxulPluginCreateInfoV2 create_info{};
+            create_info.struct_size = sizeof(create_info);
+            create_info.host = &host;
+            create_info.plugin_id = api->plugin_id;
+            create_info.plugin_directory_utf8 = directory.c_str();
+            create_info.config_json = config.data();
+            create_info.config_json_length = config.size();
+            create_info.initial_viewport = {
+                sizeof(DraxulPluginViewportV2), 0, 0,
+                640, 480, 1.0f, 96.0f };
+            void* instance = api->create_instance(&create_info);
+            REQUIRE(instance != nullptr);
+            DraxulPluginPresentationExtensionV2 presentation{};
+            REQUIRE(api->query_extension(instance,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                &presentation, sizeof(presentation)) != 0);
+            CHECK(wait_for_status(*api, instance, presentation, "ready g1"));
+            api->quiesce_instance(instance);
+            api->destroy_instance(instance);
+        }
+    }
 }

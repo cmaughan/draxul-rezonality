@@ -1,6 +1,6 @@
 # Rezonality Draxul plugin port plan
 
-Status: slice 1 implemented
+Status: slice 2 implemented on Windows; Metal implementation awaiting macOS validation
 Priority: failure-tolerant live editing first  
 Target plugin: `dev.draxul.rezonality`
 
@@ -238,9 +238,10 @@ Tests:
 
 Manual check:
 
-1. Create Rezonality in a server-backed Session with `draxul tab create` or a
-   plugin split; do not use the standalone `draxul --plugin` launch when the
-   check needs terminal/editor panes.
+1. Launch Rezonality directly with `draxul --plugin`, create it with
+   `draxul tab create`, or use a plugin split. All normal launch forms use the
+   server-backed Session and keep terminal/editor panes available; only the
+   internal render-test harness is isolated.
 2. Open Rezonality beside a terminal editing the fixture shader.
 3. Save a valid color change and watch it update automatically.
 4. Break the shader and confirm the old image remains.
@@ -253,6 +254,11 @@ callbacks. Replaced GPU generations retain a bit for every Draxul frame slot
 that used them and are destroyed only as those slots are reused.
 
 ### Slice 2 - Scenegraph surfaces and multipass rendering
+
+Status: implemented in plugin version 0.3.0. Windows Vulkan snapshots cover
+all four projects. The paired Metal path is implemented, but the macOS build,
+snapshot blessing, and interactive resize check remain a platform validation
+gate rather than being claimed from Windows.
 
 Deliver:
 
