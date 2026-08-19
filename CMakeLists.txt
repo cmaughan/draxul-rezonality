@@ -47,7 +47,11 @@ if(APPLE)
     include(FetchContent)
     set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
-    set(SPIRV_CROSS_ENABLE_GLSL OFF CACHE BOOL "" FORCE)
+    # SPIRV-Cross's MSL backend shares compiler support with its GLSL target,
+    # so GLSL must be enabled even though Rezonality only emits MSL on macOS.
+    # This does not add a Vulkan SDK or runtime dependency.
+    set(SPIRV_CROSS_ENABLE_GLSL ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_MSL ON CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_HLSL OFF CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
