@@ -1,5 +1,8 @@
 #pragma once
 
+#include "camera.h"
+#include "model_loader.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -45,6 +48,7 @@ struct ShaderBuild
         uint32_t image_width = 0;
         uint32_t image_height = 0;
         std::vector<uint8_t> image_pixels;
+        std::vector<float> image_float_pixels;
     };
 
     struct Sampler
@@ -62,6 +66,8 @@ struct ShaderBuild
         std::vector<uint32_t> fragment_spirv;
         std::vector<std::string> targets;
         std::vector<Sampler> samplers;
+        std::optional<size_t> model_index;
+        Camera camera;
         float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         bool has_clear = false;
     };
@@ -70,6 +76,7 @@ struct ShaderBuild
     std::filesystem::path project_path;
     std::filesystem::path scenegraph_path;
     std::vector<Surface> surfaces;
+    std::vector<ModelData> models;
     std::vector<Pass> passes;
 };
 

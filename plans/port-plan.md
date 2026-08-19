@@ -1,6 +1,6 @@
 # Rezonality Draxul plugin port plan
 
-Status: slice 2 implemented on Windows; Metal implementation awaiting macOS validation
+Status: slice 3 implemented on Windows; Metal implementation awaiting macOS validation
 Priority: failure-tolerant live editing first  
 Target plugin: `dev.draxul.rezonality`
 
@@ -284,6 +284,11 @@ Manual check: resize a Rezonality/terminal split continuously while editing a
 fragment shader and confirm both panes remain intact and responsive.
 
 ### Slice 3 - Models, cameras, and PBR
+
+Status: implemented in plugin version 0.4.0. Windows Vulkan snapshots cover
+the restored sphere examples and textured PBR robot. The paired Metal resource,
+pipeline, and draw path is implemented, but its build, snapshots, and
+interactive camera/resize behavior still require validation on macOS.
 
 Deliver:
 

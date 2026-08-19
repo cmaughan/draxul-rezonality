@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <fstream>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <system_error>
@@ -304,6 +305,7 @@ struct SceneDescription
 {
     fs::path scenegraph;
     std::vector<ShaderBuild::Surface> surfaces;
+    std::vector<ModelData> models;
     std::vector<ShaderBuild::Pass> passes;
 };
 
@@ -373,6 +375,43 @@ void parse_vec4(const std::string& body, std::string_view key,
         *found = true;
 }
 
+bool parse_vec3(const std::string& body, std::string_view key,
+    glm::vec3& value)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+        return false;
+    value = { std::stof(match[1].str()), std::stof(match[2].str()),
+        std::stof(match[3].str()) };
+    return true;
+}
+
+bool parse_vec2(const std::string& body, std::string_view key,
+    glm::vec2& value)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+        return false;
+    value = { std::stof(match[1].str()), std::stof(match[2].str()) };
+    return true;
+}
+
+bool parse_scalar(const std::string& body, std::string_view key,
+    float& value)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*([-+.0-9]+))");
+    const auto matched = first_match(body, expression);
+    if (!matched)
+        return false;
+    value = std::stof(*matched);
+    return true;
+}
+
 std::vector<std::pair<std::string, std::string>> named_blocks(
     const std::string& source, std::string_view kind)
 {
@@ -415,6 +454,51 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
 
     SceneDescription description;
     description.scenegraph = scenegraph;
+    std::map<std::string, size_t> model_indices;
+    std::map<std::string, Camera> cameras;
+    Camera default_camera;
+    camera_set_pos_lookat(default_camera, default_camera.position,
+        default_camera.focal_point);
+    cameras.emplace(default_camera.name, default_camera);
+
+    for (const auto& [name, body] : named_blocks(parsed, "camera"))
+    {
+        Camera camera;
+        camera.name = name;
+        glm::vec3 position = camera.position;
+        glm::vec3 look_at = camera.focal_point;
+        parse_vec3(body, "position", position);
+        parse_vec3(body, "look_at", look_at);
+        parse_vec2(body, "near_far", camera.near_far);
+        parse_scalar(body, "field_of_view", camera.field_of_view);
+        camera_set_pos_lookat(camera, position, look_at);
+        cameras[name] = camera;
+    }
+
+    for (const auto& [name, body] : named_blocks(parsed, "model"))
+    {
+        const auto path = first_match(body,
+            std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))"));
+        if (!path)
+        {
+            error = "Model '" + name + "' is missing path:";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        glm::vec3 scale{ 1.0f };
+        parse_vec3(body, "scale", scale);
+        ModelData model;
+        const fs::path model_path
+            = options.project_path / fs::u8path(*path);
+        if (!load_model(model_path, scale, model, error))
+        {
+            diagnostic_path = model_path;
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        model_indices[name] = description.models.size();
+        description.models.push_back(std::move(model));
+    }
     for (const auto& [name, body] : named_blocks(parsed, "surface"))
     {
         ShaderBuild::Surface surface;
@@ -443,6 +527,19 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         parse_vec4(body, "clear", surface.clear);
         description.surfaces.push_back(std::move(surface));
     }
+    for (const auto& [name, body] : named_blocks(parsed, "environment"))
+    {
+        ShaderBuild::Surface surface;
+        surface.name = name;
+        if (const auto path = first_match(body,
+                std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
+            surface.path = options.project_path / fs::u8path(*path);
+        if (const auto format = first_match(body,
+                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))"));
+            format && *format == "rgba32f")
+            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+        description.surfaces.push_back(std::move(surface));
+    }
 
     for (const auto& [name, body] : named_blocks(parsed, "pass"))
     {
@@ -451,14 +548,6 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         if (!vertex || !fragment)
         {
             error = "Pass '" + name + "' must declare both vs: and fs:";
-            diagnostic_line = 1;
-            return std::nullopt;
-        }
-        if (const auto geometry = first_match(body,
-                std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))"));
-            geometry && *geometry != "screen_rect")
-        {
-            error = "Pass '" + name + "' uses model geometry; models arrive in slice 3";
             diagnostic_line = 1;
             return std::nullopt;
         }
@@ -480,6 +569,58 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
             parsed_sampler.surface = std::move(sampler);
             pass.samplers.push_back(std::move(parsed_sampler));
         }
+        const auto geometries = named_blocks(body, "geometry");
+        if (geometries.empty())
+        {
+            error = "Pass '" + name + "' must declare geometry";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        const std::string& geometry_body = geometries.front().second;
+        const auto model_name = first_match(geometry_body,
+            std::regex(R"(\bmodel\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*))"));
+        const auto geometry_path = first_match(geometry_body,
+            std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))"));
+        if (model_name)
+        {
+            const auto found = model_indices.find(*model_name);
+            if (found == model_indices.end())
+            {
+                error = "Pass '" + name + "' references unknown model '"
+                    + *model_name + "'";
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.model_index = found->second;
+        }
+        else if (geometry_path && *geometry_path != "screen_rect")
+        {
+            glm::vec3 scale{ 1.0f };
+            parse_vec3(geometry_body, "scale", scale);
+            ModelData model;
+            const fs::path model_path
+                = options.project_path / fs::u8path(*geometry_path);
+            if (!load_model(model_path, scale, model, error))
+            {
+                diagnostic_path = model_path;
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.model_index = description.models.size();
+            description.models.push_back(std::move(model));
+        }
+        const auto camera_name = first_match(body,
+            std::regex(R"(\bcamera\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*))"));
+        const auto selected_camera = cameras.find(
+            camera_name.value_or("default_camera"));
+        if (selected_camera == cameras.end())
+        {
+            error = "Pass '" + name + "' references unknown camera '"
+                + *camera_name + "'";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        pass.camera = selected_camera->second;
         parse_vec4(body, "clear", pass.clear, &pass.has_clear);
         description.passes.push_back(std::move(pass));
     }
@@ -713,7 +854,10 @@ uint64_t LiveProject::project_fingerprint() const
                 || extension == ".vert" || extension == ".frag"
                 || extension == ".glsl" || extension == ".h"
                 || extension == ".png" || extension == ".jpg"
-                || extension == ".jpeg" || extension == ".bmp")
+                || extension == ".jpeg" || extension == ".bmp"
+                || extension == ".hdr" || extension == ".gltf"
+                || extension == ".glb" || extension == ".obj"
+                || extension == ".mtl" || extension == ".bin")
                 files.push_back(entry.path());
         }
     }
@@ -734,7 +878,7 @@ BuildResult LiveProject::build(uint64_t generation) const
     int line = -1;
     fs::path diagnostic;
     std::string error;
-    const auto scene = load_scene(options_, diagnostic, line, error);
+    auto scene = load_scene(options_, diagnostic, line, error);
     if (!scene)
     {
         result.diagnostic_path = std::move(diagnostic);
@@ -768,16 +912,26 @@ BuildResult LiveProject::build(uint64_t generation) const
     candidate.project_path = options_.project_path;
     candidate.scenegraph_path = scene->scenegraph;
     candidate.surfaces = scene->surfaces;
+    candidate.models = std::move(scene->models);
     candidate.passes = scene->passes;
     for (auto& surface : candidate.surfaces)
     {
-        if (!surface.path.empty()
-            && !load_rgba8_image(surface.path, surface.image_width,
-                surface.image_height, surface.image_pixels, result.error))
+        if (surface.path.empty())
+            continue;
+        const bool hdr = surface.path.extension() == ".hdr";
+        const bool loaded = hdr
+            ? load_rgba32f_image(surface.path, surface.image_width,
+                surface.image_height, surface.image_float_pixels,
+                result.error)
+            : load_rgba8_image(surface.path, surface.image_width,
+                surface.image_height, surface.image_pixels, result.error);
+        if (!loaded)
         {
             result.diagnostic_path = surface.path;
             return result;
         }
+        if (hdr)
+            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
     }
     for (size_t index = 0; index < candidate.passes.size(); ++index)
     {

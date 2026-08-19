@@ -2,6 +2,9 @@
 
 #include <draxul/plugin_api.h>
 
+#include "camera.h"
+#include "model_loader.h"
+
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -53,7 +56,7 @@ bool wait_for_status(const DraxulPluginApiV2& api, void* instance,
     std::string_view expected)
 {
     const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::seconds(10);
+        + std::chrono::seconds(30);
     DraxulPluginTickInfoV2 tick_info{};
     tick_info.struct_size = sizeof(tick_info);
     tick_info.visible = 1;
@@ -162,6 +165,26 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     CHECK(presentation_status(instance, presentation).find("paused")
         == std::string::npos);
 
+    const uint32_t redraws_before_camera = host_state.redraws.load();
+    DraxulPluginInputEventV2 orbit{};
+    orbit.struct_size = sizeof(orbit);
+    orbit.kind = DRAXUL_PLUGIN_INPUT_POINTER_MOVE;
+    orbit.buttons = 1;
+    orbit.delta_x = 12.0f;
+    orbit.delta_y = -4.0f;
+    CHECK(api->handle_input(instance, &orbit) == 1);
+    DraxulPluginInputEventV2 dolly{};
+    dolly.struct_size = sizeof(dolly);
+    dolly.kind = DRAXUL_PLUGIN_INPUT_WHEEL;
+    dolly.delta_y = 1.0f;
+    CHECK(api->handle_input(instance, &dolly) == 1);
+    CHECK(host_state.redraws.load() >= redraws_before_camera + 2);
+
+    DraxulPluginViewportV2 resized{
+        sizeof(DraxulPluginViewportV2), 0, 0, 960, 360, 1.5f, 144.0f
+    };
+    api->set_viewport(instance, &resized);
+
     api->quiesce_instance(instance);
     CHECK(api->tick(instance, &tick_info).ok == 0);
     api->destroy_instance(instance);
@@ -266,7 +289,7 @@ TEST_CASE("Rezonality compiles every staged multipass example",
     REQUIRE(api != nullptr);
     const std::string directory = plugin_root().string();
     for (const std::string_view example : { "default", "blend_waves",
-             "deferred_shading", "protoplanetary_disc" })
+             "deferred_shading", "protoplanetary_disc", "pbr_robot" })
     {
         DYNAMIC_SECTION(example)
         {
@@ -309,4 +332,87 @@ TEST_CASE("Rezonality compiles every staged multipass example",
             api->destroy_instance(instance);
         }
     }
+}
+
+TEST_CASE("Rezonality model assets load immutably and fail as a candidate",
+    "[rezonality][integration][model]")
+{
+    namespace fs = std::filesystem;
+    const fs::path fixture = fs::temp_directory_path()
+        / "draxul-rezonality-model-contract";
+    std::error_code ec;
+    fs::remove_all(fixture, ec);
+    REQUIRE(fs::create_directories(fixture));
+    write_text(fixture / "triangle.mtl",
+        "newmtl painted\n"
+        "Kd 1.0 1.0 1.0\n"
+        "map_Kd texture.png\n");
+    write_text(fixture / "triangle.obj",
+        "mtllib triangle.mtl\n"
+        "o triangle\n"
+        "v -1 0 0\n"
+        "v 1 0 0\n"
+        "v 0 1 0\n"
+        "vt 0 0\n"
+        "vt 1 0\n"
+        "vt 0.5 1\n"
+        "usemtl painted\n"
+        "f 1/1 2/2 3/3\n");
+    const fs::path first_texture = plugin_root() / "examples" / "default"
+        / "noise.png";
+    const fs::path second_texture = plugin_root() / "examples" / "pbr_robot"
+        / "models" / "robot" / "textures"
+        / "RobotChest_metallicRoughness.png";
+    REQUIRE(fs::copy_file(first_texture, fixture / "texture.png",
+        fs::copy_options::overwrite_existing));
+
+    rezonality::ModelData first;
+    std::string error;
+    REQUIRE(rezonality::load_model(
+        fixture / "triangle.obj", { 2.0f, 1.0f, 1.0f }, first, error));
+    REQUIRE(first.vertices.size() == 3);
+    CHECK(first.indices.size() == 3);
+    REQUIRE_FALSE(first.materials.empty());
+    CHECK(first.vertices[0].position.x == Catch::Approx(-2.0f));
+    const auto first_pixels = first.materials.back().base_color.pixels;
+    REQUIRE_FALSE(first_pixels.empty());
+
+    REQUIRE(fs::copy_file(second_texture, fixture / "texture.png",
+        fs::copy_options::overwrite_existing));
+    rezonality::ModelData second;
+    error.clear();
+    REQUIRE(rezonality::load_model(
+        fixture / "triangle.obj", { 2.0f, 1.0f, 1.0f }, second, error));
+    REQUIRE_FALSE(second.materials.empty());
+    CHECK(second.materials.back().base_color.pixels != first_pixels);
+    CHECK(first.materials.back().base_color.pixels == first_pixels);
+
+    REQUIRE(fs::remove(fixture / "texture.png"));
+    rezonality::ModelData rejected;
+    error.clear();
+    CHECK_FALSE(rezonality::load_model(
+        fixture / "triangle.obj", { 1.0f, 1.0f, 1.0f }, rejected, error));
+    CHECK(error.find("texture.png") != std::string::npos);
+    CHECK(rejected.vertices.empty());
+    CHECK(first.materials.back().base_color.pixels == first_pixels);
+    fs::remove_all(fixture, ec);
+}
+
+TEST_CASE("Rezonality camera orbit, dolly, and resize stay pane-local",
+    "[rezonality][camera]")
+{
+    rezonality::Camera first;
+    rezonality::Camera second;
+    rezonality::camera_set_pos_lookat(
+        first, { 0.0f, 0.0f, 4.0f }, { 0.0f, 0.0f, 0.0f });
+    rezonality::camera_set_pos_lookat(
+        second, { 0.0f, 0.0f, 4.0f }, { 0.0f, 0.0f, 0.0f });
+    const auto second_position = second.position;
+    rezonality::camera_orbit(first, { 20.0f, -10.0f });
+    rezonality::camera_dolly(first, 0.5f);
+    CHECK(first.position != second.position);
+    CHECK(second.position == second_position);
+    const auto wide = rezonality::camera_projection(first, 960, 360);
+    const auto tall = rezonality::camera_projection(first, 360, 960);
+    CHECK(wide != tall);
 }

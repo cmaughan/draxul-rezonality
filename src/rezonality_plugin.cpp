@@ -1,5 +1,8 @@
 #include "live_project.h"
 
+#include "camera.h"
+#include "model_loader.h"
+
 #include <draxul/plugin_adapter.h>
 #include <draxul/plugin_api.h>
 
@@ -25,6 +28,9 @@
 #include <utility>
 #include <vector>
 
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
 namespace
 {
 
@@ -46,7 +52,7 @@ size_t align_up(size_t value, size_t alignment)
 }
 
 CommonUniformBlock make_common_uniforms(double elapsed_seconds,
-    uint32_t width, uint32_t height)
+    uint32_t width, uint32_t height, const rezonality::Camera& camera)
 {
     CommonUniformBlock uniform{};
     const float time = static_cast<float>(std::max(0.0, elapsed_seconds));
@@ -59,10 +65,28 @@ CommonUniformBlock make_common_uniforms(double elapsed_seconds,
     uniform[8] = static_cast<float>(width);
     uniform[9] = static_cast<float>(height);
     uniform[10] = 1.0f;
-    for (size_t matrix : { size_t{ 56 }, size_t{ 72 }, size_t{ 88 },
-             size_t{ 104 }, size_t{ 120 }, size_t{ 136 } })
-        for (size_t diagonal = 0; diagonal < 4; ++diagonal)
-            uniform[matrix + diagonal * 5] = 1.0f;
+    uniform[52] = camera.position.x;
+    uniform[53] = camera.position.y;
+    uniform[54] = camera.position.z;
+    uniform[55] = 1.0f;
+    const glm::mat4 model(1.0f);
+    const glm::mat4 view = rezonality::camera_view(camera);
+    const glm::mat4 projection
+        = rezonality::camera_projection(camera, width, height);
+    const glm::mat4 model_view_projection = projection * view * model;
+    const glm::mat4 view_inverse = glm::inverse(view);
+    const glm::mat4 projection_inverse = glm::inverse(projection);
+    const auto copy_matrix = [&uniform](size_t offset,
+                                 const glm::mat4& matrix) {
+        std::memcpy(uniform.data() + offset, glm::value_ptr(matrix),
+            sizeof(glm::mat4));
+    };
+    copy_matrix(56, model);
+    copy_matrix(72, view);
+    copy_matrix(88, projection);
+    copy_matrix(104, model_view_projection);
+    copy_matrix(120, view_inverse);
+    copy_matrix(136, projection_inverse);
     return uniform;
 }
 
@@ -99,11 +123,21 @@ struct MetalGeneration
         id<MTLRenderPipelineState> pipeline = nil;
         std::vector<size_t> targets;
         std::vector<size_t> samplers;
+        std::optional<size_t> model_index;
         bool direct = false;
         bool has_clear = false;
         float clear[4] = { 0, 0, 0, 1 };
     };
+    struct Model
+    {
+        id<MTLBuffer> vertex_buffer = nil;
+        id<MTLBuffer> index_buffer = nil;
+        id<MTLBuffer> material_buffer = nil;
+        std::array<std::vector<id<MTLTexture>>, 5> textures;
+        std::vector<rezonality::ModelPart> parts;
+    };
     std::vector<Surface> surfaces;
+    std::vector<Model> models;
     std::vector<Pass> passes;
     id<MTLBuffer> uniform_buffer = nil;
     size_t uniform_stride = 0;
@@ -166,6 +200,23 @@ bool convert_to_msl(const std::vector<uint32_t>& spirv,
             sampler.msl_sampler = index;
             compiler.add_msl_resource_binding(sampler);
         }
+        spirv_cross::MSLResourceBinding materials{};
+        materials.stage = model;
+        materials.desc_set = 2;
+        materials.binding = 0;
+        materials.msl_buffer = 2;
+        compiler.add_msl_resource_binding(materials);
+        for (uint32_t binding = 1; binding <= 5; ++binding)
+        {
+            spirv_cross::MSLResourceBinding texture{};
+            texture.stage = model;
+            texture.desc_set = 2;
+            texture.binding = binding;
+            texture.msl_texture = 16
+                + (binding - 1) * rezonality::kMaxModelMaterials;
+            texture.msl_sampler = texture.msl_texture;
+            compiler.add_msl_resource_binding(texture);
+        }
         compiler.rename_entry_point("main", entry_point, model);
         compiler.set_entry_point(entry_point, model);
         source = compiler.compile();
@@ -178,9 +229,84 @@ bool convert_to_msl(const std::vector<uint32_t>& spirv,
     }
 }
 
+std::optional<MetalGeneration::Model> create_metal_model(
+    id<MTLDevice> device, const rezonality::ModelData& source,
+    std::string& error)
+{
+    MetalGeneration::Model model;
+    model.vertex_buffer = [device newBufferWithBytes:source.vertices.data()
+        length:source.vertices.size() * sizeof(rezonality::ModelVertex)
+        options:MTLResourceStorageModeShared];
+    model.index_buffer = [device newBufferWithBytes:source.indices.data()
+        length:source.indices.size() * sizeof(uint32_t)
+        options:MTLResourceStorageModeShared];
+    struct alignas(16) GpuMaterial
+    {
+        glm::vec4 base_color;
+        glm::vec4 emissive;
+        glm::vec4 metallic_roughness_occlusion;
+        glm::ivec4 texture_indices;
+    };
+    std::array<GpuMaterial, rezonality::kMaxModelMaterials> materials{};
+    for (size_t index = 0; index < source.materials.size(); ++index)
+    {
+        const auto& material = source.materials[index];
+        materials[index] = { material.base_color_factor,
+            material.emissive_factor,
+            { material.metallic_factor, material.roughness_factor,
+                material.occlusion_strength, 0.0f },
+            glm::ivec4(static_cast<int>(index)) };
+    }
+    model.material_buffer = [device newBufferWithBytes:materials.data()
+        length:sizeof(materials) options:MTLResourceStorageModeShared];
+    if (!model.vertex_buffer || !model.index_buffer
+        || !model.material_buffer)
+    {
+        error = "Rezonality could not create Metal model buffers";
+        return std::nullopt;
+    }
+    for (const auto& material : source.materials)
+    {
+        const rezonality::ModelTexture* textures[] = {
+            &material.base_color, &material.normal,
+            &material.metallic_roughness, &material.emissive,
+            &material.occlusion
+        };
+        for (size_t kind = 0; kind < std::size(textures); ++kind)
+        {
+            const auto& source_texture = *textures[kind];
+            MTLTextureDescriptor* descriptor
+                = [[MTLTextureDescriptor alloc] init];
+            descriptor.textureType = MTLTextureType2D;
+            descriptor.width = source_texture.width;
+            descriptor.height = source_texture.height;
+            descriptor.pixelFormat = source_texture.srgb
+                ? MTLPixelFormatRGBA8Unorm_sRGB
+                : MTLPixelFormatRGBA8Unorm;
+            descriptor.storageMode = MTLStorageModeManaged;
+            descriptor.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> texture
+                = [device newTextureWithDescriptor:descriptor];
+            if (!texture)
+            {
+                error = "Rezonality could not create a Metal model texture";
+                return std::nullopt;
+            }
+            [texture replaceRegion:MTLRegionMake2D(0, 0,
+                    source_texture.width, source_texture.height)
+                mipmapLevel:0 withBytes:source_texture.pixels.data()
+                bytesPerRow:source_texture.width * 4];
+            model.textures[kind].push_back(texture);
+        }
+    }
+    model.parts = source.parts;
+    return model;
+}
+
 std::optional<MetalGeneration> create_generation(BackendState& backend,
     const ShaderBuild& build, const DraxulPluginMetalFrameV2& frame,
-    double animation_seconds, std::string& error)
+    double animation_seconds, const rezonality::Camera& camera,
+    std::string& error)
 {
     id<MTLDevice> device = (__bridge id<MTLDevice>)frame.device;
     id<MTLTexture> target
@@ -213,6 +339,30 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     vertices.attributes[3].bufferIndex = 0;
     vertices.layouts[0].stride = sizeof(ScreenVertex);
     vertices.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+    MTLVertexDescriptor* model_vertices
+        = [[MTLVertexDescriptor alloc] init];
+    const MTLVertexFormat model_formats[] = {
+        MTLVertexFormatFloat4, MTLVertexFormatFloat2,
+        MTLVertexFormatFloat3, MTLVertexFormatFloat3,
+        MTLVertexFormatFloat3, MTLVertexFormatFloat3
+    };
+    const NSUInteger model_offsets[] = {
+        offsetof(rezonality::ModelVertex, position),
+        offsetof(rezonality::ModelVertex, uv),
+        offsetof(rezonality::ModelVertex, color),
+        offsetof(rezonality::ModelVertex, normal),
+        offsetof(rezonality::ModelVertex, tangent),
+        offsetof(rezonality::ModelVertex, bitangent)
+    };
+    for (NSUInteger index = 0; index < 6; ++index)
+    {
+        model_vertices.attributes[index].format = model_formats[index];
+        model_vertices.attributes[index].offset = model_offsets[index];
+        model_vertices.attributes[index].bufferIndex = 0;
+    }
+    model_vertices.layouts[0].stride = sizeof(rezonality::ModelVertex);
+    model_vertices.layouts[0].stepFunction
+        = MTLVertexStepFunctionPerVertex;
 
     MetalGeneration generation;
     generation.width = static_cast<uint32_t>(std::max(1, frame.viewport.width));
@@ -230,7 +380,7 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     }
     const auto uniform = make_common_uniforms(
         animation_seconds,
-        generation.width, generation.height);
+        generation.width, generation.height, camera);
     for (uint32_t slot = 0; slot < generation.buffered_frame_count; ++slot)
     {
         std::memcpy(static_cast<uint8_t*>(
@@ -255,7 +405,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         MetalGeneration::Surface surface;
         surface.name = source.name;
         surface.depth = source.format == ShaderBuild::SurfaceFormat::Depth32;
-        surface.repeat = !source.image_pixels.empty();
+        surface.repeat = !source.image_pixels.empty()
+            || !source.image_float_pixels.empty();
         MTLTextureDescriptor* texture = [[MTLTextureDescriptor alloc] init];
         texture.textureType = MTLTextureType2D;
         texture.width = source.image_width != 0 ? source.image_width
@@ -264,7 +415,9 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         texture.height = source.image_height != 0 ? source.image_height
             : std::max<NSUInteger>(1, static_cast<NSUInteger>(
                   generation.height * std::max(0.01f, source.scale_y)));
-        texture.storageMode = source.image_pixels.empty()
+        const bool has_image = !source.image_pixels.empty()
+            || !source.image_float_pixels.empty();
+        texture.storageMode = !has_image
             ? MTLStorageModePrivate : MTLStorageModeManaged;
         texture.usage = surface.depth
             ? MTLTextureUsageRenderTarget
@@ -291,15 +444,27 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                 + source.name + "'";
             return std::nullopt;
         }
-        if (!source.image_pixels.empty())
+        if (has_image)
         {
             const MTLRegion region = MTLRegionMake2D(
                 0, 0, source.image_width, source.image_height);
+            const void* bytes = !source.image_float_pixels.empty()
+                ? static_cast<const void*>(source.image_float_pixels.data())
+                : static_cast<const void*>(source.image_pixels.data());
+            const size_t bytes_per_pixel
+                = !source.image_float_pixels.empty() ? 16 : 4;
             [surface.texture replaceRegion:region mipmapLevel:0
-                withBytes:source.image_pixels.data()
-                bytesPerRow:source.image_width * 4];
+                withBytes:bytes
+                bytesPerRow:source.image_width * bytes_per_pixel];
         }
         generation.surfaces.push_back(surface);
+    }
+    for (const auto& source_model : build.models)
+    {
+        auto model = create_metal_model(device, source_model, error);
+        if (!model)
+            return std::nullopt;
+        generation.models.push_back(std::move(*model));
     }
     const auto find_surface = [&generation](std::string_view name)
         -> std::optional<size_t> {
@@ -312,6 +477,7 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     {
         const auto& source = build.passes[index];
         MetalGeneration::Pass pass;
+        pass.model_index = source.model_index;
         pass.has_clear = source.has_clear;
         std::copy(std::begin(source.clear), std::end(source.clear),
             std::begin(pass.clear));
@@ -377,7 +543,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
             = [[MTLRenderPipelineDescriptor alloc] init];
         descriptor.vertexFunction = vertex;
         descriptor.fragmentFunction = fragment;
-        descriptor.vertexDescriptor = vertices;
+        descriptor.vertexDescriptor = source.model_index
+            ? model_vertices : vertices;
         if (pass.direct)
             descriptor.colorAttachments[0].pixelFormat = target.pixelFormat;
         else
@@ -425,6 +592,28 @@ struct VulkanSurfaceResource
     bool initialized = false;
 };
 
+struct VulkanModelTextureResource
+{
+    draxul::vkresources::AttachmentResource attachment;
+    draxul::vkresources::BufferResource upload_buffer;
+    VkSampler sampler = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool initialized = false;
+};
+
+struct VulkanModelResource
+{
+    draxul::vkresources::BufferResource vertex_buffer;
+    draxul::vkresources::BufferResource index_buffer;
+    draxul::vkresources::BufferResource material_buffer;
+    std::array<std::vector<VulkanModelTextureResource>, 5> textures;
+    VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    std::vector<rezonality::ModelPart> parts;
+};
+
 struct VulkanPassResource
 {
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -437,6 +626,7 @@ struct VulkanPassResource
     VkDescriptorSet uniform_set = VK_NULL_HANDLE;
     VkDescriptorSet sampler_set = VK_NULL_HANDLE;
     std::vector<size_t> target_surfaces;
+    std::optional<size_t> model_index;
     bool direct = false;
     bool has_clear = false;
     float clear[4] = { 0, 0, 0, 1 };
@@ -451,6 +641,7 @@ struct VulkanGeneration
     size_t uniform_stride = 0;
     uint32_t buffered_frame_count = 1;
     std::vector<VulkanSurfaceResource> surfaces;
+    std::vector<VulkanModelResource> models;
     std::vector<VulkanPassResource> passes;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -503,6 +694,32 @@ void destroy_generation(VulkanGeneration& generation)
             generation.device, generation.allocator, surface.attachment);
         draxul::vkresources::destroy_buffer(
             generation.allocator, surface.upload_buffer);
+    }
+    for (auto& model : generation.models)
+    {
+        if (model.descriptor_pool)
+            vkDestroyDescriptorPool(
+                generation.device, model.descriptor_pool, nullptr);
+        if (model.descriptor_layout)
+            vkDestroyDescriptorSetLayout(
+                generation.device, model.descriptor_layout, nullptr);
+        for (auto& slots : model.textures)
+            for (auto& texture : slots)
+            {
+                if (texture.sampler)
+                    vkDestroySampler(
+                        generation.device, texture.sampler, nullptr);
+                draxul::vkresources::destroy_attachment(generation.device,
+                    generation.allocator, texture.attachment);
+                draxul::vkresources::destroy_buffer(
+                    generation.allocator, texture.upload_buffer);
+            }
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, model.vertex_buffer);
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, model.index_buffer);
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, model.material_buffer);
     }
     draxul::vkresources::destroy_buffer(
         generation.allocator, generation.uniform_buffer);
@@ -678,6 +895,7 @@ bool create_surface(VulkanGeneration& generation,
         sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         const VkSamplerAddressMode address_mode
             = source.image_pixels.empty()
+                && source.image_float_pixels.empty()
             ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
             : VK_SAMPLER_ADDRESS_MODE_REPEAT;
         sampler.addressModeU = address_mode;
@@ -694,11 +912,18 @@ bool create_surface(VulkanGeneration& generation,
             return false;
         }
     }
-    if (!source.image_pixels.empty())
+    if (!source.image_pixels.empty()
+        || !source.image_float_pixels.empty())
     {
+        const size_t byte_size = !source.image_float_pixels.empty()
+            ? source.image_float_pixels.size() * sizeof(float)
+            : source.image_pixels.size();
+        const void* bytes = !source.image_float_pixels.empty()
+            ? static_cast<const void*>(source.image_float_pixels.data())
+            : static_cast<const void*>(source.image_pixels.data());
         draxul::vkresources::ScopedBuffer upload;
         const draxul::vkresources::BufferRequest upload_request(
-            source.image_pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            byte_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             draxul::vkresources::MemoryPolicy::HostSequentialWrite,
             "rezonality-texture-upload",
             draxul::vkresources::LifetimeScope::Persistent);
@@ -713,12 +938,206 @@ bool create_surface(VulkanGeneration& generation,
             return false;
         }
         surface.upload_buffer = upload.release();
-        std::memcpy(surface.upload_buffer.mapped,
-            source.image_pixels.data(), source.image_pixels.size());
+        std::memcpy(surface.upload_buffer.mapped, bytes, byte_size);
         vmaFlushAllocation(generation.allocator,
-            surface.upload_buffer.allocation, 0, source.image_pixels.size());
+            surface.upload_buffer.allocation, 0, byte_size);
     }
     generation.surfaces.push_back(std::move(surface));
+    return true;
+}
+
+bool create_model_texture(VulkanGeneration& generation,
+    const rezonality::ModelTexture& source,
+    VulkanModelTextureResource& texture, std::string& error)
+{
+    texture.width = source.width;
+    texture.height = source.height;
+    const VkFormat format = source.srgb
+        ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    const draxul::vkresources::AttachmentRequest request(
+        static_cast<int>(source.width), static_cast<int>(source.height),
+        format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT, VK_SAMPLE_COUNT_1_BIT, 0,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        draxul::vkresources::LifetimeScope::Persistent,
+        "rezonality-model-texture");
+    if (!draxul::vkresources::create_attachment(generation.device,
+            generation.allocator, request, texture.attachment, error))
+        return false;
+    VkSamplerCreateInfo sampler{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sampler.magFilter = VK_FILTER_LINEAR;
+    sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler.maxLod = 1.0f;
+    if (vkCreateSampler(generation.device, &sampler, nullptr,
+            &texture.sampler) != VK_SUCCESS)
+    {
+        error = "Rezonality could not create a model texture sampler";
+        return false;
+    }
+    draxul::vkresources::ScopedBuffer upload;
+    const draxul::vkresources::BufferRequest upload_request(
+        source.pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        draxul::vkresources::MemoryPolicy::HostSequentialWrite,
+        "rezonality-model-texture-upload",
+        draxul::vkresources::LifetimeScope::Persistent);
+    if (!draxul::vkresources::create_buffer(generation.device,
+            generation.allocator, upload_request, upload, error))
+        return false;
+    texture.upload_buffer = upload.release();
+    std::memcpy(texture.upload_buffer.mapped,
+        source.pixels.data(), source.pixels.size());
+    vmaFlushAllocation(generation.allocator,
+        texture.upload_buffer.allocation, 0, source.pixels.size());
+    return true;
+}
+
+bool create_model(VulkanGeneration& generation,
+    const rezonality::ModelData& source, VulkanModelResource& model,
+    std::string& error)
+{
+    const auto create_buffer = [&](size_t size, VkBufferUsageFlags usage,
+                                   const void* data,
+                                   draxul::vkresources::BufferResource& out,
+                                   std::string_view name) {
+        draxul::vkresources::ScopedBuffer scoped;
+        const draxul::vkresources::BufferRequest request(size, usage,
+            draxul::vkresources::MemoryPolicy::HostSequentialWrite,
+            std::string(name),
+            draxul::vkresources::LifetimeScope::Persistent);
+        if (!draxul::vkresources::create_buffer(generation.device,
+                generation.allocator, request, scoped, error))
+            return false;
+        out = scoped.release();
+        std::memcpy(out.mapped, data, size);
+        vmaFlushAllocation(generation.allocator, out.allocation, 0, size);
+        return true;
+    };
+    if (!create_buffer(source.vertices.size()
+                * sizeof(rezonality::ModelVertex),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, source.vertices.data(),
+            model.vertex_buffer, "rezonality-model-vertices")
+        || !create_buffer(source.indices.size() * sizeof(uint32_t),
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, source.indices.data(),
+            model.index_buffer, "rezonality-model-indices"))
+        return false;
+
+    struct alignas(16) GpuMaterial
+    {
+        glm::vec4 base_color;
+        glm::vec4 emissive;
+        glm::vec4 metallic_roughness_occlusion;
+        glm::ivec4 texture_indices;
+    };
+    std::array<GpuMaterial, rezonality::kMaxModelMaterials> materials{};
+    for (size_t index = 0; index < source.materials.size(); ++index)
+    {
+        const auto& material = source.materials[index];
+        materials[index] = { material.base_color_factor,
+            material.emissive_factor,
+            { material.metallic_factor, material.roughness_factor,
+                material.occlusion_strength, 0.0f },
+            glm::ivec4(static_cast<int>(index)) };
+    }
+    if (!create_buffer(sizeof(materials), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            materials.data(), model.material_buffer,
+            "rezonality-model-materials"))
+        return false;
+
+    for (size_t material_index = 0;
+         material_index < source.materials.size(); ++material_index)
+    {
+        const auto& material = source.materials[material_index];
+        const rezonality::ModelTexture* textures[] = {
+            &material.base_color, &material.normal,
+            &material.metallic_roughness, &material.emissive,
+            &material.occlusion
+        };
+        for (size_t kind = 0; kind < std::size(textures); ++kind)
+        {
+            VulkanModelTextureResource texture;
+            if (!create_model_texture(
+                    generation, *textures[kind], texture, error))
+                return false;
+            model.textures[kind].push_back(std::move(texture));
+        }
+    }
+
+    std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+    bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+    for (uint32_t binding = 1; binding < bindings.size(); ++binding)
+        bindings[binding] = { binding,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            rezonality::kMaxModelMaterials,
+            VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+    VkDescriptorSetLayoutCreateInfo layout_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    };
+    layout_info.bindingCount = static_cast<uint32_t>(bindings.size());
+    layout_info.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(generation.device, &layout_info,
+            nullptr, &model.descriptor_layout) != VK_SUCCESS)
+        return false;
+    const VkDescriptorPoolSize pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            rezonality::kMaxModelMaterials * 5 }
+    };
+    VkDescriptorPoolCreateInfo pool{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pool.maxSets = 1;
+    pool.poolSizeCount = 2;
+    pool.pPoolSizes = pool_sizes;
+    if (vkCreateDescriptorPool(generation.device, &pool, nullptr,
+            &model.descriptor_pool) != VK_SUCCESS)
+        return false;
+    VkDescriptorSetAllocateInfo allocation{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    };
+    allocation.descriptorPool = model.descriptor_pool;
+    allocation.descriptorSetCount = 1;
+    allocation.pSetLayouts = &model.descriptor_layout;
+    if (vkAllocateDescriptorSets(generation.device, &allocation,
+            &model.descriptor_set) != VK_SUCCESS)
+        return false;
+    VkDescriptorBufferInfo material_buffer{
+        model.material_buffer.buffer, 0, sizeof(materials)
+    };
+    std::vector<std::array<VkDescriptorImageInfo,
+        rezonality::kMaxModelMaterials>> image_arrays(5);
+    std::array<VkWriteDescriptorSet, 6> writes{};
+    writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    writes[0].dstSet = model.descriptor_set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &material_buffer;
+    for (size_t kind = 0; kind < model.textures.size(); ++kind)
+    {
+        for (size_t index = 0; index < rezonality::kMaxModelMaterials;
+             ++index)
+        {
+            const auto& texture = model.textures[kind][
+                std::min(index, model.textures[kind].size() - 1)];
+            image_arrays[kind][index] = { texture.sampler,
+                texture.attachment.view,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        }
+        writes[kind + 1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        writes[kind + 1].dstSet = model.descriptor_set;
+        writes[kind + 1].dstBinding = static_cast<uint32_t>(kind + 1);
+        writes[kind + 1].descriptorCount
+            = rezonality::kMaxModelMaterials;
+        writes[kind + 1].descriptorType
+            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[kind + 1].pImageInfo = image_arrays[kind].data();
+    }
+    vkUpdateDescriptorSets(generation.device,
+        static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    model.parts = source.parts;
     return true;
 }
 
@@ -938,13 +1357,33 @@ bool create_pass_descriptors(VulkanGeneration& generation,
     if (!writes.empty())
         vkUpdateDescriptorSets(generation.device,
             static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    const VkDescriptorSetLayout set_layouts[]
+    std::vector<VkDescriptorSetLayout> set_layouts
         = { pass.uniform_layout, pass.sampler_layout };
+    if (source.model_index)
+    {
+        if (*source.model_index >= generation.models.size())
+        {
+            error = "Pass '" + source.name
+                + "' references an invalid model";
+            return false;
+        }
+        pass.model_index = source.model_index;
+        set_layouts.push_back(
+            generation.models[*source.model_index].descriptor_layout);
+    }
     VkPipelineLayoutCreateInfo layout{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
     };
-    layout.setLayoutCount = 2;
-    layout.pSetLayouts = set_layouts;
+    layout.setLayoutCount = static_cast<uint32_t>(set_layouts.size());
+    layout.pSetLayouts = set_layouts.data();
+    VkPushConstantRange material_index{};
+    if (source.model_index)
+    {
+        material_index.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        material_index.size = sizeof(uint32_t);
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &material_index;
+    }
     if (vkCreatePipelineLayout(generation.device, &layout, nullptr,
             &pass.layout) != VK_SUCCESS)
     {
@@ -957,7 +1396,8 @@ bool create_pass_descriptors(VulkanGeneration& generation,
 
 std::optional<VulkanGeneration> create_generation(BackendState& backend,
     const ShaderBuild& build, const DraxulPluginVulkanFrameV2& frame,
-    double animation_seconds, std::string& error)
+    double animation_seconds, const rezonality::Camera& camera,
+    std::string& error)
 {
     if (!ensure_vertex_buffer(backend, frame, error))
         return std::nullopt;
@@ -982,6 +1422,14 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
             destroy_generation(generation);
             return std::nullopt;
         }
+    generation.models.resize(build.models.size());
+    for (size_t index = 0; index < build.models.size(); ++index)
+        if (!create_model(generation, build.models[index],
+                generation.models[index], error))
+        {
+            destroy_generation(generation);
+            return std::nullopt;
+        }
     VkPhysicalDeviceProperties device_properties{};
     vkGetPhysicalDeviceProperties(
         static_cast<VkPhysicalDevice>(frame.physical_device),
@@ -991,7 +1439,7 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
                                 .minUniformBufferOffsetAlignment));
     const auto uniform = make_common_uniforms(
         animation_seconds,
-        generation.width, generation.height);
+        generation.width, generation.height, camera);
     draxul::vkresources::ScopedBuffer uniform_buffer;
     const draxul::vkresources::BufferRequest uniform_request(
         generation.uniform_stride * generation.buffered_frame_count,
@@ -1037,6 +1485,30 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
     vertex_input.pVertexBindingDescriptions = &binding;
     vertex_input.vertexAttributeDescriptionCount = 4;
     vertex_input.pVertexAttributeDescriptions = attributes;
+    VkVertexInputBindingDescription model_binding{};
+    model_binding.binding = 0;
+    model_binding.stride = sizeof(rezonality::ModelVertex);
+    model_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription model_attributes[6]{};
+    model_attributes[0] = { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
+        offsetof(rezonality::ModelVertex, position) };
+    model_attributes[1] = { 1, 0, VK_FORMAT_R32G32_SFLOAT,
+        offsetof(rezonality::ModelVertex, uv) };
+    model_attributes[2] = { 2, 0, VK_FORMAT_R32G32B32_SFLOAT,
+        offsetof(rezonality::ModelVertex, color) };
+    model_attributes[3] = { 3, 0, VK_FORMAT_R32G32B32_SFLOAT,
+        offsetof(rezonality::ModelVertex, normal) };
+    model_attributes[4] = { 4, 0, VK_FORMAT_R32G32B32_SFLOAT,
+        offsetof(rezonality::ModelVertex, tangent) };
+    model_attributes[5] = { 5, 0, VK_FORMAT_R32G32B32_SFLOAT,
+        offsetof(rezonality::ModelVertex, bitangent) };
+    VkPipelineVertexInputStateCreateInfo model_vertex_input{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+    };
+    model_vertex_input.vertexBindingDescriptionCount = 1;
+    model_vertex_input.pVertexBindingDescriptions = &model_binding;
+    model_vertex_input.vertexAttributeDescriptionCount = 6;
+    model_vertex_input.pVertexAttributeDescriptions = model_attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
     };
@@ -1135,15 +1607,17 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
         };
         blend.attachmentCount = color_count;
         blend.pAttachments = color_attachments.data();
-        depth_stencil.depthTestEnable = has_depth ? VK_TRUE : VK_FALSE;
-        depth_stencil.depthWriteEnable = has_depth ? VK_TRUE : VK_FALSE;
+        const bool model_depth = has_depth && source.model_index.has_value();
+        depth_stencil.depthTestEnable = model_depth ? VK_TRUE : VK_FALSE;
+        depth_stencil.depthWriteEnable = model_depth ? VK_TRUE : VK_FALSE;
         depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
         VkGraphicsPipelineCreateInfo pipeline_info{
             VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
         };
         pipeline_info.stageCount = 2;
         pipeline_info.pStages = stages;
-        pipeline_info.pVertexInputState = &vertex_input;
+        pipeline_info.pVertexInputState = source.model_index
+            ? &model_vertex_input : &vertex_input;
         pipeline_info.pInputAssemblyState = &assembly;
         pipeline_info.pViewportState = &viewport;
         pipeline_info.pRasterizationState = &raster;
@@ -1234,6 +1708,45 @@ void initialize_generation_images(
         }
         surface.initialized = true;
     }
+    for (auto& model : generation.models)
+        for (auto& slots : model.textures)
+            for (auto& texture : slots)
+            {
+                if (texture.initialized)
+                    continue;
+                VkImageMemoryBarrier before{
+                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+                };
+                before.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                before.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                before.image = texture.attachment.image;
+                before.subresourceRange
+                    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(command,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                    0, nullptr, 1, &before);
+                VkBufferImageCopy copy{};
+                copy.imageSubresource
+                    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                copy.imageExtent = { texture.width, texture.height, 1 };
+                vkCmdCopyBufferToImage(command,
+                    texture.upload_buffer.buffer, texture.attachment.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                VkImageMemoryBarrier after = before;
+                after.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                after.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                vkCmdPipelineBarrier(command,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                    0, nullptr, 1, &after);
+                texture.initialized = true;
+            }
 }
 
 #endif
@@ -1280,9 +1793,26 @@ struct RezonalityInstance
     bool quiesced = false;
     double animation_elapsed_seconds = 0.0;
     double last_animation_seconds = -1.0;
+    rezonality::Camera camera;
+    bool camera_initialized = false;
     std::string status = "building g1";
     std::string presentation_status;
 };
+
+void ensure_camera(RezonalityInstance* instance, const ShaderBuild& build)
+{
+    if (!instance || instance->camera_initialized)
+        return;
+    const auto model_pass = std::find_if(build.passes.begin(),
+        build.passes.end(), [](const auto& pass) {
+            return pass.model_index.has_value();
+        });
+    if (model_pass != build.passes.end())
+        instance->camera = model_pass->camera;
+    else if (!build.passes.empty())
+        instance->camera = build.passes.front().camera;
+    instance->camera_initialized = true;
+}
 
 void log(RezonalityInstance* instance, uint32_t level,
     const std::string& message)
@@ -1430,15 +1960,37 @@ int32_t handle_input(void* opaque, const DraxulPluginInputEventV2* event)
 {
     auto* instance = static_cast<RezonalityInstance*>(opaque);
     if (!instance || !event
-        || event->struct_size < sizeof(DraxulPluginInputEventV2)
-        || event->kind != DRAXUL_PLUGIN_INPUT_KEY
-        || !event->pressed || event->logical_key != 32)
+        || event->struct_size < sizeof(DraxulPluginInputEventV2))
         return 0;
-    instance->paused = !instance->paused;
-    if (!instance->paused)
+
+    if (event->kind == DRAXUL_PLUGIN_INPUT_KEY
+        && event->pressed && event->logical_key == 32)
+    {
+        instance->paused = !instance->paused;
+        if (!instance->paused)
+            request_redraw(instance);
+        notify_presentation(instance);
+        return 1;
+    }
+    if (event->kind == DRAXUL_PLUGIN_INPUT_POINTER_MOVE
+        && (event->buttons & 1u) != 0)
+    {
+        rezonality::camera_orbit(instance->camera,
+            { event->delta_x * 0.25f, event->delta_y * 0.25f });
         request_redraw(instance);
-    notify_presentation(instance);
-    return 1;
+        return 1;
+    }
+    if (event->kind == DRAXUL_PLUGIN_INPUT_WHEEL
+        && event->delta_y != 0.0f)
+    {
+        rezonality::camera_dolly(instance->camera,
+            event->delta_y * 0.35f);
+        request_redraw(instance);
+        return 1;
+    }
+    return event->kind == DRAXUL_PLUGIN_INPUT_POINTER_BUTTON
+            && event->button == 1
+        ? 1 : 0;
 }
 
 DraxulPluginTickResultV2 tick(void* opaque,
@@ -1505,12 +2057,13 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         desired = &*instance->active_build;
     if (desired)
     {
+        ensure_camera(instance, *desired);
         static thread_local std::string error;
         error.clear();
         const uint64_t desired_generation = desired->generation;
         auto candidate = create_generation(
             instance->backend, *desired, *frame,
-            animation_seconds, error);
+            animation_seconds, instance->camera, error);
         if (candidate)
         {
             if (instance->backend.active)
@@ -1558,7 +2111,7 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
     const auto uniform = make_common_uniforms(
         animation_seconds,
         instance->backend.active->width,
-        instance->backend.active->height);
+        instance->backend.active->height, instance->camera);
     std::memcpy(static_cast<uint8_t*>(
                     instance->backend.active->uniform_buffer.contents)
             + uniform_offset,
@@ -1588,7 +2141,8 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                 {
                     render_pass.depthAttachment.texture = surface.texture;
                     render_pass.depthAttachment.loadAction
-                        = MTLLoadActionClear;
+                        = scene_pass.has_clear
+                        ? MTLLoadActionClear : MTLLoadActionLoad;
                     render_pass.depthAttachment.storeAction
                         = MTLStoreActionStore;
                     render_pass.depthAttachment.clearDepth = 1.0;
@@ -1610,8 +2164,13 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         id<MTLRenderCommandEncoder> encoder
             = [command renderCommandEncoderWithDescriptor:render_pass];
         [encoder setRenderPipelineState:scene_pass.pipeline];
-        [encoder setVertexBuffer:instance->backend.vertex_buffer
-                          offset:0 atIndex:0];
+        if (scene_pass.model_index)
+            [encoder setVertexBuffer:instance->backend.active->models[
+                    *scene_pass.model_index].vertex_buffer
+                              offset:0 atIndex:0];
+        else
+            [encoder setVertexBuffer:instance->backend.vertex_buffer
+                              offset:0 atIndex:0];
         [encoder setVertexBuffer:instance->backend.active->uniform_buffer
                           offset:uniform_offset atIndex:1];
         [encoder setFragmentBuffer:instance->backend.active->uniform_buffer
@@ -1626,14 +2185,54 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                     : instance->backend.active->clamp_sampler
                                      atIndex:index];
         }
+        if (scene_pass.model_index)
+        {
+            const auto& model = instance->backend.active->models[
+                *scene_pass.model_index];
+            [encoder setFragmentBuffer:model.material_buffer
+                                offset:0 atIndex:2];
+            for (NSUInteger kind = 0; kind < model.textures.size(); ++kind)
+            {
+                for (NSUInteger index = 0;
+                     index < rezonality::kMaxModelMaterials; ++index)
+                {
+                    const id<MTLTexture> texture = model.textures[kind][
+                        std::min(index, model.textures[kind].size() - 1)];
+                    const NSUInteger binding = 16
+                        + kind * rezonality::kMaxModelMaterials + index;
+                    [encoder setFragmentTexture:texture atIndex:binding];
+                    [encoder setFragmentSamplerState:
+                        instance->backend.active->repeat_sampler
+                                             atIndex:binding];
+                }
+            }
+        }
         const MTLViewport viewport{ static_cast<double>(origin_x),
             static_cast<double>(origin_y), static_cast<double>(width),
             static_cast<double>(height), 0.0, 1.0 };
         const MTLScissorRect scissor{ origin_x, origin_y, width, height };
         [encoder setViewport:viewport];
         [encoder setScissorRect:scissor];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                     vertexStart:0 vertexCount:6];
+        if (scene_pass.model_index)
+        {
+            const auto& model = instance->backend.active->models[
+                *scene_pass.model_index];
+            for (const auto& part : model.parts)
+            {
+                uint32_t material_index = part.material_index;
+                [encoder setFragmentBytes:&material_index
+                                   length:sizeof(material_index) atIndex:0];
+                [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                     indexCount:part.index_count
+                                      indexType:MTLIndexTypeUInt32
+                                    indexBuffer:model.index_buffer
+                              indexBufferOffset:part.index_offset
+                                  * sizeof(uint32_t)];
+            }
+        }
+        else
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                         vertexStart:0 vertexCount:6];
         [encoder endEncoding];
     }
     if (frame->frame_index < 64)
@@ -1682,12 +2281,13 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
         desired = &*instance->active_build;
     if (desired)
     {
+        ensure_camera(instance, *desired);
         static thread_local std::string error;
         error.clear();
         const uint64_t desired_generation = desired->generation;
         auto candidate = create_generation(
             instance->backend, *desired, *frame,
-            animation_seconds, error);
+            animation_seconds, instance->camera, error);
         if (candidate)
         {
             if (instance->backend.active)
@@ -1735,7 +2335,7 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
     const auto uniform = make_common_uniforms(
         animation_seconds,
         instance->backend.active->width,
-        instance->backend.active->height);
+        instance->backend.active->height, instance->camera);
     std::memcpy(static_cast<uint8_t*>(
                     instance->backend.active->uniform_buffer.mapped)
             + uniform_offset,
@@ -1811,15 +2411,39 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
         vkCmdSetScissor(command, 0, 1, &scissor);
         vkCmdBindPipeline(
             command, VK_PIPELINE_BIND_POINT_GRAPHICS, pass.pipeline);
-        const VkDescriptorSet sets[]
+        std::vector<VkDescriptorSet> sets
             = { pass.uniform_set, pass.sampler_set };
+        if (pass.model_index)
+            sets.push_back(instance->backend.active->models[
+                *pass.model_index].descriptor_set);
         const uint32_t dynamic_offset
             = static_cast<uint32_t>(uniform_offset);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pass.layout, 0, 2, sets, 1, &dynamic_offset);
-        vkCmdBindVertexBuffers(command, 0, 1,
-            &instance->backend.vertex_buffer, &offset);
-        vkCmdDraw(command, 6, 1, 0, 0);
+            pass.layout, 0, static_cast<uint32_t>(sets.size()),
+            sets.data(), 1, &dynamic_offset);
+        if (pass.model_index)
+        {
+            const auto& model = instance->backend.active->models[
+                *pass.model_index];
+            vkCmdBindVertexBuffers(command, 0, 1,
+                &model.vertex_buffer.buffer, &offset);
+            vkCmdBindIndexBuffer(command, model.index_buffer.buffer, 0,
+                VK_INDEX_TYPE_UINT32);
+            for (const auto& part : model.parts)
+            {
+                vkCmdPushConstants(command, pass.layout,
+                    VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t),
+                    &part.material_index);
+                vkCmdDrawIndexed(command, part.index_count, 1,
+                    part.index_offset, 0, 0);
+            }
+        }
+        else
+        {
+            vkCmdBindVertexBuffers(command, 0, 1,
+                &instance->backend.vertex_buffer, &offset);
+            vkCmdDraw(command, 6, 1, 0, 0);
+        }
         vkCmdEndRenderPass(command);
     }
     if (frame->frame_index < 64)

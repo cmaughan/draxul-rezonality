@@ -1,20 +1,34 @@
-// Run the preserved VkLive protoplanetary shader directly. Only its original
-// model/normal overlay remains deferred until Rezonality's model slice; the
-// raymarched disk, noise field, stars, colour, and final composite are intact.
+// Preserved VkLive protoplanetary raymarch plus its model overlay.
 surface: Noise { path: noise.png }
 surface: A {
     scale: (1, 1, 1)
     format: default_color
     clear: (0.0, 0.0, 0.0, 0.0)
 }
+surface: Depth {
+    scale: (1, 1, 1)
+    format: default_depth
+}
+model: sphere {
+    path: vklive-original/sphere.gltf
+    scale: (1.0, 1.0, 1.0)
+}
 pass: Pass1 {
     samplers: (Noise)
-    targets: (A)
+    targets: (A, Depth)
     clear: (0.0, 0.0, 0.0, 1.0)
     geometry: background {
         path: screen_rect
         vs: vklive-original/screen.vert
         fs: vklive-original/screen.frag
+    }
+}
+pass: Pass2 {
+    targets: (A, Depth)
+    geometry: shape {
+        model: sphere
+        vs: vklive-original/geom.vert
+        fs: vklive-original/geom.frag
     }
 }
 pass: Pass4 {

@@ -19,6 +19,30 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
     FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
+if(NOT TARGET assimp::assimp)
+    include(FetchContent)
+    set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_NO_EXPORT ON CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_GLTF_IMPORTER ON CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        rezonality_assimp
+        GIT_REPOSITORY https://github.com/assimp/assimp.git
+        GIT_TAG v5.4.3
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(rezonality_assimp)
+    # Assimp sets a global debug postfix in its cache. Draxul deliberately
+    # keeps one binary name across configurations because manifests name the
+    # module explicitly.
+    set(CMAKE_DEBUG_POSTFIX "" CACHE STRING "" FORCE)
+endif()
+
 if(APPLE)
     include(FetchContent)
     set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
@@ -39,17 +63,25 @@ elseif(NOT TARGET Vulkan::Vulkan)
 endif()
 
 set(_rezonality_sources
+    src/camera.cpp
+    src/camera.h
     src/image_loader.cpp
     src/image_loader.h
     src/live_project.cpp
     src/live_project.h
+    src/model_loader.cpp
+    src/model_loader.h
     src/rezonality_plugin.cpp)
 
 add_library(draxul-rezonality-plugin MODULE ${_rezonality_sources})
 target_link_libraries(draxul-rezonality-plugin PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
+    assimp::assimp
+    glm::glm
     nlohmann_json::nlohmann_json)
+target_compile_definitions(draxul-rezonality-plugin PRIVATE
+    GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_include_directories(draxul-rezonality-plugin PRIVATE ${stb_SOURCE_DIR})
 if(APPLE)
     set_source_files_properties(src/rezonality_plugin.cpp
@@ -66,6 +98,7 @@ else()
 endif()
 set_target_properties(draxul-rezonality-plugin PROPERTIES
     PREFIX ""
+    DEBUG_POSTFIX ""
     OUTPUT_NAME "draxul-rezonality")
 
 if(COMMAND draxul_apply_sanitizers)
