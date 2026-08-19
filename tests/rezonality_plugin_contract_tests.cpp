@@ -438,7 +438,7 @@ TEST_CASE("Rezonality compiles every staged example",
     const std::string directory = plugin_root().string();
     for (const std::string_view example : { "simple", "default", "blend_waves",
              "deferred_shading", "protoplanetary_disc", "pbr_robot",
-             "ray_tracer", "audio_spectrum_analysis" })
+             "robot2", "ray_tracer", "audio_spectrum_analysis" })
     {
         DYNAMIC_SECTION(example)
         {

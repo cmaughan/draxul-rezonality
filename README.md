@@ -61,9 +61,12 @@ the agent-readable status described below; it accepts letters, digits, `.`,
 
 Omit `project_path` to open the bundled `examples/simple` project. Bundled
 `default`, `blend_waves`, `deferred_shading`, `protoplanetary_disc`,
-`pbr_robot`, `ray_tracer`, and `audio_spectrum_analysis` projects exercise depth, MRT, float targets,
+`pbr_robot`, `robot2`, `ray_tracer`, and `audio_spectrum_analysis` projects exercise depth, MRT, float targets,
 ordered sampling, Assimp model loading, textured PBR materials, HDR
 environments, acceleration structures, and native ray dispatch. The
+`robot2` variant preserves the neon procedural environment and reflective
+lighting experiment while `pbr_robot` remains the original reference scene.
+The
 protoplanetary demo now runs its preserved VkLive raymarch, sphere overlay, and
 composite shaders directly. Its active live-edit sources are
 `examples/protoplanetary_disc/vklive-original/screen.frag` and
