@@ -468,6 +468,14 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         R"(\bvs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
     static const std::regex fragment_expression(
         R"(\bfs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
+    static const std::regex raygen_expression(
+        R"(\bray_gen\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
+    static const std::regex miss_expression(
+        R"(\bmiss\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
+    static const std::regex closest_hit_expression(
+        R"(\bclosest_hit\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
+    static const std::regex metal_ray_expression(
+        R"(\bmetal_ray\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
 
     SceneDescription description;
     description.scenegraph = scenegraph;
@@ -569,16 +577,8 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
     {
         const auto vertex = first_match(body, vertex_expression);
         const auto fragment = first_match(body, fragment_expression);
-        if (!vertex || !fragment)
-        {
-            error = "Pass '" + name + "' must declare both vs: and fs:";
-            diagnostic_line = 1;
-            return std::nullopt;
-        }
         ShaderBuild::Pass pass;
         pass.name = name;
-        pass.vertex_path = options.project_path / fs::u8path(*vertex);
-        pass.fragment_path = options.project_path / fs::u8path(*fragment);
         pass.targets = parse_list(body, "targets");
         if (pass.targets.empty())
             pass.targets.push_back("default_color");
@@ -601,6 +601,40 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
             return std::nullopt;
         }
         const std::string& geometry_body = geometries.front().second;
+        const auto raygen = first_match(geometry_body, raygen_expression);
+        const auto miss = first_match(geometry_body, miss_expression);
+        const auto closest_hit = first_match(
+            geometry_body, closest_hit_expression);
+        const auto metal_ray = first_match(
+            geometry_body, metal_ray_expression);
+        pass.ray_trace = raygen || miss || closest_hit || metal_ray;
+        if (pass.ray_trace)
+        {
+            if (!raygen || !miss || !closest_hit || !metal_ray)
+            {
+                error = "Ray pass '" + name
+                    + "' must declare ray_gen, miss, closest_hit, and metal_ray";
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.raygen_path = options.project_path / fs::u8path(*raygen);
+            pass.miss_path = options.project_path / fs::u8path(*miss);
+            pass.closest_hit_path
+                = options.project_path / fs::u8path(*closest_hit);
+            pass.metal_ray_path
+                = options.project_path / fs::u8path(*metal_ray);
+        }
+        else
+        {
+            if (!vertex || !fragment)
+            {
+                error = "Pass '" + name + "' must declare both vs: and fs:";
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.vertex_path = options.project_path / fs::u8path(*vertex);
+            pass.fragment_path = options.project_path / fs::u8path(*fragment);
+        }
         const auto model_name = first_match(geometry_body,
             std::regex(R"(\bmodel\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*))"));
         const auto geometry_path = first_match(geometry_body,
@@ -640,6 +674,12 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
             }
             pass.model_index = description.models.size();
             description.models.push_back(std::move(model));
+        }
+        if (pass.ray_trace && !pass.model_index)
+        {
+            error = "Ray pass '" + name + "' must reference model geometry";
+            diagnostic_line = 1;
+            return std::nullopt;
         }
         const auto camera_name = first_match(body,
             std::regex(R"(\bcamera\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*))"));
@@ -715,7 +755,8 @@ bool compile_shader(const fs::path& compiler, const fs::path& project_path,
     int& diagnostic_line, std::string& error)
 {
     std::vector<fs::path> arguments{
-        compiler, "-V", shader, "-o", output_path, "-l", "-g",
+        compiler, "-V", "--target-env", "vulkan1.2", shader,
+        "-o", output_path, "-l", "-g",
         fs::path("-I" + project_path.string())
     };
     ProcessResult process = run_process(arguments);
@@ -885,6 +926,8 @@ uint64_t LiveProject::project_fingerprint() const
             if (extension == ".toml" || extension == ".scenegraph"
                 || extension == ".vert" || extension == ".frag"
                 || extension == ".glsl" || extension == ".h"
+                || extension == ".rgen" || extension == ".rmiss"
+                || extension == ".rchit" || extension == ".metal"
                 || extension == ".png" || extension == ".jpg"
                 || extension == ".jpeg" || extension == ".bmp"
                 || extension == ".hdr" || extension == ".gltf"
@@ -970,6 +1013,45 @@ BuildResult LiveProject::build(uint64_t generation) const
         auto& pass = candidate.passes[index];
         const std::string stem = std::to_string(generation) + "-"
             + std::to_string(index);
+        if (pass.ray_trace)
+        {
+            const fs::path raygen_output
+                = output_directory / ("raygen-" + stem + ".spv");
+            const fs::path miss_output
+                = output_directory / ("miss-" + stem + ".spv");
+            const fs::path closest_output
+                = output_directory / ("closest-" + stem + ".spv");
+            if (!compile_shader(compiler, options_.project_path,
+                    pass.raygen_path, raygen_output, pass.raygen_spirv,
+                    result.diagnostic_path, result.diagnostic_line,
+                    result.error)
+                || !compile_shader(compiler, options_.project_path,
+                    pass.miss_path, miss_output, pass.miss_spirv,
+                    result.diagnostic_path, result.diagnostic_line,
+                    result.error)
+                || !compile_shader(compiler, options_.project_path,
+                    pass.closest_hit_path, closest_output,
+                    pass.closest_hit_spirv, result.diagnostic_path,
+                    result.diagnostic_line, result.error))
+            {
+                fs::remove(raygen_output, ec);
+                fs::remove(miss_output, ec);
+                fs::remove(closest_output, ec);
+                return result;
+            }
+            fs::remove(raygen_output, ec);
+            fs::remove(miss_output, ec);
+            fs::remove(closest_output, ec);
+            const auto metal_source = read_text(pass.metal_ray_path);
+            if (!metal_source)
+            {
+                result.diagnostic_path = pass.metal_ray_path;
+                result.error = "Native Metal ray shader is missing";
+                return result;
+            }
+            pass.metal_ray_source = *metal_source;
+            continue;
+        }
         const fs::path vertex_output
             = output_directory / ("vertex-" + stem + ".spv");
         const fs::path fragment_output

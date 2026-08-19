@@ -1,6 +1,6 @@
 # Rezonality Draxul plugin port plan
 
-Status: slice 3 implemented on Windows; Metal implementation awaiting macOS validation
+Status: slice 4 implemented on Windows; Metal implementation awaiting macOS validation
 Priority: failure-tolerant live editing first  
 Target plugin: `dev.draxul.rezonality`
 
@@ -318,6 +318,12 @@ Manual check: open two Rezonality panes, orbit the robot in one, edit the other,
 and confirm state and resources do not leak between them.
 
 ### Slice 4 - Ray paths and backend capability handling
+
+Status: implemented in plugin version 0.5.0. Windows Vulkan uses the preserved
+Cornell-box geometry and ray shader stages, with a deterministic render
+snapshot and real invalid/repair candidate coverage. The paired native Metal
+acceleration-structure and compute path is implemented, but its build, snapshot,
+and interactive validation remain a macOS gate.
 
 Deliver:
 

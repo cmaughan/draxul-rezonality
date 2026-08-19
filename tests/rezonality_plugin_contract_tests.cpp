@@ -158,7 +158,7 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     CHECK(api->abi_version == DRAXUL_PLUGIN_ABI_VERSION);
     CHECK(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
     CHECK(std::string_view(api->display_name) == "Rezonality");
-    CHECK(std::string_view(api->plugin_version) == "0.4.0");
+    CHECK(std::string_view(api->plugin_version) == "0.5.0");
 #if defined(__APPLE__)
     CHECK(api->supported_backends == DRAXUL_PLUGIN_BACKEND_METAL);
 #else
@@ -353,7 +353,8 @@ TEST_CASE("Rezonality compiles every staged multipass example",
     REQUIRE(api != nullptr);
     const std::string directory = plugin_root().string();
     for (const std::string_view example : { "default", "blend_waves",
-             "deferred_shading", "protoplanetary_disc", "pbr_robot" })
+             "deferred_shading", "protoplanetary_disc", "pbr_robot",
+             "ray_tracer" })
     {
         DYNAMIC_SECTION(example)
         {
@@ -510,7 +511,7 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     const auto* api = module.api();
     REQUIRE(api != nullptr);
     REQUIRE(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
-    REQUIRE(std::string_view(api->plugin_version) == "0.4.0");
+    REQUIRE(std::string_view(api->plugin_version) == "0.5.0");
 
     const auto fixture_id = std::chrono::steady_clock::now()
                                 .time_since_epoch()
@@ -607,6 +608,97 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     REQUIRE_FALSE(ec);
     write_text(scene_path, scene);
     reload_and_wait("ready g8");
+
+    api->quiesce_instance(instance);
+    api->destroy_instance(instance);
+    fs::remove_all(fixture, ec);
+    CHECK_FALSE(ec);
+}
+
+TEST_CASE("The staged Rezonality module rejects and repairs ray candidates",
+    "[rezonality][integration][dynamic][ray]")
+{
+    namespace fs = std::filesystem;
+    DynamicPluginModule module(fs::path(DRAXUL_REZONALITY_MODULE_PATH));
+    const auto* api = module.api();
+    REQUIRE(api != nullptr);
+
+    const auto fixture_id = std::chrono::steady_clock::now()
+                                .time_since_epoch()
+                                .count();
+    const fs::path fixture = fs::temp_directory_path()
+        / ("draxul-rezonality-ray-edit-smoke-"
+            + std::to_string(fixture_id));
+    std::error_code ec;
+    REQUIRE(fs::create_directories(fixture));
+    fs::copy(plugin_root() / "examples" / "ray_tracer", fixture,
+        fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+        ec);
+    REQUIRE_FALSE(ec);
+
+    HostState host_state;
+    DraxulPluginHostApiV2 host{};
+    host.struct_size = sizeof(host);
+    host.abi_version = DRAXUL_PLUGIN_ABI_VERSION;
+    host.host_context = &host_state;
+    host.request_redraw = &request_redraw;
+    host.request_tick = &request_tick;
+    host.notify_presentation_changed = &request_noop;
+    host.log = &log_noop;
+    host.query_service = &query_service_noop;
+    const std::string directory = plugin_root().string();
+    const std::string config = nlohmann::json{
+        { "project_path", fixture.string() },
+        { "auto_reload", false },
+        { "paused", true },
+        { "compile_debounce_ms", 25 },
+    }.dump();
+    DraxulPluginCreateInfoV2 create_info{};
+    create_info.struct_size = sizeof(create_info);
+    create_info.host = &host;
+    create_info.plugin_id = api->plugin_id;
+    create_info.plugin_directory_utf8 = directory.c_str();
+    create_info.config_json = config.data();
+    create_info.config_json_length = config.size();
+    create_info.initial_viewport = {
+        sizeof(DraxulPluginViewportV2), 0, 0, 960, 640, 1.0f, 96.0f
+    };
+    void* instance = api->create_instance(&create_info);
+    REQUIRE(instance != nullptr);
+    DraxulPluginPresentationExtensionV2 presentation{};
+    REQUIRE(api->query_extension(instance,
+        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+        &presentation, sizeof(presentation)) != 0);
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g1"));
+    const auto reload_and_wait = [&](std::string_view expected) {
+        REQUIRE(presentation.dispatch_action(instance,
+            "rezonality_reload", sizeof("rezonality_reload") - 1) != 0);
+        REQUIRE(wait_for_status(*api, instance, presentation, expected));
+    };
+
+    const fs::path raygen_path = fixture / "rt_gen.rgen";
+    const std::string raygen = read_text(raygen_path);
+    write_text(raygen_path, raygen + "\n// valid ray shader edit\n");
+    reload_and_wait("ready g2");
+    write_text(raygen_path, raygen + "\nthis is not valid GLSL\n");
+    reload_and_wait("error g3");
+    CHECK(presentation_status(instance, presentation).find("rt_gen.rgen")
+        != std::string::npos);
+    write_text(raygen_path, raygen);
+    reload_and_wait("ready g4");
+
+    const fs::path model = fixture / "cornell-box.obj";
+    const fs::path hidden_model = model.string() + ".missing";
+    fs::rename(model, hidden_model, ec);
+    REQUIRE_FALSE(ec);
+    reload_and_wait("error g5");
+    CHECK(presentation_status(instance, presentation).find("cornell-box.obj")
+        != std::string::npos);
+    fs::rename(hidden_model, model, ec);
+    REQUIRE_FALSE(ec);
+    reload_and_wait("ready g6");
 
     api->quiesce_instance(instance);
     api->destroy_instance(instance);

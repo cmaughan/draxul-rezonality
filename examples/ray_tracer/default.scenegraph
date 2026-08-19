@@ -1,0 +1,42 @@
+surface: RayTraceTarget {
+    scale: (1, 1, 1)
+    format: rgba8
+}
+
+camera: default_camera {
+    // VkLive's importer inverted Y. Rezonality keeps model coordinates, so
+    // mirror the original camera into the Cornell box's positive-Y space.
+    position: (-0.25, 2.5, 9.0)
+    look_at: (-0.25, 2.5, -2.5)
+    field_of_view: 45.0
+    near_far: (0.01, 20.0)
+}
+
+pass: TracePass {
+    clear: (0.1, 0.1, 0.1, 1.0)
+    targets: (RayTraceTarget)
+    geometry: shape {
+        path: cornell-box.obj
+        build_as: true
+        metal_ray: rt_trace.metal
+
+        ray_group_general: raygen {
+            ray_gen: rt_gen.rgen
+        }
+        ray_group_general: miss {
+            miss: rt_miss.rmiss
+        }
+        ray_group_triangles: hit {
+            closest_hit: rt_closest.rchit
+        }
+    }
+}
+
+pass: Copy {
+    samplers: (RayTraceTarget)
+    geometry: copy {
+        path: screen_rect
+        vs: copy.vert
+        fs: copy.frag
+    }
+}

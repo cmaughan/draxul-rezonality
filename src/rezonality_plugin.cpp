@@ -41,6 +41,7 @@ using rezonality::LiveProject;
 using rezonality::ShaderBuild;
 
 constexpr const char* kPluginId = "dev.draxul.rezonality";
+constexpr const char* kPluginVersion = "0.5.0";
 constexpr size_t kCommonUniformFloatCount = 192;
 using CommonUniformBlock = std::array<float, kCommonUniformFloatCount>;
 
@@ -62,6 +63,8 @@ CommonUniformBlock make_common_uniforms(double elapsed_seconds,
     uniform[3] = time * 60.0f;
     uniform[4] = 60.0f;
     uniform[6] = 1.0f;
+    const uint32_t vertex_size = sizeof(rezonality::ModelVertex);
+    std::memcpy(&uniform[7], &vertex_size, sizeof(vertex_size));
     uniform[8] = static_cast<float>(width);
     uniform[9] = static_cast<float>(height);
     uniform[10] = 1.0f;
@@ -121,9 +124,11 @@ struct MetalGeneration
     struct Pass
     {
         id<MTLRenderPipelineState> pipeline = nil;
+        id<MTLComputePipelineState> ray_pipeline = nil;
         std::vector<size_t> targets;
         std::vector<size_t> samplers;
         std::optional<size_t> model_index;
+        bool ray_trace = false;
         bool direct = false;
         bool has_clear = false;
         float clear[4] = { 0, 0, 0, 1 };
@@ -135,6 +140,13 @@ struct MetalGeneration
         id<MTLBuffer> material_buffer = nil;
         std::array<std::vector<id<MTLTexture>>, 5> textures;
         std::vector<rezonality::ModelPart> parts;
+        id<MTLAccelerationStructure> blas = nil;
+        id<MTLAccelerationStructure> tlas = nil;
+        id<MTLBuffer> acceleration_scratch = nil;
+        id<MTLBuffer> acceleration_instances = nil;
+        MTLPrimitiveAccelerationStructureDescriptor* blas_descriptor = nil;
+        MTLInstanceAccelerationStructureDescriptor* tlas_descriptor = nil;
+        bool acceleration_structures_built = false;
     };
     std::vector<Surface> surfaces;
     std::vector<Model> models;
@@ -149,11 +161,16 @@ struct MetalGeneration
     uint32_t height = 0;
     uint64_t source_generation = 0;
     uint64_t used_slots = 0;
+    bool ray_project = false;
 };
 
 struct RetiredGeneration
 {
     MetalGeneration generation;
+    generation.ray_project = std::any_of(build.passes.begin(),
+        build.passes.end(), [](const auto& pass) {
+            return pass.ray_trace;
+        });
     uint64_t pending_slots = 0;
 };
 
@@ -303,6 +320,81 @@ std::optional<MetalGeneration::Model> create_metal_model(
     return model;
 }
 
+bool create_metal_acceleration_resources(id<MTLDevice> device,
+    const rezonality::ModelData& source, MetalGeneration::Model& model,
+    std::string& error)
+{
+    if (@available(macOS 11.0, *))
+    {
+        if (![device supportsRaytracing])
+        {
+            error = "Metal ray tracing is unsupported by this device";
+            return false;
+        }
+        MTLAccelerationStructureTriangleGeometryDescriptor* geometry
+            = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+        geometry.vertexBuffer = model.vertex_buffer;
+        geometry.vertexBufferOffset
+            = offsetof(rezonality::ModelVertex, position);
+        geometry.vertexStride = sizeof(rezonality::ModelVertex);
+        if (@available(macOS 13.0, *))
+            geometry.vertexFormat = MTLAttributeFormatFloat3;
+        geometry.indexBuffer = model.index_buffer;
+        geometry.indexBufferOffset = 0;
+        geometry.indexType = MTLIndexTypeUInt32;
+        geometry.triangleCount = source.indices.size() / 3;
+        geometry.opaque = YES;
+        model.blas_descriptor
+            = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+        model.blas_descriptor.geometryDescriptors = @[ geometry ];
+        const MTLAccelerationStructureSizes blas_sizes
+            = [device accelerationStructureSizesWithDescriptor:
+                model.blas_descriptor];
+        model.blas = [device newAccelerationStructureWithSize:
+            blas_sizes.accelerationStructureSize];
+        MTLAccelerationStructureInstanceDescriptor instance{};
+        instance.transformationMatrix = MTLPackedFloat4x3(
+            MTLPackedFloat3(1.0f, 0.0f, 0.0f),
+            MTLPackedFloat3(0.0f, 1.0f, 0.0f),
+            MTLPackedFloat3(0.0f, 0.0f, 1.0f),
+            MTLPackedFloat3(0.0f, 0.0f, 0.0f));
+        instance.mask = 0xff;
+        instance.accelerationStructureIndex = 0;
+        model.acceleration_instances = [device newBufferWithBytes:&instance
+            length:sizeof(instance) options:MTLResourceStorageModeShared];
+        model.tlas_descriptor
+            = [MTLInstanceAccelerationStructureDescriptor descriptor];
+        model.tlas_descriptor.instanceDescriptorBuffer
+            = model.acceleration_instances;
+        model.tlas_descriptor.instanceDescriptorStride
+            = sizeof(MTLAccelerationStructureInstanceDescriptor);
+        model.tlas_descriptor.instanceCount = 1;
+        model.tlas_descriptor.instancedAccelerationStructures
+            = @[ model.blas ];
+        if (@available(macOS 12.0, *))
+            model.tlas_descriptor.instanceDescriptorType
+                = MTLAccelerationStructureInstanceDescriptorTypeDefault;
+        const MTLAccelerationStructureSizes tlas_sizes
+            = [device accelerationStructureSizesWithDescriptor:
+                model.tlas_descriptor];
+        model.tlas = [device newAccelerationStructureWithSize:
+            tlas_sizes.accelerationStructureSize];
+        model.acceleration_scratch = [device newBufferWithLength:
+            std::max(blas_sizes.buildScratchBufferSize,
+                tlas_sizes.buildScratchBufferSize)
+            options:MTLResourceStorageModePrivate];
+        if (!model.blas || !model.tlas || !model.acceleration_instances
+            || !model.acceleration_scratch)
+        {
+            error = "Rezonality could not allocate Metal ray resources";
+            return false;
+        }
+        return true;
+    }
+    error = "Metal ray tracing requires macOS 11 or newer";
+    return false;
+}
+
 std::optional<MetalGeneration> create_generation(BackendState& backend,
     const ShaderBuild& build, const DraxulPluginMetalFrameV2& frame,
     double animation_seconds, const rezonality::Camera& camera,
@@ -421,7 +513,9 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
             ? MTLStorageModePrivate : MTLStorageModeManaged;
         texture.usage = surface.depth
             ? MTLTextureUsageRenderTarget
-            : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+                | (generation.ray_project
+                        ? MTLTextureUsageShaderWrite : 0);
         switch (source.format)
         {
         case ShaderBuild::SurfaceFormat::Color16Float:
@@ -478,6 +572,7 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         const auto& source = build.passes[index];
         MetalGeneration::Pass pass;
         pass.model_index = source.model_index;
+        pass.ray_trace = source.ray_trace;
         pass.has_clear = source.has_clear;
         std::copy(std::begin(source.clear), std::end(source.clear),
             std::begin(pass.clear));
@@ -509,6 +604,40 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                 return std::nullopt;
             }
             pass.samplers.push_back(*surface);
+        }
+        if (source.ray_trace)
+        {
+            if (!source.model_index
+                || *source.model_index >= generation.models.size()
+                || pass.targets.size() != 1)
+            {
+                error = "Metal ray pass '" + source.name
+                    + "' requires one model and one target";
+                return std::nullopt;
+            }
+            auto& model = generation.models[*source.model_index];
+            if (!model.blas
+                && !create_metal_acceleration_resources(device,
+                    build.models[*source.model_index], model, error))
+                return std::nullopt;
+            NSError* compile_error = nil;
+            id<MTLLibrary> library = [device
+                newLibraryWithSource:[NSString stringWithUTF8String:
+                    source.metal_ray_source.c_str()]
+                options:nil error:&compile_error];
+            id<MTLFunction> function = library
+                ? [library newFunctionWithName:@"vklive_ray_trace"] : nil;
+            pass.ray_pipeline = function
+                ? [device newComputePipelineStateWithFunction:function
+                    error:&compile_error] : nil;
+            if (!pass.ray_pipeline)
+            {
+                error = "Metal ray shader failed for pass '" + source.name
+                    + "': " + ns_error(compile_error);
+                return std::nullopt;
+            }
+            generation.passes.push_back(std::move(pass));
+            continue;
         }
         const std::string vertex_entry
             = "rezonality_vertex_" + std::to_string(index);
@@ -612,6 +741,15 @@ struct VulkanModelResource
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     std::vector<rezonality::ModelPart> parts;
+    draxul::vkresources::BufferResource blas_buffer;
+    draxul::vkresources::BufferResource tlas_buffer;
+    draxul::vkresources::BufferResource as_scratch_buffer;
+    draxul::vkresources::BufferResource as_instance_buffer;
+    VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
+    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
+    uint32_t vertex_count = 0;
+    uint32_t index_count = 0;
+    bool acceleration_structures_built = false;
 };
 
 struct VulkanPassResource
@@ -625,8 +763,16 @@ struct VulkanPassResource
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet uniform_set = VK_NULL_HANDLE;
     VkDescriptorSet sampler_set = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ray_layout = VK_NULL_HANDLE;
+    VkDescriptorSet ray_set = VK_NULL_HANDLE;
+    draxul::vkresources::BufferResource shader_binding_table;
+    VkStridedDeviceAddressRegionKHR raygen_region{};
+    VkStridedDeviceAddressRegionKHR miss_region{};
+    VkStridedDeviceAddressRegionKHR hit_region{};
+    VkStridedDeviceAddressRegionKHR callable_region{};
     std::vector<size_t> target_surfaces;
     std::optional<size_t> model_index;
+    bool ray_trace = false;
     bool direct = false;
     bool has_clear = false;
     float clear[4] = { 0, 0, 0, 1 };
@@ -634,6 +780,17 @@ struct VulkanPassResource
 
 struct VulkanGeneration
 {
+    struct RayFunctions
+    {
+        PFN_vkCreateAccelerationStructureKHR create_acceleration_structure = nullptr;
+        PFN_vkDestroyAccelerationStructureKHR destroy_acceleration_structure = nullptr;
+        PFN_vkGetAccelerationStructureBuildSizesKHR get_build_sizes = nullptr;
+        PFN_vkGetAccelerationStructureDeviceAddressKHR get_acceleration_address = nullptr;
+        PFN_vkCmdBuildAccelerationStructuresKHR cmd_build = nullptr;
+        PFN_vkCreateRayTracingPipelinesKHR create_pipeline = nullptr;
+        PFN_vkGetRayTracingShaderGroupHandlesKHR get_group_handles = nullptr;
+        PFN_vkCmdTraceRaysKHR cmd_trace = nullptr;
+    } ray;
     VkDevice device = VK_NULL_HANDLE;
     VkRenderPass render_pass = VK_NULL_HANDLE;
     VmaAllocator allocator = VK_NULL_HANDLE;
@@ -648,6 +805,7 @@ struct VulkanGeneration
     uint64_t target_generation = 0;
     uint64_t source_generation = 0;
     uint64_t used_slots = 0;
+    bool ray_project = false;
 };
 
 struct RetiredGeneration
@@ -685,6 +843,11 @@ void destroy_generation(VulkanGeneration& generation)
             vkDestroyDescriptorSetLayout(generation.device, pass.uniform_layout, nullptr);
         if (pass.sampler_layout)
             vkDestroyDescriptorSetLayout(generation.device, pass.sampler_layout, nullptr);
+        if (pass.ray_layout)
+            vkDestroyDescriptorSetLayout(
+                generation.device, pass.ray_layout, nullptr);
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, pass.shader_binding_table);
     }
     for (auto& surface : generation.surfaces)
     {
@@ -697,6 +860,12 @@ void destroy_generation(VulkanGeneration& generation)
     }
     for (auto& model : generation.models)
     {
+        if (model.tlas && generation.ray.destroy_acceleration_structure)
+            generation.ray.destroy_acceleration_structure(
+                generation.device, model.tlas, nullptr);
+        if (model.blas && generation.ray.destroy_acceleration_structure)
+            generation.ray.destroy_acceleration_structure(
+                generation.device, model.blas, nullptr);
         if (model.descriptor_pool)
             vkDestroyDescriptorPool(
                 generation.device, model.descriptor_pool, nullptr);
@@ -720,6 +889,14 @@ void destroy_generation(VulkanGeneration& generation)
             generation.allocator, model.index_buffer);
         draxul::vkresources::destroy_buffer(
             generation.allocator, model.material_buffer);
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, model.as_instance_buffer);
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, model.as_scratch_buffer);
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, model.tlas_buffer);
+        draxul::vkresources::destroy_buffer(
+            generation.allocator, model.blas_buffer);
     }
     draxul::vkresources::destroy_buffer(
         generation.allocator, generation.uniform_buffer);
@@ -876,7 +1053,8 @@ bool create_surface(VulkanGeneration& generation,
     const VkImageUsageFlags usage = depth
         ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
         : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            | (generation.ray_project ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
     const draxul::vkresources::AttachmentRequest request(
         static_cast<int>(surface.width), static_cast<int>(surface.height),
         surface.format, usage, surface.aspect, VK_SAMPLE_COUNT_1_BIT, 0,
@@ -995,6 +1173,187 @@ bool create_model_texture(VulkanGeneration& generation,
     return true;
 }
 
+VkDeviceAddress buffer_address(
+    VkDevice device, VkBuffer buffer)
+{
+    VkBufferDeviceAddressInfo info{
+        VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO
+    };
+    info.buffer = buffer;
+    return vkGetBufferDeviceAddress(device, &info);
+}
+
+bool create_owned_buffer(VulkanGeneration& generation, VkDeviceSize size,
+    VkBufferUsageFlags usage,
+    draxul::vkresources::MemoryPolicy memory,
+    std::string_view name, const void* data,
+    draxul::vkresources::BufferResource& output, std::string& error)
+{
+    draxul::vkresources::ScopedBuffer scoped;
+    const draxul::vkresources::BufferRequest request(size, usage, memory,
+        std::string(name),
+        draxul::vkresources::LifetimeScope::Persistent);
+    if (!draxul::vkresources::create_buffer(generation.device,
+            generation.allocator, request, scoped, error))
+        return false;
+    output = scoped.release();
+    if (data)
+    {
+        if (!output.mapped)
+        {
+            error = "Rezonality GPU upload buffer was not mapped";
+            return false;
+        }
+        std::memcpy(output.mapped, data, static_cast<size_t>(size));
+        vmaFlushAllocation(
+            generation.allocator, output.allocation, 0, size);
+    }
+    return true;
+}
+
+bool create_acceleration_structure(VulkanGeneration& generation,
+    VkAccelerationStructureTypeKHR type, VkDeviceSize size,
+    std::string_view name,
+    draxul::vkresources::BufferResource& buffer,
+    VkAccelerationStructureKHR& acceleration_structure,
+    std::string& error)
+{
+    if (!create_owned_buffer(generation, size,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            draxul::vkresources::MemoryPolicy::DevicePreferred,
+            name, nullptr, buffer, error))
+        return false;
+    VkAccelerationStructureCreateInfoKHR create_info{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR
+    };
+    create_info.buffer = buffer.buffer;
+    create_info.size = size;
+    create_info.type = type;
+    if (generation.ray.create_acceleration_structure(
+            generation.device, &create_info, nullptr,
+            &acceleration_structure) != VK_SUCCESS)
+    {
+        error = "Rezonality could not create a Vulkan acceleration structure";
+        return false;
+    }
+    return true;
+}
+
+bool create_model_acceleration_resources(VulkanGeneration& generation,
+    const rezonality::ModelData& source, VulkanModelResource& model,
+    std::string& error)
+{
+    model.vertex_count = static_cast<uint32_t>(source.vertices.size());
+    model.index_count = static_cast<uint32_t>(source.indices.size());
+    const VkDeviceAddress vertex_address
+        = buffer_address(generation.device, model.vertex_buffer.buffer);
+    const VkDeviceAddress index_address
+        = buffer_address(generation.device, model.index_buffer.buffer);
+    if (!vertex_address || !index_address)
+    {
+        error = "Rezonality could not address its Vulkan ray geometry";
+        return false;
+    }
+
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR
+    };
+    triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    triangles.vertexData.deviceAddress = vertex_address;
+    triangles.vertexStride = sizeof(rezonality::ModelVertex);
+    triangles.maxVertex = model.vertex_count - 1;
+    triangles.indexType = VK_INDEX_TYPE_UINT32;
+    triangles.indexData.deviceAddress = index_address;
+    VkAccelerationStructureGeometryKHR geometry{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+    };
+    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geometry.geometry.triangles = triangles;
+    VkAccelerationStructureBuildGeometryInfoKHR build_info{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+    };
+    build_info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    build_info.flags
+        = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    build_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    build_info.geometryCount = 1;
+    build_info.pGeometries = &geometry;
+    const uint32_t primitive_count = model.index_count / 3;
+    VkAccelerationStructureBuildSizesInfoKHR blas_sizes{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR
+    };
+    generation.ray.get_build_sizes(generation.device,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info,
+        &primitive_count, &blas_sizes);
+    if (!create_acceleration_structure(generation,
+            VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+            blas_sizes.accelerationStructureSize, "rezonality-ray-blas",
+            model.blas_buffer, model.blas, error))
+        return false;
+
+    VkAccelerationStructureDeviceAddressInfoKHR address_info{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR
+    };
+    address_info.accelerationStructure = model.blas;
+    VkAccelerationStructureInstanceKHR instance{};
+    instance.transform.matrix[0][0] = 1.0f;
+    instance.transform.matrix[1][1] = 1.0f;
+    instance.transform.matrix[2][2] = 1.0f;
+    instance.mask = 0xff;
+    instance.flags
+        = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    instance.accelerationStructureReference
+        = generation.ray.get_acceleration_address(
+            generation.device, &address_info);
+    if (!create_owned_buffer(generation, sizeof(instance),
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            draxul::vkresources::MemoryPolicy::HostSequentialWrite,
+            "rezonality-ray-instance", &instance,
+            model.as_instance_buffer, error))
+        return false;
+
+    VkAccelerationStructureGeometryInstancesDataKHR instances{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR
+    };
+    instances.data.deviceAddress = buffer_address(
+        generation.device, model.as_instance_buffer.buffer);
+    VkAccelerationStructureGeometryKHR tlas_geometry{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+    };
+    tlas_geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlas_geometry.geometry.instances = instances;
+    VkAccelerationStructureBuildGeometryInfoKHR tlas_build{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+    };
+    tlas_build.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlas_build.flags
+        = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    tlas_build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    tlas_build.geometryCount = 1;
+    tlas_build.pGeometries = &tlas_geometry;
+    constexpr uint32_t instance_count = 1;
+    VkAccelerationStructureBuildSizesInfoKHR tlas_sizes{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR
+    };
+    generation.ray.get_build_sizes(generation.device,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlas_build,
+        &instance_count, &tlas_sizes);
+    if (!create_acceleration_structure(generation,
+            VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+            tlas_sizes.accelerationStructureSize, "rezonality-ray-tlas",
+            model.tlas_buffer, model.tlas, error))
+        return false;
+    return create_owned_buffer(generation,
+        std::max(blas_sizes.buildScratchSize, tlas_sizes.buildScratchSize),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        draxul::vkresources::MemoryPolicy::DevicePreferred,
+        "rezonality-ray-scratch", nullptr, model.as_scratch_buffer, error);
+}
+
 bool create_model(VulkanGeneration& generation,
     const rezonality::ModelData& source, VulkanModelResource& model,
     std::string& error)
@@ -1016,12 +1375,20 @@ bool create_model(VulkanGeneration& generation,
         vmaFlushAllocation(generation.allocator, out.allocation, 0, size);
         return true;
     };
+    const VkBufferUsageFlags ray_vertex_usage = generation.ray_project
+        ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+            | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+        : 0;
     if (!create_buffer(source.vertices.size()
                 * sizeof(rezonality::ModelVertex),
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, source.vertices.data(),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                | ray_vertex_usage,
+            source.vertices.data(),
             model.vertex_buffer, "rezonality-model-vertices")
         || !create_buffer(source.indices.size() * sizeof(uint32_t),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, source.indices.data(),
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                | ray_vertex_usage,
+            source.indices.data(),
             model.index_buffer, "rezonality-model-indices"))
         return false;
 
@@ -1138,7 +1505,9 @@ bool create_model(VulkanGeneration& generation,
     vkUpdateDescriptorSets(generation.device,
         static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     model.parts = source.parts;
-    return true;
+    return !generation.ray_project
+        || create_model_acceleration_resources(
+            generation, source, model, error);
 }
 
 bool create_pass_render_target(VulkanGeneration& generation,
@@ -1394,6 +1763,334 @@ bool create_pass_descriptors(VulkanGeneration& generation,
     return true;
 }
 
+bool load_ray_functions(VulkanGeneration& generation,
+    VkPhysicalDevice physical_device, std::string& error)
+{
+    const auto load = [&generation](const char* name) {
+        return vkGetDeviceProcAddr(generation.device, name);
+    };
+    generation.ray.create_acceleration_structure
+        = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
+            load("vkCreateAccelerationStructureKHR"));
+    generation.ray.destroy_acceleration_structure
+        = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
+            load("vkDestroyAccelerationStructureKHR"));
+    generation.ray.get_build_sizes
+        = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+            load("vkGetAccelerationStructureBuildSizesKHR"));
+    generation.ray.get_acceleration_address
+        = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+            load("vkGetAccelerationStructureDeviceAddressKHR"));
+    generation.ray.cmd_build
+        = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+            load("vkCmdBuildAccelerationStructuresKHR"));
+    generation.ray.create_pipeline
+        = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
+            load("vkCreateRayTracingPipelinesKHR"));
+    generation.ray.get_group_handles
+        = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
+            load("vkGetRayTracingShaderGroupHandlesKHR"));
+    generation.ray.cmd_trace
+        = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(
+            load("vkCmdTraceRaysKHR"));
+    if (!generation.ray.create_acceleration_structure
+        || !generation.ray.destroy_acceleration_structure
+        || !generation.ray.get_build_sizes
+        || !generation.ray.get_acceleration_address
+        || !generation.ray.cmd_build || !generation.ray.create_pipeline
+        || !generation.ray.get_group_handles || !generation.ray.cmd_trace)
+    {
+        error = "Vulkan ray tracing is unsupported by this device";
+        return false;
+    }
+
+    VkPhysicalDeviceBufferDeviceAddressFeatures address{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES
+    };
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR
+    };
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR ray_pipeline{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR
+    };
+    address.pNext = &acceleration;
+    acceleration.pNext = &ray_pipeline;
+    VkPhysicalDeviceFeatures2 features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2
+    };
+    features.pNext = &address;
+    vkGetPhysicalDeviceFeatures2(physical_device, &features);
+    if (!address.bufferDeviceAddress || !acceleration.accelerationStructure
+        || !ray_pipeline.rayTracingPipeline)
+    {
+        error = "Vulkan ray tracing is unsupported by this device";
+        return false;
+    }
+    return true;
+}
+
+bool create_ray_pass(VulkanGeneration& generation,
+    const ShaderBuild::Pass& source, VulkanPassResource& pass,
+    VkPhysicalDevice physical_device, std::string& error)
+{
+    if (!source.model_index
+        || *source.model_index >= generation.models.size())
+    {
+        error = "Ray pass '" + source.name + "' has no valid model";
+        return false;
+    }
+    if (source.targets.size() != 1)
+    {
+        error = "Ray pass '" + source.name
+            + "' must have exactly one storage-image target";
+        return false;
+    }
+    const auto target = find_surface(generation, source.targets.front());
+    if (!target
+        || generation.surfaces[*target].aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+    {
+        error = "Ray pass '" + source.name
+            + "' references an invalid storage-image target";
+        return false;
+    }
+    pass.ray_trace = true;
+    pass.model_index = source.model_index;
+    pass.target_surfaces.push_back(*target);
+
+    VkDescriptorSetLayoutBinding uniform_binding{};
+    uniform_binding.binding = 0;
+    uniform_binding.descriptorType
+        = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    uniform_binding.descriptorCount = 1;
+    uniform_binding.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR
+        | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    VkDescriptorSetLayoutCreateInfo uniform_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    };
+    uniform_info.bindingCount = 1;
+    uniform_info.pBindings = &uniform_binding;
+    if (vkCreateDescriptorSetLayout(generation.device, &uniform_info,
+            nullptr, &pass.uniform_layout) != VK_SUCCESS)
+        return false;
+    const std::array ray_bindings{
+        VkDescriptorSetLayoutBinding{ 0,
+            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,
+            VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr },
+        VkDescriptorSetLayoutBinding{ 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+            VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr },
+        VkDescriptorSetLayoutBinding{ 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+            VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr },
+        VkDescriptorSetLayoutBinding{ 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+            VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }
+    };
+    VkDescriptorSetLayoutCreateInfo ray_layout{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    };
+    ray_layout.bindingCount = static_cast<uint32_t>(ray_bindings.size());
+    ray_layout.pBindings = ray_bindings.data();
+    if (vkCreateDescriptorSetLayout(generation.device, &ray_layout,
+            nullptr, &pass.ray_layout) != VK_SUCCESS)
+        return false;
+    const std::array pool_sizes{
+        VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 },
+        VkDescriptorPoolSize{
+            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
+        VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
+        VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 }
+    };
+    VkDescriptorPoolCreateInfo pool{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    };
+    pool.maxSets = 2;
+    pool.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
+    pool.pPoolSizes = pool_sizes.data();
+    if (vkCreateDescriptorPool(generation.device, &pool, nullptr,
+            &pass.descriptor_pool) != VK_SUCCESS)
+        return false;
+    const VkDescriptorSetLayout layouts[]
+        = { pass.uniform_layout, pass.ray_layout };
+    VkDescriptorSet sets[2]{};
+    VkDescriptorSetAllocateInfo allocation{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    };
+    allocation.descriptorPool = pass.descriptor_pool;
+    allocation.descriptorSetCount = 2;
+    allocation.pSetLayouts = layouts;
+    if (vkAllocateDescriptorSets(generation.device, &allocation, sets)
+        != VK_SUCCESS)
+        return false;
+    pass.uniform_set = sets[0];
+    pass.ray_set = sets[1];
+    VkDescriptorBufferInfo uniform_buffer{
+        generation.uniform_buffer.buffer, 0, sizeof(CommonUniformBlock)
+    };
+    VkWriteDescriptorSet uniform_write{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    };
+    uniform_write.dstSet = pass.uniform_set;
+    uniform_write.descriptorCount = 1;
+    uniform_write.descriptorType
+        = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    uniform_write.pBufferInfo = &uniform_buffer;
+    vkUpdateDescriptorSets(
+        generation.device, 1, &uniform_write, 0, nullptr);
+
+    auto& model = generation.models[*source.model_index];
+    VkWriteDescriptorSetAccelerationStructureKHR acceleration_write{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+    };
+    acceleration_write.accelerationStructureCount = 1;
+    acceleration_write.pAccelerationStructures = &model.tlas;
+    VkDescriptorImageInfo target_image{ VK_NULL_HANDLE,
+        generation.surfaces[*target].attachment.view,
+        VK_IMAGE_LAYOUT_GENERAL };
+    const VkDescriptorBufferInfo vertex_buffer{
+        model.vertex_buffer.buffer, 0, VK_WHOLE_SIZE
+    };
+    const VkDescriptorBufferInfo index_buffer{
+        model.index_buffer.buffer, 0, VK_WHOLE_SIZE
+    };
+    std::array<VkWriteDescriptorSet, 4> writes{};
+    for (auto& write : writes)
+    {
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = pass.ray_set;
+        write.descriptorCount = 1;
+    }
+    writes[0].pNext = &acceleration_write;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorType
+        = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[1].pImageInfo = &target_image;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[2].pBufferInfo = &vertex_buffer;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].pBufferInfo = &index_buffer;
+    vkUpdateDescriptorSets(generation.device,
+        static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    VkPipelineLayoutCreateInfo pipeline_layout{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    };
+    pipeline_layout.setLayoutCount = 2;
+    pipeline_layout.pSetLayouts = layouts;
+    if (vkCreatePipelineLayout(generation.device, &pipeline_layout,
+            nullptr, &pass.layout) != VK_SUCCESS)
+        return false;
+
+    const VkShaderModule raygen
+        = create_shader(generation.device, source.raygen_spirv);
+    const VkShaderModule miss
+        = create_shader(generation.device, source.miss_spirv);
+    const VkShaderModule closest
+        = create_shader(generation.device, source.closest_hit_spirv);
+    if (!raygen || !miss || !closest)
+    {
+        if (raygen)
+            vkDestroyShaderModule(generation.device, raygen, nullptr);
+        if (miss)
+            vkDestroyShaderModule(generation.device, miss, nullptr);
+        if (closest)
+            vkDestroyShaderModule(generation.device, closest, nullptr);
+        error = "Rezonality could not create ray shaders for pass '"
+            + source.name + "'";
+        return false;
+    }
+    const std::array stages{
+        VkPipelineShaderStageCreateInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+            VK_SHADER_STAGE_RAYGEN_BIT_KHR, raygen, "main", nullptr },
+        VkPipelineShaderStageCreateInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+            VK_SHADER_STAGE_MISS_BIT_KHR, miss, "main", nullptr },
+        VkPipelineShaderStageCreateInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+            VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, closest, "main", nullptr }
+    };
+    std::array<VkRayTracingShaderGroupCreateInfoKHR, 3> groups{};
+    for (auto& group : groups)
+    {
+        group.sType
+            = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        group.generalShader = VK_SHADER_UNUSED_KHR;
+        group.closestHitShader = VK_SHADER_UNUSED_KHR;
+        group.anyHitShader = VK_SHADER_UNUSED_KHR;
+        group.intersectionShader = VK_SHADER_UNUSED_KHR;
+    }
+    groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[0].generalShader = 0;
+    groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[1].generalShader = 1;
+    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[2].closestHitShader = 2;
+    VkRayTracingPipelineCreateInfoKHR pipeline{
+        VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR
+    };
+    pipeline.stageCount = static_cast<uint32_t>(stages.size());
+    pipeline.pStages = stages.data();
+    pipeline.groupCount = static_cast<uint32_t>(groups.size());
+    pipeline.pGroups = groups.data();
+    pipeline.maxPipelineRayRecursionDepth = 1;
+    pipeline.layout = pass.layout;
+    const VkResult pipeline_result = generation.ray.create_pipeline(
+        generation.device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipeline,
+        nullptr, &pass.pipeline);
+    vkDestroyShaderModule(generation.device, raygen, nullptr);
+    vkDestroyShaderModule(generation.device, miss, nullptr);
+    vkDestroyShaderModule(generation.device, closest, nullptr);
+    if (pipeline_result != VK_SUCCESS)
+    {
+        error = "Rezonality could not create Vulkan ray pipeline for pass '"
+            + source.name + "'";
+        return false;
+    }
+
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR
+    };
+    VkPhysicalDeviceProperties2 properties2{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+    };
+    properties2.pNext = &properties;
+    vkGetPhysicalDeviceProperties2(physical_device, &properties2);
+    const size_t handle_size = properties.shaderGroupHandleSize;
+    const size_t handle_stride
+        = align_up(handle_size, properties.shaderGroupHandleAlignment);
+    const size_t section_stride
+        = align_up(handle_stride, properties.shaderGroupBaseAlignment);
+    std::vector<uint8_t> handles(handle_size * groups.size());
+    if (generation.ray.get_group_handles(generation.device, pass.pipeline,
+            0, static_cast<uint32_t>(groups.size()), handles.size(),
+            handles.data()) != VK_SUCCESS
+        || !create_owned_buffer(generation, section_stride * groups.size(),
+            VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR
+                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            draxul::vkresources::MemoryPolicy::HostSequentialWrite,
+            "rezonality-ray-sbt", nullptr,
+            pass.shader_binding_table, error))
+        return false;
+    auto* mapped = static_cast<uint8_t*>(pass.shader_binding_table.mapped);
+    std::memset(mapped, 0, section_stride * groups.size());
+    for (size_t index = 0; index < groups.size(); ++index)
+        std::memcpy(mapped + section_stride * index,
+            handles.data() + handle_size * index, handle_size);
+    vmaFlushAllocation(generation.allocator,
+        pass.shader_binding_table.allocation, 0,
+        section_stride * groups.size());
+    const VkDeviceAddress sbt_address = buffer_address(
+        generation.device, pass.shader_binding_table.buffer);
+    pass.raygen_region
+        = { sbt_address, handle_stride, handle_stride };
+    pass.miss_region = { sbt_address + section_stride,
+        handle_stride, handle_stride };
+    pass.hit_region = { sbt_address + section_stride * 2,
+        handle_stride, handle_stride };
+    return true;
+}
+
 std::optional<VulkanGeneration> create_generation(BackendState& backend,
     const ShaderBuild& build, const DraxulPluginVulkanFrameV2& frame,
     double animation_seconds, const rezonality::Camera& camera,
@@ -1411,10 +2108,18 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
         static_cast<uintptr_t>(frame.continuation_render_pass));
     generation.target_generation = frame.target_generation;
     generation.source_generation = build.generation;
+    generation.ray_project = std::any_of(build.passes.begin(),
+        build.passes.end(), [](const auto& pass) {
+            return pass.ray_trace;
+        });
     generation.width = static_cast<uint32_t>(std::max(1, frame.viewport.width));
     generation.height = static_cast<uint32_t>(std::max(1, frame.viewport.height));
     generation.buffered_frame_count
         = std::max(1u, frame.buffered_frame_count);
+    if (generation.ray_project
+        && !load_ray_functions(generation,
+            static_cast<VkPhysicalDevice>(frame.physical_device), error))
+        return std::nullopt;
     for (const auto& surface : build.surfaces)
         if (!create_surface(generation, surface, generation.width,
                 generation.height, error))
@@ -1549,6 +2254,19 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
         pass.has_clear = source.has_clear;
         std::copy(std::begin(source.clear), std::end(source.clear),
             std::begin(pass.clear));
+        if (source.ray_trace)
+        {
+            if (!create_ray_pass(generation, source, pass,
+                    static_cast<VkPhysicalDevice>(frame.physical_device),
+                    error))
+            {
+                generation.passes.push_back(std::move(pass));
+                destroy_generation(generation);
+                return std::nullopt;
+            }
+            generation.passes.push_back(std::move(pass));
+            continue;
+        }
         if (!create_pass_render_target(
                 generation, source, pass, error)
             || !create_pass_descriptors(generation, source, pass, error))
@@ -1747,6 +2465,106 @@ void initialize_generation_images(
                     0, nullptr, 1, &after);
                 texture.initialized = true;
             }
+}
+
+void build_model_acceleration_structures(VkCommandBuffer command,
+    VulkanGeneration& generation, VulkanModelResource& model)
+{
+    if (model.acceleration_structures_built)
+        return;
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR
+    };
+    triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    triangles.vertexData.deviceAddress = buffer_address(
+        generation.device, model.vertex_buffer.buffer);
+    triangles.vertexStride = sizeof(rezonality::ModelVertex);
+    triangles.maxVertex = model.vertex_count - 1;
+    triangles.indexType = VK_INDEX_TYPE_UINT32;
+    triangles.indexData.deviceAddress = buffer_address(
+        generation.device, model.index_buffer.buffer);
+    VkAccelerationStructureGeometryKHR geometry{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+    };
+    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geometry.geometry.triangles = triangles;
+    VkAccelerationStructureBuildGeometryInfoKHR build{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+    };
+    build.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    build.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    build.dstAccelerationStructure = model.blas;
+    build.geometryCount = 1;
+    build.pGeometries = &geometry;
+    build.scratchData.deviceAddress = buffer_address(
+        generation.device, model.as_scratch_buffer.buffer);
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = model.index_count / 3;
+    const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = { &range };
+    generation.ray.cmd_build(command, 1, &build, ranges);
+    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask
+        = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstAccessMask
+        = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(command,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    VkAccelerationStructureGeometryInstancesDataKHR instances{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR
+    };
+    instances.data.deviceAddress = buffer_address(
+        generation.device, model.as_instance_buffer.buffer);
+    VkAccelerationStructureGeometryKHR tlas_geometry{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+    };
+    tlas_geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlas_geometry.geometry.instances = instances;
+    build.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    build.dstAccelerationStructure = model.tlas;
+    build.pGeometries = &tlas_geometry;
+    range.primitiveCount = 1;
+    generation.ray.cmd_build(command, 1, &build, ranges);
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    model.acceleration_structures_built = true;
+}
+
+void transition_ray_target(VkCommandBuffer command,
+    const VulkanSurfaceResource& surface, bool for_write)
+{
+    VkImageMemoryBarrier barrier{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    };
+    barrier.oldLayout = for_write
+        ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        : VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = for_write
+        ? VK_IMAGE_LAYOUT_GENERAL
+        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = surface.attachment.image;
+    barrier.subresourceRange
+        = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    barrier.srcAccessMask = for_write
+        ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = for_write
+        ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command,
+        for_write ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                  : VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        for_write ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                  : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
 #endif
@@ -2118,6 +2936,56 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         uniform.data(), sizeof(uniform));
     for (const auto& scene_pass : instance->backend.active->passes)
     {
+        if (scene_pass.ray_trace)
+        {
+            auto& model = instance->backend.active->models[
+                *scene_pass.model_index];
+            if (!model.acceleration_structures_built)
+            {
+                id<MTLAccelerationStructureCommandEncoder> blas_encoder
+                    = [command accelerationStructureCommandEncoder];
+                [blas_encoder buildAccelerationStructure:model.blas
+                    descriptor:model.blas_descriptor
+                    scratchBuffer:model.acceleration_scratch
+                    scratchBufferOffset:0];
+                [blas_encoder endEncoding];
+                id<MTLAccelerationStructureCommandEncoder> tlas_encoder
+                    = [command accelerationStructureCommandEncoder];
+                [tlas_encoder buildAccelerationStructure:model.tlas
+                    descriptor:model.tlas_descriptor
+                    scratchBuffer:model.acceleration_scratch
+                    scratchBufferOffset:0];
+                [tlas_encoder endEncoding];
+                model.acceleration_structures_built = true;
+            }
+            id<MTLTexture> ray_target
+                = instance->backend.active->surfaces[
+                    scene_pass.targets.front()].texture;
+            id<MTLComputeCommandEncoder> encoder
+                = [command computeCommandEncoder];
+            [encoder setComputePipelineState:scene_pass.ray_pipeline];
+            [encoder setTexture:ray_target atIndex:0];
+            [encoder setAccelerationStructure:model.tlas atBufferIndex:0];
+            [encoder setBuffer:instance->backend.active->uniform_buffer
+                          offset:uniform_offset atIndex:1];
+            [encoder setBuffer:model.vertex_buffer offset:0 atIndex:2];
+            [encoder setBuffer:model.index_buffer offset:0 atIndex:3];
+            [encoder useResource:ray_target usage:MTLResourceUsageWrite];
+            [encoder useResource:model.vertex_buffer
+                          usage:MTLResourceUsageRead];
+            [encoder useResource:model.index_buffer
+                          usage:MTLResourceUsageRead];
+            [encoder useResource:(id<MTLResource>)model.tlas
+                          usage:MTLResourceUsageRead];
+            [encoder useResource:(id<MTLResource>)model.blas
+                          usage:MTLResourceUsageRead];
+            const MTLSize grid
+                = MTLSizeMake(ray_target.width, ray_target.height, 1);
+            const MTLSize threads = MTLSizeMake(8, 8, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+            [encoder endEncoding];
+            continue;
+        }
         MTLRenderPassDescriptor* render_pass = pass;
         NSUInteger width = static_cast<NSUInteger>(frame->viewport.width);
         NSUInteger height = static_cast<NSUInteger>(frame->viewport.height);
@@ -2346,6 +3214,30 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
     const VkDeviceSize offset = 0;
     for (auto& pass : instance->backend.active->passes)
     {
+        if (pass.ray_trace)
+        {
+            auto& model = instance->backend.active->models[
+                *pass.model_index];
+            build_model_acceleration_structures(
+                command, *instance->backend.active, model);
+            const auto& target = instance->backend.active->surfaces[
+                pass.target_surfaces.front()];
+            transition_ray_target(command, target, true);
+            vkCmdBindPipeline(command,
+                VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pass.pipeline);
+            const VkDescriptorSet sets[]
+                = { pass.uniform_set, pass.ray_set };
+            const uint32_t dynamic_offset
+                = static_cast<uint32_t>(uniform_offset);
+            vkCmdBindDescriptorSets(command,
+                VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pass.layout, 0, 2,
+                sets, 1, &dynamic_offset);
+            instance->backend.active->ray.cmd_trace(command,
+                &pass.raygen_region, &pass.miss_region, &pass.hit_region,
+                &pass.callable_region, target.width, target.height, 1);
+            transition_ray_target(command, target, false);
+            continue;
+        }
         uint32_t target_width = instance->backend.active->width;
         uint32_t target_height = instance->backend.active->height;
         int32_t target_x = 0;
@@ -2507,7 +3399,7 @@ using Presentation = draxul::plugin_support::PresentationAdapter<kActions,
     &get_presentation_state, &dispatch_action>;
 
 const DraxulPluginApiV2 kApi = draxul::plugin_support::make_plugin_api(
-    { kPluginId, "Rezonality", "0.4.0",
+    { kPluginId, "Rezonality", kPluginVersion,
         draxul::plugin_support::kNativeBackendMask },
     {
         .create_instance = &create_instance,

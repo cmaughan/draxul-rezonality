@@ -60,10 +60,19 @@ struct ShaderBuild
     struct Pass
     {
         std::string name;
+        bool ray_trace = false;
         std::filesystem::path vertex_path;
         std::filesystem::path fragment_path;
+        std::filesystem::path raygen_path;
+        std::filesystem::path miss_path;
+        std::filesystem::path closest_hit_path;
+        std::filesystem::path metal_ray_path;
         std::vector<uint32_t> vertex_spirv;
         std::vector<uint32_t> fragment_spirv;
+        std::vector<uint32_t> raygen_spirv;
+        std::vector<uint32_t> miss_spirv;
+        std::vector<uint32_t> closest_hit_spirv;
+        std::string metal_ray_source;
         std::vector<std::string> targets;
         std::vector<Sampler> samplers;
         std::optional<size_t> model_index;
