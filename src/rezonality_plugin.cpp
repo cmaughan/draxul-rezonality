@@ -56,7 +56,8 @@ size_t align_up(size_t value, size_t alignment)
 }
 
 CommonUniformBlock make_common_uniforms(double elapsed_seconds,
-    uint32_t width, uint32_t height, const rezonality::Camera& camera)
+    uint32_t width, uint32_t height, int32_t origin_x, int32_t origin_y,
+    const rezonality::Camera& camera)
 {
     CommonUniformBlock uniform{};
     const float time = static_cast<float>(std::max(0.0, elapsed_seconds));
@@ -71,6 +72,8 @@ CommonUniformBlock make_common_uniforms(double elapsed_seconds,
     uniform[8] = static_cast<float>(width);
     uniform[9] = static_cast<float>(height);
     uniform[10] = 1.0f;
+    uniform[48] = static_cast<float>(origin_x);
+    uniform[49] = static_cast<float>(origin_y);
     uniform[52] = camera.position.x;
     uniform[53] = camera.position.y;
     uniform[54] = camera.position.z;
@@ -480,7 +483,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     }
     const auto uniform = make_common_uniforms(
         animation_seconds,
-        generation.width, generation.height, camera);
+        generation.width, generation.height,
+        frame.viewport.x, frame.viewport.y, camera);
     for (uint32_t slot = 0; slot < generation.buffered_frame_count; ++slot)
     {
         std::memcpy(static_cast<uint8_t*>(
@@ -506,8 +510,9 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         surface.name = source.name;
         surface.depth = source.format == ShaderBuild::SurfaceFormat::Depth32;
         surface.audio_analysis = source.audio_analysis;
-        surface.repeat = !source.image_pixels.empty()
-            || !source.image_float_pixels.empty();
+        surface.repeat = !source.audio_analysis
+            && (!source.image_pixels.empty()
+                || !source.image_float_pixels.empty());
         MTLTextureDescriptor* texture = [[MTLTextureDescriptor alloc] init];
         texture.textureType = MTLTextureType2D;
         texture.width = source.image_width != 0 ? source.image_width
@@ -1094,8 +1099,9 @@ bool create_surface(VulkanGeneration& generation,
         sampler.minFilter = VK_FILTER_LINEAR;
         sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         const VkSamplerAddressMode address_mode
-            = source.image_pixels.empty()
-                && source.image_float_pixels.empty()
+            = source.audio_analysis
+                || (source.image_pixels.empty()
+                    && source.image_float_pixels.empty())
             ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
             : VK_SAMPLER_ADDRESS_MODE_REPEAT;
         sampler.addressModeU = address_mode;
@@ -2215,7 +2221,8 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
                                 .minUniformBufferOffsetAlignment));
     const auto uniform = make_common_uniforms(
         animation_seconds,
-        generation.width, generation.height, camera);
+        generation.width, generation.height,
+        frame.viewport.x, frame.viewport.y, camera);
     draxul::vkresources::ScopedBuffer uniform_buffer;
     const draxul::vkresources::BufferRequest uniform_request(
         generation.uniform_stride * generation.buffered_frame_count,
@@ -3110,7 +3117,8 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
     const auto uniform = make_common_uniforms(
         animation_seconds,
         instance->backend.active->width,
-        instance->backend.active->height, instance->camera);
+        instance->backend.active->height,
+        frame->viewport.x, frame->viewport.y, instance->camera);
     std::memcpy(static_cast<uint8_t*>(
                     instance->backend.active->uniform_buffer.contents)
             + uniform_offset,
@@ -3392,7 +3400,8 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
     const auto uniform = make_common_uniforms(
         animation_seconds,
         instance->backend.active->width,
-        instance->backend.active->height, instance->camera);
+        instance->backend.active->height,
+        frame->viewport.x, frame->viewport.y, instance->camera);
     std::memcpy(static_cast<uint8_t*>(
                     instance->backend.active->uniform_buffer.mapped)
             + uniform_offset,
