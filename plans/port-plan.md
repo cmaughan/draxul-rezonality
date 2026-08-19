@@ -1,6 +1,6 @@
 # Rezonality Draxul plugin port plan
 
-Status: slice 1 implemented
+Status: slice 5 implemented on Windows; Metal/audio implementation awaiting macOS validation
 Priority: failure-tolerant live editing first  
 Target plugin: `dev.draxul.rezonality`
 
@@ -238,9 +238,10 @@ Tests:
 
 Manual check:
 
-1. Create Rezonality in a server-backed Session with `draxul tab create` or a
-   plugin split; do not use the standalone `draxul --plugin` launch when the
-   check needs terminal/editor panes.
+1. Launch Rezonality directly with `draxul --plugin`, create it with
+   `draxul tab create`, or use a plugin split. All normal launch forms use the
+   server-backed Session and keep terminal/editor panes available; only the
+   internal render-test harness is isolated.
 2. Open Rezonality beside a terminal editing the fixture shader.
 3. Save a valid color change and watch it update automatically.
 4. Break the shader and confirm the old image remains.
@@ -253,6 +254,11 @@ callbacks. Replaced GPU generations retain a bit for every Draxul frame slot
 that used them and are destroyed only as those slots are reused.
 
 ### Slice 2 - Scenegraph surfaces and multipass rendering
+
+Status: implemented in plugin version 0.3.0. Windows Vulkan snapshots cover
+all four projects. The paired Metal path is implemented, but the macOS build,
+snapshot blessing, and interactive resize check remain a platform validation
+gate rather than being claimed from Windows.
 
 Deliver:
 
@@ -279,6 +285,11 @@ fragment shader and confirm both panes remain intact and responsive.
 
 ### Slice 3 - Models, cameras, and PBR
 
+Status: implemented in plugin version 0.4.0. Windows Vulkan snapshots cover
+the restored sphere examples and textured PBR robot. The paired Metal resource,
+pipeline, and draw path is implemented, but its build, snapshots, and
+interactive camera/resize behavior still require validation on macOS.
+
 Deliver:
 
 - port Assimp model loading, geometry buffers, cameras, textures, materials,
@@ -291,15 +302,28 @@ Deliver:
 
 Tests:
 
-- snapshots for the default sphere and PBR robot;
-- model/texture edit and missing-asset rollback;
+- snapshots for the default sphere and an upright, correctly mapped PBR robot;
+- a real dynamically loaded PBR-project smoke that performs valid shader and
+  scene edits, rejects invalid GLSL/scene/model/texture candidates, and recovers
+  after every repair;
+- model/texture edit and missing-asset rollback, including UV-origin handling;
 - two simultaneous instances with different projects and cameras;
 - camera input translation and resize preservation.
+
+The PBR edit/recovery smoke and robot snapshot are selected by
+`py do.py test debug --rezonality`. Core-only runs omit them, and the render
+tests are not registered when the Rezonality target is unavailable.
 
 Manual check: open two Rezonality panes, orbit the robot in one, edit the other,
 and confirm state and resources do not leak between them.
 
 ### Slice 4 - Ray paths and backend capability handling
+
+Status: implemented in plugin version 0.5.0. Windows Vulkan uses the preserved
+Cornell-box geometry and ray shader stages, with a deterministic render
+snapshot and real invalid/repair candidate coverage. The paired native Metal
+acceleration-structure and compute path is implemented, but its build, snapshot,
+and interactive validation remain a macOS gate.
 
 Deliver:
 
@@ -322,11 +346,19 @@ confirm the last valid traced image never disappears.
 
 ### Slice 5 - Audio-reactive project
 
+Status: implemented in plugin version 0.6.0. Windows Vulkan uses a
+deterministic stereo FFT/waveform fixture for its render snapshot. Live input
+uses one shared SDL recording service per selected device, with all-hidden
+capture suspension. The paired Metal upload path and macOS microphone
+permission preflight are implemented, but its build, snapshot, and interactive
+device/visibility behavior remain a macOS gate.
+
 Deliver:
 
 - port the smallest product-owned audio capture/analysis layer needed to
   generate the stereo waveform and FFT texture;
-- use default input/output devices unless overridden by plugin config;
+- use the default recording device unless overridden by plugin config (the
+  plugin owns no playback stream or output-loopback capture);
 - stage the audio spectrum example without importing VkLive's audio settings UI;
 - stop audio-driven redraw scheduling while hidden, while keeping capture
   lifecycle safe across visibility and plugin shutdown.
@@ -343,6 +375,14 @@ Manual check: play audio, confirm the visualizer reacts, switch tabs, and verify
 the hidden pane stops driving frames and resumes cleanly.
 
 ### Slice 6 - Complete example and agent workflow acceptance
+
+Status: implemented in plugin version 0.7.0. All eight scenegraph projects are
+staged; a declarative layout generator creates terminal-plus-view workspaces;
+bounded atomic diagnostics expose candidate success, rollback, and repair; and
+Draxul's native-module hot reload preserves matching project time, pause, and
+camera state. Windows exercises every registered Vulkan render golden. Metal
+build, render-golden creation, and interactive workflow validation remain the
+explicit macOS acceptance gate.
 
 Deliver:
 

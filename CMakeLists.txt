@@ -19,11 +19,39 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
     FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
+if(NOT TARGET assimp::assimp)
+    include(FetchContent)
+    set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_NO_EXPORT ON CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_GLTF_IMPORTER ON CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
+    set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        rezonality_assimp
+        GIT_REPOSITORY https://github.com/assimp/assimp.git
+        GIT_TAG v5.4.3
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(rezonality_assimp)
+    # Assimp sets a global debug postfix in its cache. Draxul deliberately
+    # keeps one binary name across configurations because manifests name the
+    # module explicitly.
+    set(CMAKE_DEBUG_POSTFIX "" CACHE STRING "" FORCE)
+endif()
+
 if(APPLE)
     include(FetchContent)
     set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
-    set(SPIRV_CROSS_ENABLE_GLSL OFF CACHE BOOL "" FORCE)
+    # SPIRV-Cross's MSL backend shares compiler support with its GLSL target,
+    # so GLSL must be enabled even though Rezonality only emits MSL on macOS.
+    # This does not add a Vulkan SDK or runtime dependency.
+    set(SPIRV_CROSS_ENABLE_GLSL ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_MSL ON CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_HLSL OFF CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
     set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
@@ -39,27 +67,59 @@ elseif(NOT TARGET Vulkan::Vulkan)
 endif()
 
 set(_rezonality_sources
+    src/audio_analysis.cpp
+    src/audio_analysis.h
+    src/camera.cpp
+    src/camera.h
+    src/diagnostics.cpp
+    src/diagnostics.h
+    src/image_loader.cpp
+    src/image_loader.h
     src/live_project.cpp
     src/live_project.h
+    src/model_loader.cpp
+    src/model_loader.h
     src/rezonality_plugin.cpp)
+
+if(APPLE)
+    list(APPEND _rezonality_sources src/mic_permission.mm)
+    set(DRAXUL_REZONALITY_SDL_TARGET SDL3::Headers)
+else()
+    list(APPEND _rezonality_sources src/mic_permission_stub.cpp)
+    set(DRAXUL_REZONALITY_SDL_TARGET SDL3::SDL3)
+endif()
 
 add_library(draxul-rezonality-plugin MODULE ${_rezonality_sources})
 target_link_libraries(draxul-rezonality-plugin PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
-    nlohmann_json::nlohmann_json)
+    assimp::assimp
+    glm::glm
+    nlohmann_json::nlohmann_json
+    ${DRAXUL_REZONALITY_SDL_TARGET})
+target_compile_definitions(draxul-rezonality-plugin PRIVATE
+    GLM_FORCE_DEPTH_ZERO_TO_ONE)
+target_include_directories(draxul-rezonality-plugin PRIVATE ${stb_SOURCE_DIR})
 if(APPLE)
     set_source_files_properties(src/rezonality_plugin.cpp
         PROPERTIES LANGUAGE OBJCXX)
+    set_source_files_properties(src/mic_permission.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    find_library(REZONALITY_AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
     target_link_libraries(draxul-rezonality-plugin PRIVATE
         spirv-cross-msl
         "-framework Metal"
-        "-framework Foundation")
+        "-framework Foundation"
+        ${REZONALITY_AVFOUNDATION_FRAMEWORK})
 else()
-    target_link_libraries(draxul-rezonality-plugin PRIVATE Vulkan::Vulkan)
+    target_link_libraries(draxul-rezonality-plugin PRIVATE
+        Vulkan::Vulkan
+        Draxul::PluginSupport::VulkanResources
+        GPUOpen::VulkanMemoryAllocator)
 endif()
 set_target_properties(draxul-rezonality-plugin PROPERTIES
     PREFIX ""
+    DEBUG_POSTFIX ""
     OUTPUT_NAME "draxul-rezonality")
 
 if(COMMAND draxul_apply_sanitizers)

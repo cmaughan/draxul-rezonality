@@ -1,4 +1,5 @@
 #include "live_project.h"
+#include "image_loader.h"
 
 #include <nlohmann/json.hpp>
 
@@ -6,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <fstream>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <system_error>
@@ -206,7 +208,7 @@ ProcessResult run_process(const std::vector<fs::path>& arguments)
     }
     DWORD count = 0;
     while (ReadFile(read_pipe, buffer.data(),
-        static_cast<DWORD>(buffer.size()), &count, nullptr)
+               static_cast<DWORD>(buffer.size()), &count, nullptr)
         && count > 0)
         result.output.append(buffer.data(), count);
     CloseHandle(read_pipe);
@@ -302,8 +304,9 @@ ProcessResult run_process(const std::vector<fs::path>& arguments)
 struct SceneDescription
 {
     fs::path scenegraph;
-    fs::path vertex;
-    fs::path fragment;
+    std::vector<ShaderBuild::Surface> surfaces;
+    std::vector<ModelData> models;
+    std::vector<ShaderBuild::Pass> passes;
 };
 
 std::optional<std::string> first_match(const std::string& source,
@@ -313,6 +316,137 @@ std::optional<std::string> first_match(const std::string& source,
     if (!std::regex_search(source, match, expression) || match.size() < 2)
         return std::nullopt;
     return match[1].str();
+}
+
+std::string without_comments(std::string source)
+{
+    static const std::regex comments(R"(//[^\r\n]*)");
+    return std::regex_replace(source, comments, "");
+}
+
+size_t matching_brace(std::string_view source, size_t open)
+{
+    size_t depth = 0;
+    for (size_t index = open; index < source.size(); ++index)
+    {
+        if (source[index] == '{')
+            ++depth;
+        else if (source[index] == '}' && --depth == 0)
+            return index;
+    }
+    return std::string_view::npos;
+}
+
+std::vector<std::string> parse_list(
+    const std::string& body, std::string_view key)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(([^)]*)\))");
+    const auto matched = first_match(body, expression);
+    if (!matched)
+        return {};
+    std::vector<std::string> values;
+    std::istringstream stream(*matched);
+    std::string value;
+    while (std::getline(stream, value, ','))
+    {
+        value = trim(value);
+        if (!value.empty())
+            values.push_back(std::move(value));
+    }
+    return values;
+}
+
+void parse_vec4(const std::string& body, std::string_view key,
+    float (&value)[4], bool* found = nullptr)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+    {
+        if (found)
+            *found = false;
+        return;
+    }
+    for (size_t index = 0; index < 4; ++index)
+        value[index] = std::stof(match[index + 1].str());
+    if (found)
+        *found = true;
+}
+
+bool parse_vec3(const std::string& body, std::string_view key,
+    glm::vec3& value)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+        return false;
+    value = { std::stof(match[1].str()), std::stof(match[2].str()),
+        std::stof(match[3].str()) };
+    return true;
+}
+
+bool parse_vec2(const std::string& body, std::string_view key,
+    glm::vec2& value)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+        return false;
+    value = { std::stof(match[1].str()), std::stof(match[2].str()) };
+    return true;
+}
+
+bool parse_scalar(const std::string& body, std::string_view key,
+    float& value)
+{
+    const std::regex expression("\\b" + std::string(key)
+        + R"(\s*:\s*([-+.0-9]+))");
+    const auto matched = first_match(body, expression);
+    if (!matched)
+        return false;
+    value = std::stof(*matched);
+    return true;
+}
+
+bool parse_uv_origin(const std::string& body, std::string_view owner,
+    bool& flip_texture_y, std::string& error)
+{
+    flip_texture_y = true;
+    const auto origin = first_match(body,
+        std::regex(R"(\buv_origin\s*:\s*([A-Za-z_]+))"));
+    if (!origin || *origin == "lower_left")
+        return true;
+    if (*origin == "upper_left")
+    {
+        flip_texture_y = false;
+        return true;
+    }
+    error = std::string(owner) + " has unknown uv_origin '" + *origin + "'";
+    return false;
+}
+
+std::vector<std::pair<std::string, std::string>> named_blocks(
+    const std::string& source, std::string_view kind)
+{
+    std::vector<std::pair<std::string, std::string>> blocks;
+    const std::regex header("(^|[\\r\\n])\\s*" + std::string(kind)
+        + R"(\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{)");
+    for (auto begin = std::sregex_iterator(source.begin(), source.end(), header);
+         begin != std::sregex_iterator(); ++begin)
+    {
+        const auto& match = *begin;
+        const size_t open = static_cast<size_t>(match.position() + match.length() - 1);
+        const size_t close = matching_brace(source, open);
+        if (close == std::string::npos)
+            continue;
+        blocks.emplace_back(match[2].str(),
+            source.substr(open + 1, close - open - 1));
+    }
+    return blocks;
 }
 
 std::optional<SceneDescription> load_scene(const ProjectOptions& options,
@@ -329,26 +463,260 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         return std::nullopt;
     }
 
-    // This is the single-pass subset of VkLive's existing scene grammar. The
-    // complete MPC grammar is ported in the following multipass slice; keeping
-    // the spelling here identical lets real projects move across unchanged.
+    const std::string parsed = without_comments(*source);
     static const std::regex vertex_expression(
         R"(\bvs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
     static const std::regex fragment_expression(
         R"(\bfs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
-    const auto vertex = first_match(*source, vertex_expression);
-    const auto fragment = first_match(*source, fragment_expression);
-    if (!vertex || !fragment)
-    {
-        error = "Single-pass scenegraph must declare both vs: and fs:";
-        diagnostic_line = 1;
-        return std::nullopt;
-    }
+    static const std::regex raygen_expression(
+        R"(\bray_gen\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
+    static const std::regex miss_expression(
+        R"(\bmiss\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
+    static const std::regex closest_hit_expression(
+        R"(\bclosest_hit\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
+    static const std::regex metal_ray_expression(
+        R"(\bmetal_ray\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
 
     SceneDescription description;
     description.scenegraph = scenegraph;
-    description.vertex = options.project_path / fs::u8path(*vertex);
-    description.fragment = options.project_path / fs::u8path(*fragment);
+    std::map<std::string, size_t> model_indices;
+    std::map<std::string, Camera> cameras;
+    Camera default_camera;
+    camera_set_pos_lookat(default_camera, default_camera.position,
+        default_camera.focal_point);
+    cameras.emplace(default_camera.name, default_camera);
+
+    for (const auto& [name, body] : named_blocks(parsed, "camera"))
+    {
+        Camera camera;
+        camera.name = name;
+        glm::vec3 position = camera.position;
+        glm::vec3 look_at = camera.focal_point;
+        parse_vec3(body, "position", position);
+        parse_vec3(body, "look_at", look_at);
+        parse_vec2(body, "near_far", camera.near_far);
+        parse_scalar(body, "field_of_view", camera.field_of_view);
+        camera_set_pos_lookat(camera, position, look_at);
+        cameras[name] = camera;
+    }
+
+    for (const auto& [name, body] : named_blocks(parsed, "model"))
+    {
+        const auto path = first_match(body,
+            std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))"));
+        if (!path)
+        {
+            error = "Model '" + name + "' is missing path:";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        glm::vec3 scale{ 1.0f };
+        parse_vec3(body, "scale", scale);
+        bool flip_texture_y = true;
+        if (!parse_uv_origin(body, "Model '" + name + "'",
+                flip_texture_y, error))
+        {
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        ModelData model;
+        const fs::path model_path
+            = options.project_path / fs::u8path(*path);
+        if (!load_model(model_path, scale, flip_texture_y, model, error))
+        {
+            diagnostic_path = model_path;
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        model_indices[name] = description.models.size();
+        description.models.push_back(std::move(model));
+    }
+    for (const auto& [name, body] : named_blocks(parsed, "surface"))
+    {
+        ShaderBuild::Surface surface;
+        surface.name = name;
+        if (name == "AudioAnalysis")
+        {
+            surface.audio_analysis = true;
+            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+            surface.image_width = AudioTextureFrame::width;
+            surface.image_height = AudioTextureFrame::height;
+            surface.image_float_pixels.resize(
+                AudioTextureFrame::width * AudioTextureFrame::height * 4,
+                0.0f);
+        }
+        if (const auto path = first_match(body,
+                std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
+            surface.path = options.project_path / fs::u8path(*path);
+        if (const auto format = first_match(body,
+                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))")))
+        {
+            if (*format == "rgba16f")
+                surface.format = ShaderBuild::SurfaceFormat::Color16Float;
+            else if (*format == "rgba32f")
+                surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+            else if (format->find("depth") != std::string::npos)
+                surface.format = ShaderBuild::SurfaceFormat::Depth32;
+        }
+        const std::regex scale_expression(
+            R"(\bscale\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+))");
+        std::smatch scale;
+        if (std::regex_search(body, scale, scale_expression))
+        {
+            surface.scale_x = std::stof(scale[1].str());
+            surface.scale_y = std::stof(scale[2].str());
+        }
+        parse_vec4(body, "clear", surface.clear);
+        description.surfaces.push_back(std::move(surface));
+    }
+    for (const auto& [name, body] : named_blocks(parsed, "environment"))
+    {
+        ShaderBuild::Surface surface;
+        surface.name = name;
+        if (const auto path = first_match(body,
+                std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
+            surface.path = options.project_path / fs::u8path(*path);
+        if (const auto format = first_match(body,
+                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))"));
+            format && *format == "rgba32f")
+            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+        description.surfaces.push_back(std::move(surface));
+    }
+
+    for (const auto& [name, body] : named_blocks(parsed, "pass"))
+    {
+        const auto vertex = first_match(body, vertex_expression);
+        const auto fragment = first_match(body, fragment_expression);
+        ShaderBuild::Pass pass;
+        pass.name = name;
+        pass.targets = parse_list(body, "targets");
+        if (pass.targets.empty())
+            pass.targets.push_back("default_color");
+        for (std::string sampler : parse_list(body, "samplers"))
+        {
+            ShaderBuild::Sampler parsed_sampler;
+            if (!sampler.empty() && sampler.front() == '!')
+            {
+                parsed_sampler.previous_frame = true;
+                sampler.erase(sampler.begin());
+            }
+            parsed_sampler.surface = std::move(sampler);
+            pass.samplers.push_back(std::move(parsed_sampler));
+        }
+        const auto geometries = named_blocks(body, "geometry");
+        if (geometries.empty())
+        {
+            error = "Pass '" + name + "' must declare geometry";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        const std::string& geometry_body = geometries.front().second;
+        const auto raygen = first_match(geometry_body, raygen_expression);
+        const auto miss = first_match(geometry_body, miss_expression);
+        const auto closest_hit = first_match(
+            geometry_body, closest_hit_expression);
+        const auto metal_ray = first_match(
+            geometry_body, metal_ray_expression);
+        pass.ray_trace = raygen || miss || closest_hit || metal_ray;
+        if (pass.ray_trace)
+        {
+            if (!raygen || !miss || !closest_hit || !metal_ray)
+            {
+                error = "Ray pass '" + name
+                    + "' must declare ray_gen, miss, closest_hit, and metal_ray";
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.raygen_path = options.project_path / fs::u8path(*raygen);
+            pass.miss_path = options.project_path / fs::u8path(*miss);
+            pass.closest_hit_path
+                = options.project_path / fs::u8path(*closest_hit);
+            pass.metal_ray_path
+                = options.project_path / fs::u8path(*metal_ray);
+        }
+        else
+        {
+            if (!vertex || !fragment)
+            {
+                error = "Pass '" + name + "' must declare both vs: and fs:";
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.vertex_path = options.project_path / fs::u8path(*vertex);
+            pass.fragment_path = options.project_path / fs::u8path(*fragment);
+        }
+        const auto model_name = first_match(geometry_body,
+            std::regex(R"(\bmodel\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*))"));
+        const auto geometry_path = first_match(geometry_body,
+            std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))"));
+        if (model_name)
+        {
+            const auto found = model_indices.find(*model_name);
+            if (found == model_indices.end())
+            {
+                error = "Pass '" + name + "' references unknown model '"
+                    + *model_name + "'";
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.model_index = found->second;
+        }
+        else if (geometry_path && *geometry_path != "screen_rect")
+        {
+            glm::vec3 scale{ 1.0f };
+            parse_vec3(geometry_body, "scale", scale);
+            bool flip_texture_y = true;
+            if (!parse_uv_origin(geometry_body,
+                    "Geometry in pass '" + name + "'",
+                    flip_texture_y, error))
+            {
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            ModelData model;
+            const fs::path model_path
+                = options.project_path / fs::u8path(*geometry_path);
+            if (!load_model(model_path, scale, flip_texture_y, model, error))
+            {
+                diagnostic_path = model_path;
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
+            pass.model_index = description.models.size();
+            description.models.push_back(std::move(model));
+        }
+        if (pass.ray_trace && !pass.model_index)
+        {
+            error = "Ray pass '" + name + "' must reference model geometry";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        const auto camera_name = first_match(body,
+            std::regex(R"(\bcamera\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*))"));
+        const auto selected_camera = cameras.find(
+            camera_name.value_or("default_camera"));
+        if (selected_camera == cameras.end())
+        {
+            error = "Pass '" + name + "' references unknown camera '"
+                + *camera_name + "'";
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
+        pass.camera = selected_camera->second;
+        parse_vec4(body, "clear", pass.clear, &pass.has_clear);
+        description.passes.push_back(std::move(pass));
+    }
+    if (description.passes.empty())
+    {
+        error = "Scenegraph must declare at least one enabled pass";
+        diagnostic_line = 1;
+        return std::nullopt;
+    }
+    for (auto& pass : description.passes)
+        for (const auto& target : pass.targets)
+            if (target != "default_color" && target != "default_depth")
+                for (auto& surface : description.surfaces)
+                    surface.target = surface.target || surface.name == target;
     return description;
 }
 
@@ -397,7 +765,8 @@ bool compile_shader(const fs::path& compiler, const fs::path& project_path,
     int& diagnostic_line, std::string& error)
 {
     std::vector<fs::path> arguments{
-        compiler, "-V", shader, "-o", output_path, "-l", "-g",
+        compiler, "-V", "--target-env", "vulkan1.2", shader,
+        "-o", output_path, "-l", "-g",
         fs::path("-I" + project_path.string())
     };
     ProcessResult process = run_process(arguments);
@@ -472,8 +841,54 @@ std::optional<ProjectOptions> parse_project_options(
             scenegraph_explicit = true;
         }
         options.auto_reload = config.value("auto_reload", true);
+        options.paused = config.value("paused", false);
         options.compile_debounce_ms = std::clamp(
             config.value("compile_debounce_ms", 150u), 25u, 5000u);
+        if (const auto diagnostics = config.find("diagnostics_id");
+            diagnostics != config.end())
+        {
+            if (!diagnostics->is_string())
+                throw std::runtime_error("diagnostics_id must be a string");
+            options.diagnostics_id = diagnostics->get<std::string>();
+            if (options.diagnostics_id.empty()
+                || options.diagnostics_id.size() > 64
+                || !std::all_of(options.diagnostics_id.begin(),
+                    options.diagnostics_id.end(), [](unsigned char value) {
+                        return (value >= 'a' && value <= 'z')
+                            || (value >= '0' && value <= '9')
+                            || value == '.' || value == '_'
+                            || value == '-';
+                    }))
+            {
+                throw std::runtime_error(
+                    "diagnostics_id must use 1-64 lowercase letters, digits, '.', '_', or '-'");
+            }
+        }
+        if (const auto source = config.find("audio_source");
+            source != config.end())
+        {
+            if (!source->is_string())
+                throw std::runtime_error("audio_source must be a string");
+            const std::string value = source->get<std::string>();
+            if (value == "input")
+                options.audio.source = AudioOptions::Source::Input;
+            else if (value == "synthetic")
+                options.audio.source = AudioOptions::Source::Synthetic;
+            else if (value == "silent")
+                options.audio.source = AudioOptions::Source::Silent;
+            else
+                throw std::runtime_error(
+                    "audio_source must be input, synthetic, or silent");
+        }
+        if (const auto device = config.find("audio_device");
+            device != config.end())
+        {
+            if (!device->is_string())
+                throw std::runtime_error("audio_device must be a string");
+            options.audio.device_name = device->get<std::string>();
+            if (options.audio.device_name.size() > 256)
+                throw std::runtime_error("audio_device is too long");
+        }
     }
     catch (const std::exception& exception)
     {
@@ -565,7 +980,14 @@ uint64_t LiveProject::project_fingerprint() const
             const auto extension = entry.path().extension().string();
             if (extension == ".toml" || extension == ".scenegraph"
                 || extension == ".vert" || extension == ".frag"
-                || extension == ".glsl" || extension == ".h")
+                || extension == ".glsl" || extension == ".h"
+                || extension == ".rgen" || extension == ".rmiss"
+                || extension == ".rchit" || extension == ".metal"
+                || extension == ".png" || extension == ".jpg"
+                || extension == ".jpeg" || extension == ".bmp"
+                || extension == ".hdr" || extension == ".gltf"
+                || extension == ".glb" || extension == ".obj"
+                || extension == ".mtl" || extension == ".bin")
                 files.push_back(entry.path());
         }
     }
@@ -586,7 +1008,7 @@ BuildResult LiveProject::build(uint64_t generation) const
     int line = -1;
     fs::path diagnostic;
     std::string error;
-    const auto scene = load_scene(options_, diagnostic, line, error);
+    auto scene = load_scene(options_, diagnostic, line, error);
     if (!scene)
     {
         result.diagnostic_path = std::move(diagnostic);
@@ -604,8 +1026,7 @@ BuildResult LiveProject::build(uint64_t generation) const
     }
 
     const fs::path output_directory = fs::temp_directory_path()
-        / "draxul-rezonality" / std::to_string(
-            reinterpret_cast<uintptr_t>(this));
+        / "draxul-rezonality" / std::to_string(reinterpret_cast<uintptr_t>(this));
     std::error_code ec;
     fs::create_directories(output_directory, ec);
     if (ec)
@@ -619,26 +1040,90 @@ BuildResult LiveProject::build(uint64_t generation) const
     candidate.generation = generation;
     candidate.project_path = options_.project_path;
     candidate.scenegraph_path = scene->scenegraph;
-    candidate.vertex_path = scene->vertex;
-    candidate.fragment_path = scene->fragment;
-    const fs::path vertex_output = output_directory
-        / ("vertex-" + std::to_string(generation) + ".spv");
-    const fs::path fragment_output = output_directory
-        / ("fragment-" + std::to_string(generation) + ".spv");
-    if (!compile_shader(compiler, options_.project_path,
-            candidate.vertex_path, vertex_output, candidate.vertex_spirv,
-            result.diagnostic_path, result.diagnostic_line, result.error)
-        || !compile_shader(compiler, options_.project_path,
-            candidate.fragment_path, fragment_output,
-            candidate.fragment_spirv, result.diagnostic_path,
-            result.diagnostic_line, result.error))
+    candidate.surfaces = scene->surfaces;
+    candidate.models = std::move(scene->models);
+    candidate.passes = scene->passes;
+    for (auto& surface : candidate.surfaces)
     {
+        if (surface.path.empty())
+            continue;
+        const bool hdr = surface.path.extension() == ".hdr";
+        const bool loaded = hdr
+            ? load_rgba32f_image(surface.path, surface.image_width,
+                  surface.image_height, surface.image_float_pixels,
+                  result.error)
+            : load_rgba8_image(surface.path, surface.image_width,
+                  surface.image_height, surface.image_pixels, result.error);
+        if (!loaded)
+        {
+            result.diagnostic_path = surface.path;
+            return result;
+        }
+        if (hdr)
+            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+    }
+    for (size_t index = 0; index < candidate.passes.size(); ++index)
+    {
+        auto& pass = candidate.passes[index];
+        const std::string stem = std::to_string(generation) + "-"
+            + std::to_string(index);
+        if (pass.ray_trace)
+        {
+            const fs::path raygen_output
+                = output_directory / ("raygen-" + stem + ".spv");
+            const fs::path miss_output
+                = output_directory / ("miss-" + stem + ".spv");
+            const fs::path closest_output
+                = output_directory / ("closest-" + stem + ".spv");
+            if (!compile_shader(compiler, options_.project_path,
+                    pass.raygen_path, raygen_output, pass.raygen_spirv,
+                    result.diagnostic_path, result.diagnostic_line,
+                    result.error)
+                || !compile_shader(compiler, options_.project_path,
+                    pass.miss_path, miss_output, pass.miss_spirv,
+                    result.diagnostic_path, result.diagnostic_line,
+                    result.error)
+                || !compile_shader(compiler, options_.project_path,
+                    pass.closest_hit_path, closest_output,
+                    pass.closest_hit_spirv, result.diagnostic_path,
+                    result.diagnostic_line, result.error))
+            {
+                fs::remove(raygen_output, ec);
+                fs::remove(miss_output, ec);
+                fs::remove(closest_output, ec);
+                return result;
+            }
+            fs::remove(raygen_output, ec);
+            fs::remove(miss_output, ec);
+            fs::remove(closest_output, ec);
+            const auto metal_source = read_text(pass.metal_ray_path);
+            if (!metal_source)
+            {
+                result.diagnostic_path = pass.metal_ray_path;
+                result.error = "Native Metal ray shader is missing";
+                return result;
+            }
+            pass.metal_ray_source = *metal_source;
+            continue;
+        }
+        const fs::path vertex_output
+            = output_directory / ("vertex-" + stem + ".spv");
+        const fs::path fragment_output
+            = output_directory / ("fragment-" + stem + ".spv");
+        if (!compile_shader(compiler, options_.project_path,
+                pass.vertex_path, vertex_output, pass.vertex_spirv,
+                result.diagnostic_path, result.diagnostic_line, result.error)
+            || !compile_shader(compiler, options_.project_path,
+                pass.fragment_path, fragment_output, pass.fragment_spirv,
+                result.diagnostic_path, result.diagnostic_line, result.error))
+        {
+            fs::remove(vertex_output, ec);
+            fs::remove(fragment_output, ec);
+            return result;
+        }
         fs::remove(vertex_output, ec);
         fs::remove(fragment_output, ec);
-        return result;
     }
-    fs::remove(vertex_output, ec);
-    fs::remove(fragment_output, ec);
     result.build = std::move(candidate);
     return result;
 }
@@ -661,8 +1146,7 @@ void LiveProject::run(std::stop_token stop_token)
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (forced || (dirty && now - dirty_since
-                >= std::chrono::milliseconds(options_.compile_debounce_ms)))
+        if (forced || (dirty && now - dirty_since >= std::chrono::milliseconds(options_.compile_debounce_ms)))
         {
             BuildResult next = build(++generation);
             {

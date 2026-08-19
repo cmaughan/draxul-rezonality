@@ -1,0 +1,62 @@
+// PBR glTF robot with an HDR equirectangular environment.
+
+camera: default_camera {
+    position: (0.0, 1.55, 6.0)
+    look_at: (0.0, 1.55, 0.0)
+    field_of_view: 45.0
+    near_far: (0.01, 50.0)
+}
+
+environment: studio_sky {
+    path: textures/environment/farm_field_puresky_1k.hdr
+    format: rgba32f
+}
+
+surface: Color {
+    scale: (1, 1, 1)
+    format: default_color
+}
+
+surface: Depth {
+    scale: (1, 1, 1)
+    format: default_depth
+}
+
+model: robot {
+    path: models/robot/scene.gltf
+    scale: (1.0, 1.0, 1.0)
+    uv_origin: lower_left
+}
+
+pass: Sky {
+    targets: (Color, Depth)
+    clear: (0.0, 0.0, 0.0, 1.0)
+    samplers: (studio_sky)
+    camera: default_camera
+    geometry: background {
+        path: screen_rect
+        vs: skybox.vert
+        fs: skybox.frag
+    }
+}
+
+pass: Robot {
+    targets: (Color, Depth)
+    samplers: (studio_sky)
+    camera: default_camera
+    geometry: robot_mesh {
+        model: robot
+        vs: pbr.vert
+        fs: pbr.frag
+    }
+}
+
+pass: Composite {
+    targets: (default_color)
+    samplers: (Color)
+    geometry: copy {
+        path: screen_rect
+        vs: copy.vert
+        fs: copy.frag
+    }
+}

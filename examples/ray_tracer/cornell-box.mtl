@@ -1,0 +1,25 @@
+# Blender MTL File: 'cornell-box-cycles.blend'
+
+newmtl Light
+Ns 0.0
+Ka 1.0 1.0 1.0
+Kd 1.0 1.0 1.0
+Ks 0.0 0.0 0.0
+
+newmtl DarkGreen
+Ns 96.078431
+Ka 1.0 1.0 1.0
+Kd 0.0 0.32 0.0
+Ks 0.5 0.5 0.5
+
+newmtl Khaki
+Ns 96.078431
+Ka 1.0 1.0 1.0
+Kd 0.8 0.659341 0.43956
+Ks 0.5 0.5 0.5
+
+newmtl BloodyRed
+Ns 96.078431
+Ka 1.0 1.0 1.0
+Kd 0.445 0.0 0.0
+Ks 0.5 0.5 0.5

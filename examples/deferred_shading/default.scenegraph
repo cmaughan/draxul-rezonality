@@ -1,0 +1,14 @@
+surface: Positions { scale: (1, 1, 1) format: rgba16f }
+surface: Albedo { scale: (1, 1, 1) format: default_color }
+surface: Normals { scale: (1, 1, 1) format: rgba16f }
+surface: Depth { scale: (1, 1, 1) format: default_depth }
+pass: GBuffer {
+    targets: (Positions, Albedo, Normals, Depth)
+    clear: (0.0, 0.0, 0.0, 1.0)
+    geometry: background { path: screen_rect vs: screen.vert fs: gbuffer.frag }
+}
+pass: Lights {
+    samplers: (Positions, Albedo, Normals)
+    targets: (default_color)
+    geometry: background { path: screen_rect vs: screen.vert fs: lighting.frag }
+}
