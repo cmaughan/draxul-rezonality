@@ -1,0 +1,12 @@
+surface: AudioAnalysis {
+}
+
+pass: Pass1 {
+    samplers: (AudioAnalysis)
+    clear: (0.0, 1.0, 0.0, 1.0)
+    geometry: background {
+        path: screen_rect
+        vs: screen.vert
+        fs: screen.frag
+    }
+}

@@ -2,6 +2,7 @@
 
 #include <draxul/plugin_api.h>
 
+#include "audio_analysis.h"
 #include "camera.h"
 #include "image_loader.h"
 #include "model_loader.h"
@@ -158,7 +159,7 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     CHECK(api->abi_version == DRAXUL_PLUGIN_ABI_VERSION);
     CHECK(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
     CHECK(std::string_view(api->display_name) == "Rezonality");
-    CHECK(std::string_view(api->plugin_version) == "0.5.0");
+    CHECK(std::string_view(api->plugin_version) == "0.6.0");
 #if defined(__APPLE__)
     CHECK(api->supported_backends == DRAXUL_PLUGIN_BACKEND_METAL);
 #else
@@ -185,17 +186,19 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     create_info.config_json = "{}";
     create_info.config_json_length = 2;
     create_info.initial_viewport = {
-        sizeof(DraxulPluginViewportV2), 0, 0, 640, 480, 1.0f, 96.0f };
+        sizeof(DraxulPluginViewportV2), 0, 0, 640, 480, 1.0f, 96.0f
+    };
 
     void* instance = api->create_instance(&create_info);
     REQUIRE(instance != nullptr);
 
     DraxulPluginPresentationExtensionV2 presentation{};
     REQUIRE(api->query_extension(instance,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
-        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
-        &presentation, sizeof(presentation)) != 0);
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                &presentation, sizeof(presentation))
+        != 0);
 
     DraxulPluginPresentationStateV2 state{};
     state.struct_size = sizeof(state);
@@ -254,6 +257,39 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     api->destroy_instance(instance);
 }
 
+TEST_CASE("Rezonality synthetic audio produces a stable stereo analysis texture",
+    "[rezonality][audio]")
+{
+    rezonality::AudioOptions options;
+    options.source = rezonality::AudioOptions::Source::Synthetic;
+    rezonality::AudioAnalyzer analyzer(options);
+
+    const auto first = analyzer.frame();
+    const auto second = analyzer.frame();
+    REQUIRE(first.rgba.size()
+        == rezonality::AudioTextureFrame::width
+            * rezonality::AudioTextureFrame::height * 4);
+    CHECK(first.generation == 1);
+    CHECK(first.status == "audio synthetic fixture");
+    CHECK(first.rgba == second.rgba);
+    CHECK(std::any_of(first.rgba.begin(), first.rgba.end(),
+        [](float value) { return value > 0.1f && value < 0.99f; }));
+
+    analyzer.set_visible(false);
+    CHECK(analyzer.frame().rgba == first.rgba);
+    analyzer.set_visible(true);
+    CHECK(analyzer.frame().rgba == first.rgba);
+
+    options.source = rezonality::AudioOptions::Source::Silent;
+    rezonality::AudioAnalyzer silent(options);
+    const auto fallback = silent.frame();
+    CHECK(fallback.generation == 1);
+    CHECK(fallback.status.find("audio unavailable") != std::string::npos);
+    CHECK(fallback.rgba.size() == first.rgba.size());
+    CHECK(std::all_of(fallback.rgba.begin(), fallback.rgba.end(),
+        [](float value) { return value == 0.0f || value == 1.0f; }));
+}
+
 TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
     "[rezonality][integration][reload]")
 {
@@ -293,7 +329,8 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
     const std::string config = nlohmann::json{
         { "project_path", fixture.string() },
         { "compile_debounce_ms", 25 },
-    }.dump();
+    }
+                                   .dump();
     DraxulPluginCreateInfoV2 create_info{};
     create_info.struct_size = sizeof(create_info);
     create_info.host = &host;
@@ -302,16 +339,18 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
     create_info.config_json = config.data();
     create_info.config_json_length = config.size();
     create_info.initial_viewport = {
-        sizeof(DraxulPluginViewportV2), 0, 0, 640, 480, 1.0f, 96.0f };
+        sizeof(DraxulPluginViewportV2), 0, 0, 640, 480, 1.0f, 96.0f
+    };
     void* instance = api->create_instance(&create_info);
     REQUIRE(instance != nullptr);
 
     DraxulPluginPresentationExtensionV2 presentation{};
     REQUIRE(api->query_extension(instance,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
-        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
-        &presentation, sizeof(presentation)) != 0);
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                &presentation, sizeof(presentation))
+        != 0);
     REQUIRE(wait_for_status(*api, instance, presentation, "ready g1"));
 
     write_text(fixture / "screen.frag",
@@ -354,7 +393,7 @@ TEST_CASE("Rezonality compiles every staged multipass example",
     const std::string directory = plugin_root().string();
     for (const std::string_view example : { "default", "blend_waves",
              "deferred_shading", "protoplanetary_disc", "pbr_robot",
-             "ray_tracer" })
+             "ray_tracer", "audio_spectrum_analysis" })
     {
         DYNAMIC_SECTION(example)
         {
@@ -373,7 +412,8 @@ TEST_CASE("Rezonality compiles every staged multipass example",
                     (plugin_root() / "examples" / example).string() },
                 { "auto_reload", false },
                 { "compile_debounce_ms", 25 },
-            }.dump();
+            }
+                                           .dump();
             DraxulPluginCreateInfoV2 create_info{};
             create_info.struct_size = sizeof(create_info);
             create_info.host = &host;
@@ -383,15 +423,17 @@ TEST_CASE("Rezonality compiles every staged multipass example",
             create_info.config_json_length = config.size();
             create_info.initial_viewport = {
                 sizeof(DraxulPluginViewportV2), 0, 0,
-                640, 480, 1.0f, 96.0f };
+                640, 480, 1.0f, 96.0f
+            };
             void* instance = api->create_instance(&create_info);
             REQUIRE(instance != nullptr);
             DraxulPluginPresentationExtensionV2 presentation{};
             REQUIRE(api->query_extension(instance,
-                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
-                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
-                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
-                &presentation, sizeof(presentation)) != 0);
+                        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                        &presentation, sizeof(presentation))
+                != 0);
             CHECK(wait_for_status(*api, instance, presentation, "ready g1"));
             api->quiesce_instance(instance);
             api->destroy_instance(instance);
@@ -511,7 +553,7 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     const auto* api = module.api();
     REQUIRE(api != nullptr);
     REQUIRE(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
-    REQUIRE(std::string_view(api->plugin_version) == "0.5.0");
+    REQUIRE(std::string_view(api->plugin_version) == "0.6.0");
 
     const auto fixture_id = std::chrono::steady_clock::now()
                                 .time_since_epoch()
@@ -543,7 +585,8 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
         { "auto_reload", false },
         { "paused", true },
         { "compile_debounce_ms", 25 },
-    }.dump();
+    }
+                                   .dump();
     DraxulPluginCreateInfoV2 create_info{};
     create_info.struct_size = sizeof(create_info);
     create_info.host = &host;
@@ -559,15 +602,17 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
 
     DraxulPluginPresentationExtensionV2 presentation{};
     REQUIRE(api->query_extension(instance,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
-        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
-        &presentation, sizeof(presentation)) != 0);
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                &presentation, sizeof(presentation))
+        != 0);
     REQUIRE(wait_for_status(*api, instance, presentation, "ready g1"));
 
     const auto reload_and_wait = [&](std::string_view expected) {
         REQUIRE(presentation.dispatch_action(instance,
-            "rezonality_reload", sizeof("rezonality_reload") - 1) != 0);
+                    "rezonality_reload", sizeof("rezonality_reload") - 1)
+            != 0);
         REQUIRE(wait_for_status(*api, instance, presentation, expected));
     };
     const fs::path shader_path = fixture / "pbr.frag";
@@ -601,8 +646,7 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     fs::rename(texture, hidden_texture, ec);
     REQUIRE_FALSE(ec);
     reload_and_wait("error g7");
-    CHECK(presentation_status(instance, presentation).find(
-              "RobotChest_baseColor.jpeg")
+    CHECK(presentation_status(instance, presentation).find("RobotChest_baseColor.jpeg")
         != std::string::npos);
     fs::rename(hidden_texture, texture, ec);
     REQUIRE_FALSE(ec);
@@ -652,7 +696,8 @@ TEST_CASE("The staged Rezonality module rejects and repairs ray candidates",
         { "auto_reload", false },
         { "paused", true },
         { "compile_debounce_ms", 25 },
-    }.dump();
+    }
+                                   .dump();
     DraxulPluginCreateInfoV2 create_info{};
     create_info.struct_size = sizeof(create_info);
     create_info.host = &host;
@@ -667,14 +712,16 @@ TEST_CASE("The staged Rezonality module rejects and repairs ray candidates",
     REQUIRE(instance != nullptr);
     DraxulPluginPresentationExtensionV2 presentation{};
     REQUIRE(api->query_extension(instance,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
-        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
-        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
-        &presentation, sizeof(presentation)) != 0);
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                &presentation, sizeof(presentation))
+        != 0);
     REQUIRE(wait_for_status(*api, instance, presentation, "ready g1"));
     const auto reload_and_wait = [&](std::string_view expected) {
         REQUIRE(presentation.dispatch_action(instance,
-            "rezonality_reload", sizeof("rezonality_reload") - 1) != 0);
+                    "rezonality_reload", sizeof("rezonality_reload") - 1)
+            != 0);
         REQUIRE(wait_for_status(*api, instance, presentation, expected));
     };
 

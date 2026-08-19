@@ -1,6 +1,6 @@
 # Rezonality Draxul plugin port plan
 
-Status: slice 4 implemented on Windows; Metal implementation awaiting macOS validation
+Status: slice 5 implemented on Windows; Metal/audio implementation awaiting macOS validation
 Priority: failure-tolerant live editing first  
 Target plugin: `dev.draxul.rezonality`
 
@@ -346,11 +346,19 @@ confirm the last valid traced image never disappears.
 
 ### Slice 5 - Audio-reactive project
 
+Status: implemented in plugin version 0.6.0. Windows Vulkan uses a
+deterministic stereo FFT/waveform fixture for its render snapshot. Live input
+uses one shared SDL recording service per selected device, with all-hidden
+capture suspension. The paired Metal upload path and macOS microphone
+permission preflight are implemented, but its build, snapshot, and interactive
+device/visibility behavior remain a macOS gate.
+
 Deliver:
 
 - port the smallest product-owned audio capture/analysis layer needed to
   generate the stereo waveform and FFT texture;
-- use default input/output devices unless overridden by plugin config;
+- use the default recording device unless overridden by plugin config (the
+  plugin owns no playback stream or output-loopback capture);
 - stage the audio spectrum example without importing VkLive's audio settings UI;
 - stop audio-driven redraw scheduling while hidden, while keeping capture
   lifecycle safe across visibility and plugin shutdown.

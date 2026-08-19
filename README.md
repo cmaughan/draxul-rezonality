@@ -6,7 +6,7 @@ viewer for shader and scene editing. It will render inside a Draxul pane using
 Vulkan on Windows and Metal on macOS while projects are edited from any other
 terminal or editor pane.
 
-The first four live-renderer slices are implemented. Rezonality parses ordered
+The first five live-renderer slices are implemented. Rezonality parses ordered
 VkLive-style passes, named surfaces, cameras, and Assimp-backed OBJ/glTF models.
 It renders pane-sized intermediate targets, uploads immutable geometry and PBR
 material generations, binds HDR and material textures, then composites through
@@ -16,6 +16,13 @@ Vulkan ray shader groups or the native Metal ray kernel. Saving any scenegraph,
 shader, include, model, or texture dependency triggers a debounced rebuild. A
 bad edit, missing asset, or unsupported ray capability is reported while the
 complete last-known-good generation keeps rendering.
+
+The `audio_spectrum_analysis` project adds a product-owned stereo waveform and
+FFT texture. Live instances share one SDL recording stream per selected input
+device, so two panes do not open the same microphone twice. Capture pauses and
+its queued samples are cleared when every subscribing pane is hidden; showing
+one again resumes capture and rendering. Rezonality does not own an audio
+output stream or a system-loopback facility in this slice.
 
 ```text
 draxul tab create --space <space-id> --name Rezonality \
@@ -37,13 +44,21 @@ Instances accept a bounded JSON configuration like this:
   "scenegraph": "default.scenegraph",
   "auto_reload": true,
   "paused": false,
-  "compile_debounce_ms": 150
+  "compile_debounce_ms": 150,
+  "audio_source": "input",
+  "audio_device": ""
 }
 ```
 
+`audio_source` may be `input` (the default recording device), `synthetic` (the
+deterministic test signal), or `silent` (an explicit inert fallback). Set
+`audio_device` to an exact SDL recording-device name to override the default.
+The setting is only used by projects declaring the reserved `AudioAnalysis`
+surface.
+
 Omit `project_path` to open the bundled `examples/simple` project. Bundled
 `default`, `blend_waves`, `deferred_shading`, `protoplanetary_disc`,
-`pbr_robot`, and `ray_tracer` projects exercise depth, MRT, float targets,
+`pbr_robot`, `ray_tracer`, and `audio_spectrum_analysis` projects exercise depth, MRT, float targets,
 ordered sampling, Assimp model loading, textured PBR materials, HDR
 environments, acceleration structures, and native ray dispatch. The
 protoplanetary demo now runs its preserved VkLive raymarch, sphere overlay, and
@@ -99,8 +114,8 @@ py do.py smoke --skip-build
 The Rezonality scope loads the staged native module through the exported ABI,
 copies the real PBR and Cornell-box projects, and drives valid shader edits,
 invalid GLSL, scene errors, missing models/textures, and successful recovery.
-On Windows it also renders the fixed paused robot and ray-traced Cornell box
-and compares them with checked-in references. These checks are opt-in:
+On Windows it also renders the fixed paused robot, ray-traced Cornell box, and
+synthetic audio spectrum and compares them with checked-in references. These checks are opt-in:
 core-only tests do not run them, and Draxul does not register the render cases
 when the Rezonality submodule/target is absent.
 

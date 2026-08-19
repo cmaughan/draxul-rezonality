@@ -5,11 +5,19 @@ file(GLOB _rezonality_test_sources CONFIGURE_DEPENDS
 draxul_add_test_target(
     draxul-test-rezonality rezonality 1
     ${_rezonality_test_sources}
+    "${_rezonality_root}/src/audio_analysis.cpp"
     "${_rezonality_root}/src/camera.cpp"
     "${_rezonality_root}/src/image_loader.cpp"
     "${_rezonality_root}/src/live_project.cpp"
     "${_rezonality_root}/src/model_loader.cpp"
     "${_rezonality_root}/src/rezonality_plugin.cpp")
+if(APPLE)
+    target_sources(draxul-test-rezonality PRIVATE
+        "${_rezonality_root}/src/mic_permission.mm")
+else()
+    target_sources(draxul-test-rezonality PRIVATE
+        "${_rezonality_root}/src/mic_permission_stub.cpp")
+endif()
 target_link_libraries(draxul-test-rezonality PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
@@ -27,12 +35,17 @@ target_include_directories(draxul-test-rezonality PRIVATE
     "${_rezonality_root}/src"
     ${stb_SOURCE_DIR})
 if(APPLE)
+    target_link_libraries(draxul-test-rezonality PRIVATE SDL3::Headers)
+    set_source_files_properties("${_rezonality_root}/src/mic_permission.mm"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(draxul-test-rezonality PRIVATE
         spirv-cross-msl
         "-framework Metal"
-        "-framework Foundation")
+        "-framework Foundation"
+        ${REZONALITY_AVFOUNDATION_FRAMEWORK})
 else()
     target_link_libraries(draxul-test-rezonality PRIVATE
+        SDL3::SDL3
         Vulkan::Vulkan
         Draxul::PluginSupport::VulkanResources
         GPUOpen::VulkanMemoryAllocator)

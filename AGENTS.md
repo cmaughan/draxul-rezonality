@@ -87,6 +87,12 @@ available.
 - Golden comparisons complement, rather than replace, live-edit recovery
   tests: a static image cannot prove candidate rollback or file watching.
 
+The audio spectrum golden must use `"audio_source":"synthetic"`; render tests
+must never depend on microphone permission, ambient sound, or an installed
+device. Manual live-audio checks use `"audio_source":"input"`. Rezonality
+shares live capture per exact recording-device selection and pauses/clears it
+when all subscribers are hidden.
+
 ## Live-edit and failure-recovery checks
 
 Exercise live editing against a copied fixture, never by destructively editing

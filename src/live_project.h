@@ -1,5 +1,6 @@
 #pragma once
 
+#include "audio_analysis.h"
 #include "camera.h"
 #include "model_loader.h"
 
@@ -24,6 +25,7 @@ struct ProjectOptions
     bool auto_reload = true;
     bool paused = false;
     uint32_t compile_debounce_ms = 150;
+    AudioOptions audio;
 };
 
 struct ShaderBuild
@@ -49,6 +51,7 @@ struct ShaderBuild
         uint32_t image_height = 0;
         std::vector<uint8_t> image_pixels;
         std::vector<float> image_float_pixels;
+        bool audio_analysis = false;
     };
 
     struct Sampler
@@ -115,7 +118,10 @@ public:
     void force_reload();
     std::optional<BuildResult> take_result();
 
-    const ProjectOptions& options() const { return options_; }
+    const ProjectOptions& options() const
+    {
+        return options_;
+    }
 
 private:
     void run(std::stop_token stop_token);

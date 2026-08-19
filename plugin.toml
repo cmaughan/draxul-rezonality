@@ -1,7 +1,7 @@
 schema_version = 1
 id = "dev.draxul.rezonality"
 name = "Rezonality"
-version = "0.5.0"
+version = "0.6.0"
 abi_version = 2
 
 [platform.windows]

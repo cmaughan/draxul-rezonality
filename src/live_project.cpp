@@ -208,7 +208,7 @@ ProcessResult run_process(const std::vector<fs::path>& arguments)
     }
     DWORD count = 0;
     while (ReadFile(read_pipe, buffer.data(),
-        static_cast<DWORD>(buffer.size()), &count, nullptr)
+               static_cast<DWORD>(buffer.size()), &count, nullptr)
         && count > 0)
         result.output.append(buffer.data(), count);
     CloseHandle(read_pipe);
@@ -535,6 +535,16 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
     {
         ShaderBuild::Surface surface;
         surface.name = name;
+        if (name == "AudioAnalysis")
+        {
+            surface.audio_analysis = true;
+            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+            surface.image_width = AudioTextureFrame::width;
+            surface.image_height = AudioTextureFrame::height;
+            surface.image_float_pixels.resize(
+                AudioTextureFrame::width * AudioTextureFrame::height * 4,
+                0.0f);
+        }
         if (const auto path = first_match(body,
                 std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
             surface.path = options.project_path / fs::u8path(*path);
@@ -834,6 +844,31 @@ std::optional<ProjectOptions> parse_project_options(
         options.paused = config.value("paused", false);
         options.compile_debounce_ms = std::clamp(
             config.value("compile_debounce_ms", 150u), 25u, 5000u);
+        if (const auto source = config.find("audio_source");
+            source != config.end())
+        {
+            if (!source->is_string())
+                throw std::runtime_error("audio_source must be a string");
+            const std::string value = source->get<std::string>();
+            if (value == "input")
+                options.audio.source = AudioOptions::Source::Input;
+            else if (value == "synthetic")
+                options.audio.source = AudioOptions::Source::Synthetic;
+            else if (value == "silent")
+                options.audio.source = AudioOptions::Source::Silent;
+            else
+                throw std::runtime_error(
+                    "audio_source must be input, synthetic, or silent");
+        }
+        if (const auto device = config.find("audio_device");
+            device != config.end())
+        {
+            if (!device->is_string())
+                throw std::runtime_error("audio_device must be a string");
+            options.audio.device_name = device->get<std::string>();
+            if (options.audio.device_name.size() > 256)
+                throw std::runtime_error("audio_device is too long");
+        }
     }
     catch (const std::exception& exception)
     {
@@ -971,8 +1006,7 @@ BuildResult LiveProject::build(uint64_t generation) const
     }
 
     const fs::path output_directory = fs::temp_directory_path()
-        / "draxul-rezonality" / std::to_string(
-            reinterpret_cast<uintptr_t>(this));
+        / "draxul-rezonality" / std::to_string(reinterpret_cast<uintptr_t>(this));
     std::error_code ec;
     fs::create_directories(output_directory, ec);
     if (ec)
@@ -996,10 +1030,10 @@ BuildResult LiveProject::build(uint64_t generation) const
         const bool hdr = surface.path.extension() == ".hdr";
         const bool loaded = hdr
             ? load_rgba32f_image(surface.path, surface.image_width,
-                surface.image_height, surface.image_float_pixels,
-                result.error)
+                  surface.image_height, surface.image_float_pixels,
+                  result.error)
             : load_rgba8_image(surface.path, surface.image_width,
-                surface.image_height, surface.image_pixels, result.error);
+                  surface.image_height, surface.image_pixels, result.error);
         if (!loaded)
         {
             result.diagnostic_path = surface.path;
@@ -1092,8 +1126,7 @@ void LiveProject::run(std::stop_token stop_token)
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (forced || (dirty && now - dirty_since
-                >= std::chrono::milliseconds(options_.compile_debounce_ms)))
+        if (forced || (dirty && now - dirty_since >= std::chrono::milliseconds(options_.compile_debounce_ms)))
         {
             BuildResult next = build(++generation);
             {

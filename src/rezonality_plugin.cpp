@@ -36,12 +36,15 @@ namespace
 
 using draxul::plugin_support::render_result;
 using draxul::plugin_support::tick_result;
+using rezonality::AudioAnalyzer;
+using rezonality::AudioOptions;
+using rezonality::AudioTextureFrame;
 using rezonality::BuildResult;
 using rezonality::LiveProject;
 using rezonality::ShaderBuild;
 
 constexpr const char* kPluginId = "dev.draxul.rezonality";
-constexpr const char* kPluginVersion = "0.5.0";
+constexpr const char* kPluginVersion = "0.6.0";
 constexpr size_t kCommonUniformFloatCount = 192;
 using CommonUniformBlock = std::array<float, kCommonUniformFloatCount>;
 
@@ -120,6 +123,8 @@ struct MetalGeneration
         id<MTLTexture> texture = nil;
         bool depth = false;
         bool repeat = false;
+        bool audio_analysis = false;
+        uint64_t audio_generation = 0;
     };
     struct Pass
     {
@@ -185,7 +190,7 @@ struct BackendState
 std::string ns_error(NSError* error)
 {
     return error ? std::string(error.localizedDescription.UTF8String
-                         ?: "unknown error")
+                           ?: "unknown error")
                  : std::string("unknown error");
 }
 
@@ -252,11 +257,11 @@ std::optional<MetalGeneration::Model> create_metal_model(
 {
     MetalGeneration::Model model;
     model.vertex_buffer = [device newBufferWithBytes:source.vertices.data()
-        length:source.vertices.size() * sizeof(rezonality::ModelVertex)
-        options:MTLResourceStorageModeShared];
+                                              length:source.vertices.size() * sizeof(rezonality::ModelVertex)
+                                             options:MTLResourceStorageModeShared];
     model.index_buffer = [device newBufferWithBytes:source.indices.data()
-        length:source.indices.size() * sizeof(uint32_t)
-        options:MTLResourceStorageModeShared];
+                                             length:source.indices.size() * sizeof(uint32_t)
+                                            options:MTLResourceStorageModeShared];
     struct alignas(16) GpuMaterial
     {
         glm::vec4 base_color;
@@ -275,7 +280,8 @@ std::optional<MetalGeneration::Model> create_metal_model(
             glm::ivec4(static_cast<int>(index)) };
     }
     model.material_buffer = [device newBufferWithBytes:materials.data()
-        length:sizeof(materials) options:MTLResourceStorageModeShared];
+                                                length:sizeof(materials)
+                                               options:MTLResourceStorageModeShared];
     if (!model.vertex_buffer || !model.index_buffer
         || !model.material_buffer)
     {
@@ -310,9 +316,10 @@ std::optional<MetalGeneration::Model> create_metal_model(
                 return std::nullopt;
             }
             [texture replaceRegion:MTLRegionMake2D(0, 0,
-                    source_texture.width, source_texture.height)
-                mipmapLevel:0 withBytes:source_texture.pixels.data()
-                bytesPerRow:source_texture.width * 4];
+                                       source_texture.width, source_texture.height)
+                       mipmapLevel:0
+                         withBytes:source_texture.pixels.data()
+                       bytesPerRow:source_texture.width * 4];
             model.textures[kind].push_back(texture);
         }
     }
@@ -349,9 +356,9 @@ bool create_metal_acceleration_resources(id<MTLDevice> device,
         model.blas_descriptor.geometryDescriptors = @[ geometry ];
         const MTLAccelerationStructureSizes blas_sizes
             = [device accelerationStructureSizesWithDescriptor:
-                model.blas_descriptor];
+                          model.blas_descriptor];
         model.blas = [device newAccelerationStructureWithSize:
-            blas_sizes.accelerationStructureSize];
+                                 blas_sizes.accelerationStructureSize];
         MTLAccelerationStructureInstanceDescriptor instance{};
         instance.transformationMatrix = MTLPackedFloat4x3(
             MTLPackedFloat3(1.0f, 0.0f, 0.0f),
@@ -361,7 +368,8 @@ bool create_metal_acceleration_resources(id<MTLDevice> device,
         instance.mask = 0xff;
         instance.accelerationStructureIndex = 0;
         model.acceleration_instances = [device newBufferWithBytes:&instance
-            length:sizeof(instance) options:MTLResourceStorageModeShared];
+                                                           length:sizeof(instance)
+                                                          options:MTLResourceStorageModeShared];
         model.tlas_descriptor
             = [MTLInstanceAccelerationStructureDescriptor descriptor];
         model.tlas_descriptor.instanceDescriptorBuffer
@@ -376,13 +384,13 @@ bool create_metal_acceleration_resources(id<MTLDevice> device,
                 = MTLAccelerationStructureInstanceDescriptorTypeDefault;
         const MTLAccelerationStructureSizes tlas_sizes
             = [device accelerationStructureSizesWithDescriptor:
-                model.tlas_descriptor];
+                          model.tlas_descriptor];
         model.tlas = [device newAccelerationStructureWithSize:
-            tlas_sizes.accelerationStructureSize];
+                                 tlas_sizes.accelerationStructureSize];
         model.acceleration_scratch = [device newBufferWithLength:
-            std::max(blas_sizes.buildScratchBufferSize,
-                tlas_sizes.buildScratchBufferSize)
-            options:MTLResourceStorageModePrivate];
+                                                 std::max(blas_sizes.buildScratchBufferSize,
+                                                     tlas_sizes.buildScratchBufferSize)
+                                                         options:MTLResourceStorageModePrivate];
         if (!model.blas || !model.tlas || !model.acceleration_instances
             || !model.acceleration_scratch)
         {
@@ -407,8 +415,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     {
         backend.device = device;
         backend.vertex_buffer = [device newBufferWithBytes:kScreenVertices
-            length:sizeof(kScreenVertices)
-            options:MTLResourceStorageModeShared];
+                                                    length:sizeof(kScreenVertices)
+                                                   options:MTLResourceStorageModeShared];
         if (!backend.vertex_buffer)
         {
             error = "Rezonality could not create its Metal screen rectangle";
@@ -463,8 +471,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         = std::max(1u, frame.buffered_frame_count);
     generation.uniform_stride = align_up(sizeof(CommonUniformBlock), 256);
     generation.uniform_buffer = [device newBufferWithLength:
-        generation.uniform_stride * generation.buffered_frame_count
-        options:MTLResourceStorageModeShared];
+                                            generation.uniform_stride * generation.buffered_frame_count
+                                                    options:MTLResourceStorageModeShared];
     if (!generation.uniform_buffer)
     {
         error = "Rezonality could not create its Metal common uniforms";
@@ -497,25 +505,26 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         MetalGeneration::Surface surface;
         surface.name = source.name;
         surface.depth = source.format == ShaderBuild::SurfaceFormat::Depth32;
+        surface.audio_analysis = source.audio_analysis;
         surface.repeat = !source.image_pixels.empty()
             || !source.image_float_pixels.empty();
         MTLTextureDescriptor* texture = [[MTLTextureDescriptor alloc] init];
         texture.textureType = MTLTextureType2D;
         texture.width = source.image_width != 0 ? source.image_width
-            : std::max<NSUInteger>(1, static_cast<NSUInteger>(
-                  generation.width * std::max(0.01f, source.scale_x)));
+                                                : std::max<NSUInteger>(1, static_cast<NSUInteger>(generation.width * std::max(0.01f, source.scale_x)));
         texture.height = source.image_height != 0 ? source.image_height
-            : std::max<NSUInteger>(1, static_cast<NSUInteger>(
-                  generation.height * std::max(0.01f, source.scale_y)));
+                                                  : std::max<NSUInteger>(1, static_cast<NSUInteger>(generation.height * std::max(0.01f, source.scale_y)));
         const bool has_image = !source.image_pixels.empty()
             || !source.image_float_pixels.empty();
         texture.storageMode = !has_image
-            ? MTLStorageModePrivate : MTLStorageModeManaged;
+            ? MTLStorageModePrivate
+            : MTLStorageModeManaged;
         texture.usage = surface.depth
             ? MTLTextureUsageRenderTarget
             : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
                 | (generation.ray_project
-                        ? MTLTextureUsageShaderWrite : 0);
+                        ? MTLTextureUsageShaderWrite
+                        : 0);
         switch (source.format)
         {
         case ShaderBuild::SurfaceFormat::Color16Float:
@@ -547,9 +556,10 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                 : static_cast<const void*>(source.image_pixels.data());
             const size_t bytes_per_pixel
                 = !source.image_float_pixels.empty() ? 16 : 4;
-            [surface.texture replaceRegion:region mipmapLevel:0
-                withBytes:bytes
-                bytesPerRow:source.image_width * bytes_per_pixel];
+            [surface.texture replaceRegion:region
+                               mipmapLevel:0
+                                 withBytes:bytes
+                               bytesPerRow:source.image_width * bytes_per_pixel];
         }
         generation.surfaces.push_back(surface);
     }
@@ -623,13 +633,16 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
             NSError* compile_error = nil;
             id<MTLLibrary> library = [device
                 newLibraryWithSource:[NSString stringWithUTF8String:
-                    source.metal_ray_source.c_str()]
-                options:nil error:&compile_error];
+                                                   source.metal_ray_source.c_str()]
+                             options:nil
+                               error:&compile_error];
             id<MTLFunction> function = library
-                ? [library newFunctionWithName:@"vklive_ray_trace"] : nil;
+                ? [library newFunctionWithName:@"vklive_ray_trace"]
+                : nil;
             pass.ray_pipeline = function
                 ? [device newComputePipelineStateWithFunction:function
-                    error:&compile_error] : nil;
+                                                        error:&compile_error]
+                : nil;
             if (!pass.ray_pipeline)
             {
                 error = "Metal ray shader failed for pass '" + source.name
@@ -654,10 +667,12 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         NSError* compile_error = nil;
         id<MTLLibrary> vertex_library = [device
             newLibraryWithSource:[NSString stringWithUTF8String:vertex_source.c_str()]
-            options:nil error:&compile_error];
+                         options:nil
+                           error:&compile_error];
         id<MTLLibrary> fragment_library = [device
             newLibraryWithSource:[NSString stringWithUTF8String:fragment_source.c_str()]
-            options:nil error:&compile_error];
+                         options:nil
+                           error:&compile_error];
         if (!vertex_library || !fragment_library)
         {
             error = "Metal shader compilation failed for pass '"
@@ -673,7 +688,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         descriptor.vertexFunction = vertex;
         descriptor.fragmentFunction = fragment;
         descriptor.vertexDescriptor = source.model_index
-            ? model_vertices : vertices;
+            ? model_vertices
+            : vertices;
         if (pass.direct)
             descriptor.colorAttachments[0].pixelFormat = target.pixelFormat;
         else
@@ -691,7 +707,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
             }
         }
         id<MTLRenderPipelineState> pipeline = [device
-            newRenderPipelineStateWithDescriptor:descriptor error:&compile_error];
+            newRenderPipelineStateWithDescriptor:descriptor
+                                           error:&compile_error];
         if (!pipeline)
         {
             error = "Rezonality Metal pipeline failed for pass '"
@@ -713,12 +730,15 @@ struct VulkanSurfaceResource
     std::string name;
     draxul::vkresources::AttachmentResource attachment;
     draxul::vkresources::BufferResource upload_buffer;
+    std::vector<draxul::vkresources::BufferResource> audio_upload_buffers;
     VkSampler sampler = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     uint32_t width = 0;
     uint32_t height = 0;
     bool initialized = false;
+    bool audio_analysis = false;
+    uint64_t audio_generation = 0;
 };
 
 struct VulkanModelTextureResource
@@ -857,6 +877,9 @@ void destroy_generation(VulkanGeneration& generation)
             generation.device, generation.allocator, surface.attachment);
         draxul::vkresources::destroy_buffer(
             generation.allocator, surface.upload_buffer);
+        for (auto& buffer : surface.audio_upload_buffers)
+            draxul::vkresources::destroy_buffer(
+                generation.allocator, buffer);
     }
     for (auto& model : generation.models)
     {
@@ -1039,16 +1062,15 @@ bool create_surface(VulkanGeneration& generation,
 {
     VulkanSurfaceResource surface;
     surface.name = source.name;
+    surface.audio_analysis = source.audio_analysis;
     surface.format = surface_format(source.format);
     surface.aspect = source.format == ShaderBuild::SurfaceFormat::Depth32
         ? VK_IMAGE_ASPECT_DEPTH_BIT
         : VK_IMAGE_ASPECT_COLOR_BIT;
     surface.width = source.image_width != 0 ? source.image_width
-        : std::max(1u, static_cast<uint32_t>(
-              pane_width * std::max(0.01f, source.scale_x)));
+                                            : std::max(1u, static_cast<uint32_t>(pane_width * std::max(0.01f, source.scale_x)));
     surface.height = source.image_height != 0 ? source.image_height
-        : std::max(1u, static_cast<uint32_t>(
-              pane_height * std::max(0.01f, source.scale_y)));
+                                              : std::max(1u, static_cast<uint32_t>(pane_height * std::max(0.01f, source.scale_y)));
     const bool depth = surface.aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
     const VkImageUsageFlags usage = depth
         ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
@@ -1081,7 +1103,8 @@ bool create_surface(VulkanGeneration& generation,
         sampler.addressModeW = address_mode;
         sampler.maxLod = 1.0f;
         if (vkCreateSampler(generation.device, &sampler, nullptr,
-                &surface.sampler) != VK_SUCCESS)
+                &surface.sampler)
+            != VK_SUCCESS)
         {
             draxul::vkresources::destroy_attachment(generation.device,
                 generation.allocator, surface.attachment);
@@ -1090,7 +1113,38 @@ bool create_surface(VulkanGeneration& generation,
             return false;
         }
     }
-    if (!source.image_pixels.empty()
+    if (source.audio_analysis)
+    {
+        const size_t byte_size = static_cast<size_t>(surface.width)
+            * surface.height * 4 * sizeof(float);
+        surface.audio_upload_buffers.reserve(
+            generation.buffered_frame_count);
+        for (uint32_t index = 0; index < generation.buffered_frame_count;
+             ++index)
+        {
+            draxul::vkresources::ScopedBuffer upload;
+            const draxul::vkresources::BufferRequest upload_request(
+                byte_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                draxul::vkresources::MemoryPolicy::HostSequentialWrite,
+                "rezonality-audio-upload",
+                draxul::vkresources::LifetimeScope::Persistent);
+            if (!draxul::vkresources::create_buffer(generation.device,
+                    generation.allocator, upload_request, upload, error))
+            {
+                for (auto& buffer : surface.audio_upload_buffers)
+                    draxul::vkresources::destroy_buffer(
+                        generation.allocator, buffer);
+                if (surface.sampler)
+                    vkDestroySampler(
+                        generation.device, surface.sampler, nullptr);
+                draxul::vkresources::destroy_attachment(generation.device,
+                    generation.allocator, surface.attachment);
+                return false;
+            }
+            surface.audio_upload_buffers.push_back(upload.release());
+        }
+    }
+    else if (!source.image_pixels.empty()
         || !source.image_float_pixels.empty())
     {
         const size_t byte_size = !source.image_float_pixels.empty()
@@ -1131,7 +1185,8 @@ bool create_model_texture(VulkanGeneration& generation,
     texture.width = source.width;
     texture.height = source.height;
     const VkFormat format = source.srgb
-        ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        ? VK_FORMAT_R8G8B8A8_SRGB
+        : VK_FORMAT_R8G8B8A8_UNORM;
     const draxul::vkresources::AttachmentRequest request(
         static_cast<int>(source.width), static_cast<int>(source.height),
         format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1151,7 +1206,8 @@ bool create_model_texture(VulkanGeneration& generation,
     sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampler.maxLod = 1.0f;
     if (vkCreateSampler(generation.device, &sampler, nullptr,
-            &texture.sampler) != VK_SUCCESS)
+            &texture.sampler)
+        != VK_SUCCESS)
     {
         error = "Rezonality could not create a model texture sampler";
         return false;
@@ -1232,7 +1288,8 @@ bool create_acceleration_structure(VulkanGeneration& generation,
     create_info.type = type;
     if (generation.ray.create_acceleration_structure(
             generation.device, &create_info, nullptr,
-            &acceleration_structure) != VK_SUCCESS)
+            &acceleration_structure)
+        != VK_SUCCESS)
     {
         error = "Rezonality could not create a Vulkan acceleration structure";
         return false;
@@ -1447,7 +1504,8 @@ bool create_model(VulkanGeneration& generation,
     layout_info.bindingCount = static_cast<uint32_t>(bindings.size());
     layout_info.pBindings = bindings.data();
     if (vkCreateDescriptorSetLayout(generation.device, &layout_info,
-            nullptr, &model.descriptor_layout) != VK_SUCCESS)
+            nullptr, &model.descriptor_layout)
+        != VK_SUCCESS)
         return false;
     const VkDescriptorPoolSize pool_sizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
@@ -1459,7 +1517,8 @@ bool create_model(VulkanGeneration& generation,
     pool.poolSizeCount = 2;
     pool.pPoolSizes = pool_sizes;
     if (vkCreateDescriptorPool(generation.device, &pool, nullptr,
-            &model.descriptor_pool) != VK_SUCCESS)
+            &model.descriptor_pool)
+        != VK_SUCCESS)
         return false;
     VkDescriptorSetAllocateInfo allocation{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
@@ -1468,13 +1527,15 @@ bool create_model(VulkanGeneration& generation,
     allocation.descriptorSetCount = 1;
     allocation.pSetLayouts = &model.descriptor_layout;
     if (vkAllocateDescriptorSets(generation.device, &allocation,
-            &model.descriptor_set) != VK_SUCCESS)
+            &model.descriptor_set)
+        != VK_SUCCESS)
         return false;
     VkDescriptorBufferInfo material_buffer{
         model.material_buffer.buffer, 0, sizeof(materials)
     };
     std::vector<std::array<VkDescriptorImageInfo,
-        rezonality::kMaxModelMaterials>> image_arrays(5);
+        rezonality::kMaxModelMaterials>>
+        image_arrays(5);
     std::array<VkWriteDescriptorSet, 6> writes{};
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     writes[0].dstSet = model.descriptor_set;
@@ -1487,8 +1548,7 @@ bool create_model(VulkanGeneration& generation,
         for (size_t index = 0; index < rezonality::kMaxModelMaterials;
              ++index)
         {
-            const auto& texture = model.textures[kind][
-                std::min(index, model.textures[kind].size() - 1)];
+            const auto& texture = model.textures[kind][std::min(index, model.textures[kind].size() - 1)];
             image_arrays[kind][index] = { texture.sampler,
                 texture.attachment.view,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -1597,7 +1657,8 @@ bool create_pass_render_target(VulkanGeneration& generation,
     render_pass.dependencyCount = 2;
     render_pass.pDependencies = dependencies;
     if (vkCreateRenderPass(generation.device, &render_pass, nullptr,
-            &pass.render_pass) != VK_SUCCESS)
+            &pass.render_pass)
+        != VK_SUCCESS)
     {
         error = "Rezonality could not create render pass '" + source.name + "'";
         return false;
@@ -1613,7 +1674,8 @@ bool create_pass_render_target(VulkanGeneration& generation,
     framebuffer.height = first.height;
     framebuffer.layers = 1;
     if (vkCreateFramebuffer(generation.device, &framebuffer, nullptr,
-            &pass.framebuffer) != VK_SUCCESS)
+            &pass.framebuffer)
+        != VK_SUCCESS)
     {
         error = "Rezonality could not create framebuffer '" + source.name + "'";
         return false;
@@ -1638,7 +1700,8 @@ bool create_pass_descriptors(VulkanGeneration& generation,
     uniform_info.bindingCount = 1;
     uniform_info.pBindings = &uniform_binding;
     if (vkCreateDescriptorSetLayout(generation.device, &uniform_info,
-            nullptr, &pass.uniform_layout) != VK_SUCCESS)
+            nullptr, &pass.uniform_layout)
+        != VK_SUCCESS)
         return false;
 
     std::vector<VkDescriptorSetLayoutBinding> sampler_bindings;
@@ -1653,7 +1716,8 @@ bool create_pass_descriptors(VulkanGeneration& generation,
         = static_cast<uint32_t>(sampler_bindings.size());
     sampler_info.pBindings = sampler_bindings.data();
     if (vkCreateDescriptorSetLayout(generation.device, &sampler_info,
-            nullptr, &pass.sampler_layout) != VK_SUCCESS)
+            nullptr, &pass.sampler_layout)
+        != VK_SUCCESS)
         return false;
 
     const VkDescriptorPoolSize sizes[] = {
@@ -1666,7 +1730,8 @@ bool create_pass_descriptors(VulkanGeneration& generation,
     pool.poolSizeCount = 2;
     pool.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(generation.device, &pool, nullptr,
-            &pass.descriptor_pool) != VK_SUCCESS)
+            &pass.descriptor_pool)
+        != VK_SUCCESS)
         return false;
     const VkDescriptorSetLayout layouts[]
         = { pass.uniform_layout, pass.sampler_layout };
@@ -1754,7 +1819,8 @@ bool create_pass_descriptors(VulkanGeneration& generation,
         layout.pPushConstantRanges = &material_index;
     }
     if (vkCreatePipelineLayout(generation.device, &layout, nullptr,
-            &pass.layout) != VK_SUCCESS)
+            &pass.layout)
+        != VK_SUCCESS)
     {
         error = "Rezonality could not create descriptors for pass '"
             + source.name + "'";
@@ -1870,7 +1936,8 @@ bool create_ray_pass(VulkanGeneration& generation,
     uniform_info.bindingCount = 1;
     uniform_info.pBindings = &uniform_binding;
     if (vkCreateDescriptorSetLayout(generation.device, &uniform_info,
-            nullptr, &pass.uniform_layout) != VK_SUCCESS)
+            nullptr, &pass.uniform_layout)
+        != VK_SUCCESS)
         return false;
     const std::array ray_bindings{
         VkDescriptorSetLayoutBinding{ 0,
@@ -1889,7 +1956,8 @@ bool create_ray_pass(VulkanGeneration& generation,
     ray_layout.bindingCount = static_cast<uint32_t>(ray_bindings.size());
     ray_layout.pBindings = ray_bindings.data();
     if (vkCreateDescriptorSetLayout(generation.device, &ray_layout,
-            nullptr, &pass.ray_layout) != VK_SUCCESS)
+            nullptr, &pass.ray_layout)
+        != VK_SUCCESS)
         return false;
     const std::array pool_sizes{
         VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 },
@@ -1905,7 +1973,8 @@ bool create_ray_pass(VulkanGeneration& generation,
     pool.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
     pool.pPoolSizes = pool_sizes.data();
     if (vkCreateDescriptorPool(generation.device, &pool, nullptr,
-            &pass.descriptor_pool) != VK_SUCCESS)
+            &pass.descriptor_pool)
+        != VK_SUCCESS)
         return false;
     const VkDescriptorSetLayout layouts[]
         = { pass.uniform_layout, pass.ray_layout };
@@ -1978,7 +2047,8 @@ bool create_ray_pass(VulkanGeneration& generation,
     pipeline_layout.setLayoutCount = 2;
     pipeline_layout.pSetLayouts = layouts;
     if (vkCreatePipelineLayout(generation.device, &pipeline_layout,
-            nullptr, &pass.layout) != VK_SUCCESS)
+            nullptr, &pass.layout)
+        != VK_SUCCESS)
         return false;
 
     const VkShaderModule raygen
@@ -2064,7 +2134,8 @@ bool create_ray_pass(VulkanGeneration& generation,
     std::vector<uint8_t> handles(handle_size * groups.size());
     if (generation.ray.get_group_handles(generation.device, pass.pipeline,
             0, static_cast<uint32_t>(groups.size()), handles.size(),
-            handles.data()) != VK_SUCCESS
+            handles.data())
+            != VK_SUCCESS
         || !create_owned_buffer(generation, section_stride * groups.size(),
             VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR
                 | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -2335,7 +2406,8 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
         pipeline_info.stageCount = 2;
         pipeline_info.pStages = stages;
         pipeline_info.pVertexInputState = source.model_index
-            ? &model_vertex_input : &vertex_input;
+            ? &model_vertex_input
+            : &vertex_input;
         pipeline_info.pInputAssemblyState = &assembly;
         pipeline_info.pViewportState = &viewport;
         pipeline_info.pRasterizationState = &raster;
@@ -2467,6 +2539,62 @@ void initialize_generation_images(
             }
 }
 
+void update_audio_surfaces(VkCommandBuffer command,
+    VulkanGeneration& generation, uint32_t frame_index,
+    const AudioTextureFrame& audio)
+{
+    if (audio.rgba.empty())
+        return;
+    const VkDeviceSize byte_size = audio.rgba.size() * sizeof(float);
+    for (auto& surface : generation.surfaces)
+    {
+        if (!surface.audio_analysis
+            || surface.audio_generation == audio.generation
+            || surface.audio_upload_buffers.empty())
+            continue;
+        auto& upload = surface.audio_upload_buffers[frame_index % surface.audio_upload_buffers.size()];
+        std::memcpy(upload.mapped, audio.rgba.data(),
+            static_cast<size_t>(byte_size));
+        vmaFlushAllocation(generation.allocator,
+            upload.allocation, 0, byte_size);
+
+        VkImageMemoryBarrier before{
+            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+        };
+        before.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        before.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.image = surface.attachment.image;
+        before.subresourceRange
+            = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        before.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(command,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+            1, &before);
+
+        VkBufferImageCopy copy{};
+        copy.imageSubresource
+            = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copy.imageExtent = { surface.width, surface.height, 1 };
+        vkCmdCopyBufferToImage(command, upload.buffer,
+            surface.attachment.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &copy);
+
+        VkImageMemoryBarrier after = before;
+        after.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        after.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+            nullptr, 1, &after);
+        surface.audio_generation = audio.generation;
+    }
+}
+
 void build_model_acceleration_structures(VkCommandBuffer command,
     VulkanGeneration& generation, VulkanModelResource& model)
 {
@@ -2556,9 +2684,11 @@ void transition_ray_target(VkCommandBuffer command,
     barrier.subresourceRange
         = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     barrier.srcAccessMask = for_write
-        ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_SHADER_WRITE_BIT;
+        ? VK_ACCESS_SHADER_READ_BIT
+        : VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = for_write
-        ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
+        ? VK_ACCESS_SHADER_WRITE_BIT
+        : VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(command,
         for_write ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
                   : VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
@@ -2600,6 +2730,8 @@ struct RezonalityInstance
     std::filesystem::path plugin_directory;
     DraxulPluginViewportV2 viewport{};
     std::unique_ptr<LiveProject> project;
+    AudioOptions audio_options;
+    std::unique_ptr<AudioAnalyzer> audio;
     std::optional<ShaderBuild> pending_build;
     std::optional<ShaderBuild> active_build;
     BackendState backend;
@@ -2615,7 +2747,32 @@ struct RezonalityInstance
     bool camera_initialized = false;
     std::string status = "building g1";
     std::string presentation_status;
+    std::string audio_status;
 };
+
+bool uses_audio(const ShaderBuild& build)
+{
+    return std::any_of(build.surfaces.begin(), build.surfaces.end(),
+        [](const auto& surface) { return surface.audio_analysis; });
+}
+
+void configure_audio(RezonalityInstance* instance, const ShaderBuild& build)
+{
+    if (uses_audio(build))
+    {
+        if (!instance->audio)
+        {
+            instance->audio
+                = std::make_unique<AudioAnalyzer>(instance->audio_options);
+            instance->audio->set_visible(instance->visible);
+        }
+    }
+    else
+    {
+        instance->audio.reset();
+        instance->audio_status.clear();
+    }
+}
 
 void ensure_camera(RezonalityInstance* instance, const ShaderBuild& build)
 {
@@ -2715,9 +2872,10 @@ void* create_instance(const DraxulPluginCreateInfoV2* info)
     }
     auto* raw = instance.get();
     instance->project = std::make_unique<LiveProject>(
-        instance->plugin_directory, std::move(*options), [raw] {
+        instance->plugin_directory, *options, [raw] {
             request_tick(raw);
         });
+    instance->audio_options = options->audio;
     instance->paused = instance->project->options().paused;
     instance->project->start();
     return instance.release();
@@ -2760,6 +2918,8 @@ void set_visible(void* opaque, int32_t visible)
     if (!instance)
         return;
     instance->visible = visible != 0;
+    if (instance->audio)
+        instance->audio->set_visible(instance->visible);
     if (instance->visible)
         request_redraw(instance);
     notify_presentation(instance);
@@ -2808,7 +2968,8 @@ int32_t handle_input(void* opaque, const DraxulPluginInputEventV2* event)
     }
     return event->kind == DRAXUL_PLUGIN_INPUT_POINTER_BUTTON
             && event->button == 1
-        ? 1 : 0;
+        ? 1
+        : 0;
 }
 
 DraxulPluginTickResultV2 tick(void* opaque,
@@ -2888,11 +3049,11 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
             {
                 const uint64_t used
                     = instance->backend.active->used_slots;
-                instance->backend.retired.push_back({
-                    std::move(*instance->backend.active), used });
+                instance->backend.retired.push_back({ std::move(*instance->backend.active), used });
             }
             instance->backend.active = std::move(*candidate);
             instance->active_build = *desired;
+            configure_audio(instance, *instance->active_build);
             instance->active_generation = desired_generation;
             instance->pending_build.reset();
             instance->status = "live g"
@@ -2917,11 +3078,31 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         || instance->backend.active->format != target.pixelFormat)
         return render_result(true, DRAXUL_PLUGIN_NO_DEADLINE);
 
+    if (instance->audio)
+    {
+        const AudioTextureFrame audio = instance->audio->frame();
+        instance->audio_status = audio.status;
+        for (auto& surface : instance->backend.active->surfaces)
+        {
+            if (!surface.audio_analysis
+                || surface.audio_generation == audio.generation
+                || audio.rgba.empty())
+                continue;
+            const MTLRegion region = MTLRegionMake2D(0, 0,
+                AudioTextureFrame::width, AudioTextureFrame::height);
+            [surface.texture replaceRegion:region
+                               mipmapLevel:0
+                                 withBytes:audio.rgba.data()
+                               bytesPerRow:AudioTextureFrame::width * 4 * sizeof(float)];
+            surface.audio_generation = audio.generation;
+        }
+    }
+
     id<MTLCommandBuffer> command
         = (__bridge id<MTLCommandBuffer>)frame->command_buffer;
     MTLRenderPassDescriptor* pass
         = (__bridge MTLRenderPassDescriptor*)
-            frame->continuation_render_pass_descriptor;
+              frame->continuation_render_pass_descriptor;
     const uint32_t uniform_slot = frame->frame_index
         % instance->backend.active->buffered_frame_count;
     const size_t uniform_offset
@@ -2938,47 +3119,46 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
     {
         if (scene_pass.ray_trace)
         {
-            auto& model = instance->backend.active->models[
-                *scene_pass.model_index];
+            auto& model = instance->backend.active->models[*scene_pass.model_index];
             if (!model.acceleration_structures_built)
             {
                 id<MTLAccelerationStructureCommandEncoder> blas_encoder
                     = [command accelerationStructureCommandEncoder];
                 [blas_encoder buildAccelerationStructure:model.blas
-                    descriptor:model.blas_descriptor
-                    scratchBuffer:model.acceleration_scratch
-                    scratchBufferOffset:0];
+                                              descriptor:model.blas_descriptor
+                                           scratchBuffer:model.acceleration_scratch
+                                     scratchBufferOffset:0];
                 [blas_encoder endEncoding];
                 id<MTLAccelerationStructureCommandEncoder> tlas_encoder
                     = [command accelerationStructureCommandEncoder];
                 [tlas_encoder buildAccelerationStructure:model.tlas
-                    descriptor:model.tlas_descriptor
-                    scratchBuffer:model.acceleration_scratch
-                    scratchBufferOffset:0];
+                                              descriptor:model.tlas_descriptor
+                                           scratchBuffer:model.acceleration_scratch
+                                     scratchBufferOffset:0];
                 [tlas_encoder endEncoding];
                 model.acceleration_structures_built = true;
             }
             id<MTLTexture> ray_target
-                = instance->backend.active->surfaces[
-                    scene_pass.targets.front()].texture;
+                = instance->backend.active->surfaces[scene_pass.targets.front()].texture;
             id<MTLComputeCommandEncoder> encoder
                 = [command computeCommandEncoder];
             [encoder setComputePipelineState:scene_pass.ray_pipeline];
             [encoder setTexture:ray_target atIndex:0];
             [encoder setAccelerationStructure:model.tlas atBufferIndex:0];
             [encoder setBuffer:instance->backend.active->uniform_buffer
-                          offset:uniform_offset atIndex:1];
+                        offset:uniform_offset
+                       atIndex:1];
             [encoder setBuffer:model.vertex_buffer offset:0 atIndex:2];
             [encoder setBuffer:model.index_buffer offset:0 atIndex:3];
             [encoder useResource:ray_target usage:MTLResourceUsageWrite];
             [encoder useResource:model.vertex_buffer
-                          usage:MTLResourceUsageRead];
+                           usage:MTLResourceUsageRead];
             [encoder useResource:model.index_buffer
-                          usage:MTLResourceUsageRead];
+                           usage:MTLResourceUsageRead];
             [encoder useResource:(id<MTLResource>)model.tlas
-                          usage:MTLResourceUsageRead];
+                           usage:MTLResourceUsageRead];
             [encoder useResource:(id<MTLResource>)model.blas
-                          usage:MTLResourceUsageRead];
+                           usage:MTLResourceUsageRead];
             const MTLSize grid
                 = MTLSizeMake(ray_target.width, ray_target.height, 1);
             const MTLSize threads = MTLSizeMake(8, 8, 1);
@@ -3010,7 +3190,8 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                     render_pass.depthAttachment.texture = surface.texture;
                     render_pass.depthAttachment.loadAction
                         = scene_pass.has_clear
-                        ? MTLLoadActionClear : MTLLoadActionLoad;
+                        ? MTLLoadActionClear
+                        : MTLLoadActionLoad;
                     render_pass.depthAttachment.storeAction
                         = MTLStoreActionStore;
                     render_pass.depthAttachment.clearDepth = 1.0;
@@ -3021,7 +3202,8 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                         = render_pass.colorAttachments[color_index++];
                     attachment.texture = surface.texture;
                     attachment.loadAction = scene_pass.has_clear
-                        ? MTLLoadActionClear : MTLLoadActionLoad;
+                        ? MTLLoadActionClear
+                        : MTLLoadActionLoad;
                     attachment.storeAction = MTLStoreActionStore;
                     attachment.clearColor = MTLClearColorMake(
                         scene_pass.clear[0], scene_pass.clear[1],
@@ -3033,44 +3215,45 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
             = [command renderCommandEncoderWithDescriptor:render_pass];
         [encoder setRenderPipelineState:scene_pass.pipeline];
         if (scene_pass.model_index)
-            [encoder setVertexBuffer:instance->backend.active->models[
-                    *scene_pass.model_index].vertex_buffer
-                              offset:0 atIndex:0];
+            [encoder setVertexBuffer:instance->backend.active->models[*scene_pass.model_index].vertex_buffer
+                              offset:0
+                             atIndex:0];
         else
             [encoder setVertexBuffer:instance->backend.vertex_buffer
-                              offset:0 atIndex:0];
+                              offset:0
+                             atIndex:0];
         [encoder setVertexBuffer:instance->backend.active->uniform_buffer
-                          offset:uniform_offset atIndex:1];
+                          offset:uniform_offset
+                         atIndex:1];
         [encoder setFragmentBuffer:instance->backend.active->uniform_buffer
-                            offset:uniform_offset atIndex:1];
+                            offset:uniform_offset
+                           atIndex:1];
         for (NSUInteger index = 0; index < scene_pass.samplers.size(); ++index)
         {
-            const auto& surface = instance->backend.active->surfaces[
-                scene_pass.samplers[index]];
+            const auto& surface = instance->backend.active->surfaces[scene_pass.samplers[index]];
             [encoder setFragmentTexture:surface.texture atIndex:index];
             [encoder setFragmentSamplerState:surface.repeat
-                    ? instance->backend.active->repeat_sampler
-                    : instance->backend.active->clamp_sampler
+                         ? instance->backend.active->repeat_sampler
+                         : instance->backend.active->clamp_sampler
                                      atIndex:index];
         }
         if (scene_pass.model_index)
         {
-            const auto& model = instance->backend.active->models[
-                *scene_pass.model_index];
+            const auto& model = instance->backend.active->models[*scene_pass.model_index];
             [encoder setFragmentBuffer:model.material_buffer
-                                offset:0 atIndex:2];
+                                offset:0
+                               atIndex:2];
             for (NSUInteger kind = 0; kind < model.textures.size(); ++kind)
             {
                 for (NSUInteger index = 0;
                      index < rezonality::kMaxModelMaterials; ++index)
                 {
-                    const id<MTLTexture> texture = model.textures[kind][
-                        std::min(index, model.textures[kind].size() - 1)];
+                    const id<MTLTexture> texture = model.textures[kind][std::min(index, model.textures[kind].size() - 1)];
                     const NSUInteger binding = 16
                         + kind * rezonality::kMaxModelMaterials + index;
                     [encoder setFragmentTexture:texture atIndex:binding];
                     [encoder setFragmentSamplerState:
-                        instance->backend.active->repeat_sampler
+                                 instance->backend.active->repeat_sampler
                                              atIndex:binding];
                 }
             }
@@ -3083,32 +3266,31 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         [encoder setScissorRect:scissor];
         if (scene_pass.model_index)
         {
-            const auto& model = instance->backend.active->models[
-                *scene_pass.model_index];
+            const auto& model = instance->backend.active->models[*scene_pass.model_index];
             for (const auto& part : model.parts)
             {
                 uint32_t material_index = part.material_index;
                 [encoder setFragmentBytes:&material_index
-                                   length:sizeof(material_index) atIndex:0];
+                                   length:sizeof(material_index)
+                                  atIndex:0];
                 [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                     indexCount:part.index_count
-                                      indexType:MTLIndexTypeUInt32
-                                    indexBuffer:model.index_buffer
-                              indexBufferOffset:part.index_offset
-                                  * sizeof(uint32_t)];
+                                    indexCount:part.index_count
+                                     indexType:MTLIndexTypeUInt32
+                                   indexBuffer:model.index_buffer
+                             indexBufferOffset:part.index_offset
+                             * sizeof(uint32_t)];
             }
         }
         else
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                         vertexStart:0 vertexCount:6];
+                        vertexStart:0
+                        vertexCount:6];
         [encoder endEncoding];
     }
     if (frame->frame_index < 64)
         instance->backend.active->used_slots
             |= uint64_t{ 1 } << frame->frame_index;
-    return render_result(true, instance->paused
-            ? DRAXUL_PLUGIN_NO_DEADLINE
-            : draxul::plugin_support::kFrameDelayNs);
+    return render_result(true, instance->paused ? DRAXUL_PLUGIN_NO_DEADLINE : draxul::plugin_support::kFrameDelayNs);
 }
 
 #else
@@ -3162,11 +3344,11 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
             {
                 const uint64_t used
                     = instance->backend.active->used_slots;
-                instance->backend.retired.push_back({
-                    std::move(*instance->backend.active), used });
+                instance->backend.retired.push_back({ std::move(*instance->backend.active), used });
             }
             instance->backend.active = std::move(*candidate);
             instance->active_build = *desired;
+            configure_audio(instance, *instance->active_build);
             instance->active_generation = desired_generation;
             instance->pending_build.reset();
             instance->status = "live g"
@@ -3196,6 +3378,13 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
     const VkCommandBuffer command
         = static_cast<VkCommandBuffer>(frame->command_buffer);
     initialize_generation_images(command, *instance->backend.active);
+    if (instance->audio)
+    {
+        const AudioTextureFrame audio = instance->audio->frame();
+        instance->audio_status = audio.status;
+        update_audio_surfaces(command, *instance->backend.active,
+            frame->frame_index, audio);
+    }
     const uint32_t uniform_slot = frame->frame_index
         % instance->backend.active->buffered_frame_count;
     const size_t uniform_offset
@@ -3216,12 +3405,10 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
     {
         if (pass.ray_trace)
         {
-            auto& model = instance->backend.active->models[
-                *pass.model_index];
+            auto& model = instance->backend.active->models[*pass.model_index];
             build_model_acceleration_structures(
                 command, *instance->backend.active, model);
-            const auto& target = instance->backend.active->surfaces[
-                pass.target_surfaces.front()];
+            const auto& target = instance->backend.active->surfaces[pass.target_surfaces.front()];
             transition_ray_target(command, target, true);
             vkCmdBindPipeline(command,
                 VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pass.pipeline);
@@ -3254,16 +3441,14 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
         }
         else if (!pass.target_surfaces.empty())
         {
-            const auto& target = instance->backend.active->surfaces[
-                pass.target_surfaces.front()];
+            const auto& target = instance->backend.active->surfaces[pass.target_surfaces.front()];
             target_width = target.width;
             target_height = target.height;
         }
         std::vector<VkClearValue> clears(pass.target_surfaces.size());
         for (size_t index = 0; index < pass.target_surfaces.size(); ++index)
         {
-            const auto& target = instance->backend.active->surfaces[
-                pass.target_surfaces[index]];
+            const auto& target = instance->backend.active->surfaces[pass.target_surfaces[index]];
             if (target.aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
                 clears[index].depthStencil = { 1.0f, 0 };
             else
@@ -3293,11 +3478,11 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
         VkRect2D scissor{
             { target_x, target_y },
             { static_cast<uint32_t>(pass.direct
-                    ? frame->viewport.width
-                    : static_cast<int32_t>(target_width)),
+                      ? frame->viewport.width
+                      : static_cast<int32_t>(target_width)),
                 static_cast<uint32_t>(pass.direct
-                    ? frame->viewport.height
-                    : static_cast<int32_t>(target_height)) }
+                        ? frame->viewport.height
+                        : static_cast<int32_t>(target_height)) }
         };
         vkCmdSetViewport(command, 0, 1, &viewport);
         vkCmdSetScissor(command, 0, 1, &scissor);
@@ -3306,8 +3491,7 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
         std::vector<VkDescriptorSet> sets
             = { pass.uniform_set, pass.sampler_set };
         if (pass.model_index)
-            sets.push_back(instance->backend.active->models[
-                *pass.model_index].descriptor_set);
+            sets.push_back(instance->backend.active->models[*pass.model_index].descriptor_set);
         const uint32_t dynamic_offset
             = static_cast<uint32_t>(uniform_offset);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -3315,8 +3499,7 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
             sets.data(), 1, &dynamic_offset);
         if (pass.model_index)
         {
-            const auto& model = instance->backend.active->models[
-                *pass.model_index];
+            const auto& model = instance->backend.active->models[*pass.model_index];
             vkCmdBindVertexBuffers(command, 0, 1,
                 &model.vertex_buffer.buffer, &offset);
             vkCmdBindIndexBuffer(command, model.index_buffer.buffer, 0,
@@ -3341,9 +3524,7 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
     if (frame->frame_index < 64)
         instance->backend.active->used_slots
             |= uint64_t{ 1 } << frame->frame_index;
-    return render_result(true, instance->paused
-            ? DRAXUL_PLUGIN_NO_DEADLINE
-            : draxul::plugin_support::kFrameDelayNs);
+    return render_result(true, instance->paused ? DRAXUL_PLUGIN_NO_DEADLINE : draxul::plugin_support::kFrameDelayNs);
 }
 
 #endif
@@ -3356,6 +3537,8 @@ int32_t get_presentation_state(void* opaque,
         || state->struct_size < sizeof(DraxulPluginPresentationStateV2))
         return 0;
     instance->presentation_status = instance->status;
+    if (!instance->audio_status.empty())
+        instance->presentation_status += " | " + instance->audio_status;
     if (instance->paused)
         instance->presentation_status += " | paused";
     if (!instance->visible)

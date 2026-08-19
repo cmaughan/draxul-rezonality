@@ -67,6 +67,8 @@ elseif(NOT TARGET Vulkan::Vulkan)
 endif()
 
 set(_rezonality_sources
+    src/audio_analysis.cpp
+    src/audio_analysis.h
     src/camera.cpp
     src/camera.h
     src/image_loader.cpp
@@ -77,23 +79,36 @@ set(_rezonality_sources
     src/model_loader.h
     src/rezonality_plugin.cpp)
 
+if(APPLE)
+    list(APPEND _rezonality_sources src/mic_permission.mm)
+    set(DRAXUL_REZONALITY_SDL_TARGET SDL3::Headers)
+else()
+    list(APPEND _rezonality_sources src/mic_permission_stub.cpp)
+    set(DRAXUL_REZONALITY_SDL_TARGET SDL3::SDL3)
+endif()
+
 add_library(draxul-rezonality-plugin MODULE ${_rezonality_sources})
 target_link_libraries(draxul-rezonality-plugin PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
     assimp::assimp
     glm::glm
-    nlohmann_json::nlohmann_json)
+    nlohmann_json::nlohmann_json
+    ${DRAXUL_REZONALITY_SDL_TARGET})
 target_compile_definitions(draxul-rezonality-plugin PRIVATE
     GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_include_directories(draxul-rezonality-plugin PRIVATE ${stb_SOURCE_DIR})
 if(APPLE)
     set_source_files_properties(src/rezonality_plugin.cpp
         PROPERTIES LANGUAGE OBJCXX)
+    set_source_files_properties(src/mic_permission.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    find_library(REZONALITY_AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
     target_link_libraries(draxul-rezonality-plugin PRIVATE
         spirv-cross-msl
         "-framework Metal"
-        "-framework Foundation")
+        "-framework Foundation"
+        ${REZONALITY_AVFOUNDATION_FRAMEWORK})
 else()
     target_link_libraries(draxul-rezonality-plugin PRIVATE
         Vulkan::Vulkan
