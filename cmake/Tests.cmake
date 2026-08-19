@@ -21,6 +21,8 @@ target_compile_definitions(draxul-test-rezonality PRIVATE
     GLM_FORCE_DEPTH_ZERO_TO_ONE
     DRAXUL_REZONALITY_MODULE_PATH="$<TARGET_FILE:draxul-rezonality-plugin>")
 add_dependencies(draxul-test-rezonality draxul-rezonality-plugin)
+set_tests_properties(draxul-test-rezonality-shard-0
+    PROPERTIES RUN_SERIAL TRUE)
 target_include_directories(draxul-test-rezonality PRIVATE
     "${_rezonality_root}/src"
     ${stb_SOURCE_DIR})

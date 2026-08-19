@@ -512,12 +512,17 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     REQUIRE(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
     REQUIRE(std::string_view(api->plugin_version) == "0.4.0");
 
+    const auto fixture_id = std::chrono::steady_clock::now()
+                                .time_since_epoch()
+                                .count();
     const fs::path fixture = fs::temp_directory_path()
-        / "draxul-rezonality-pbr-edit-smoke";
+        / ("draxul-rezonality-pbr-edit-smoke-"
+            + std::to_string(fixture_id));
     std::error_code ec;
-    fs::remove_all(fixture, ec);
+    REQUIRE(fs::create_directories(fixture));
     fs::copy(plugin_root() / "examples" / "pbr_robot", fixture,
-        fs::copy_options::recursive, ec);
+        fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+        ec);
     REQUIRE_FALSE(ec);
 
     HostState host_state;
@@ -606,4 +611,5 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     api->quiesce_instance(instance);
     api->destroy_instance(instance);
     fs::remove_all(fixture, ec);
+    CHECK_FALSE(ec);
 }
