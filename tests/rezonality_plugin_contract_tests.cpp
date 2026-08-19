@@ -95,6 +95,7 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     CHECK(api->abi_version == DRAXUL_PLUGIN_ABI_VERSION);
     CHECK(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
     CHECK(std::string_view(api->display_name) == "Rezonality");
+    CHECK(std::string_view(api->plugin_version) == "0.4.0");
 #if defined(__APPLE__)
     CHECK(api->supported_backends == DRAXUL_PLUGIN_BACKEND_METAL);
 #else

@@ -2507,7 +2507,7 @@ using Presentation = draxul::plugin_support::PresentationAdapter<kActions,
     &get_presentation_state, &dispatch_action>;
 
 const DraxulPluginApiV2 kApi = draxul::plugin_support::make_plugin_api(
-    { kPluginId, "Rezonality", "0.3.0",
+    { kPluginId, "Rezonality", "0.4.0",
         draxul::plugin_support::kNativeBackendMask },
     {
         .create_instance = &create_instance,
