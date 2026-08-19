@@ -412,6 +412,23 @@ bool parse_scalar(const std::string& body, std::string_view key,
     return true;
 }
 
+bool parse_uv_origin(const std::string& body, std::string_view owner,
+    bool& flip_texture_y, std::string& error)
+{
+    flip_texture_y = true;
+    const auto origin = first_match(body,
+        std::regex(R"(\buv_origin\s*:\s*([A-Za-z_]+))"));
+    if (!origin || *origin == "lower_left")
+        return true;
+    if (*origin == "upper_left")
+    {
+        flip_texture_y = false;
+        return true;
+    }
+    error = std::string(owner) + " has unknown uv_origin '" + *origin + "'";
+    return false;
+}
+
 std::vector<std::pair<std::string, std::string>> named_blocks(
     const std::string& source, std::string_view kind)
 {
@@ -487,10 +504,17 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         }
         glm::vec3 scale{ 1.0f };
         parse_vec3(body, "scale", scale);
+        bool flip_texture_y = true;
+        if (!parse_uv_origin(body, "Model '" + name + "'",
+                flip_texture_y, error))
+        {
+            diagnostic_line = 1;
+            return std::nullopt;
+        }
         ModelData model;
         const fs::path model_path
             = options.project_path / fs::u8path(*path);
-        if (!load_model(model_path, scale, model, error))
+        if (!load_model(model_path, scale, flip_texture_y, model, error))
         {
             diagnostic_path = model_path;
             diagnostic_line = 1;
@@ -597,10 +621,18 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         {
             glm::vec3 scale{ 1.0f };
             parse_vec3(geometry_body, "scale", scale);
+            bool flip_texture_y = true;
+            if (!parse_uv_origin(geometry_body,
+                    "Geometry in pass '" + name + "'",
+                    flip_texture_y, error))
+            {
+                diagnostic_line = 1;
+                return std::nullopt;
+            }
             ModelData model;
             const fs::path model_path
                 = options.project_path / fs::u8path(*geometry_path);
-            if (!load_model(model_path, scale, model, error))
+            if (!load_model(model_path, scale, flip_texture_y, model, error))
             {
                 diagnostic_path = model_path;
                 diagnostic_line = 1;

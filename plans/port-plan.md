@@ -302,10 +302,17 @@ Deliver:
 
 Tests:
 
-- snapshots for the default sphere and PBR robot;
-- model/texture edit and missing-asset rollback;
+- snapshots for the default sphere and an upright, correctly mapped PBR robot;
+- a real dynamically loaded PBR-project smoke that performs valid shader and
+  scene edits, rejects invalid GLSL/scene/model/texture candidates, and recovers
+  after every repair;
+- model/texture edit and missing-asset rollback, including UV-origin handling;
 - two simultaneous instances with different projects and cameras;
 - camera input translation and resize preservation.
+
+The PBR edit/recovery smoke and robot snapshot are selected by
+`py do.py test debug --rezonality`. Core-only runs omit them, and the render
+tests are not registered when the Rezonality target is unavailable.
 
 Manual check: open two Rezonality panes, orbit the robot in one, edit the other,
 and confirm state and resources do not leak between them.

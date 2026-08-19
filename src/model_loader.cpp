@@ -25,10 +25,27 @@ ModelTexture solid_texture(std::array<uint8_t, 4> rgba, bool srgb = false)
     return texture;
 }
 
+void flip_texture_rows(ModelTexture& texture)
+{
+    if (texture.height <= 1 || texture.width == 0 || texture.pixels.empty())
+        return;
+    const size_t row_bytes = static_cast<size_t>(texture.width) * 4;
+    std::vector<uint8_t> row(row_bytes);
+    for (uint32_t y = 0; y < texture.height / 2; ++y)
+    {
+        uint8_t* top = texture.pixels.data() + y * row_bytes;
+        uint8_t* bottom = texture.pixels.data()
+            + (texture.height - 1 - y) * row_bytes;
+        std::memcpy(row.data(), top, row_bytes);
+        std::memcpy(top, bottom, row_bytes);
+        std::memcpy(bottom, row.data(), row_bytes);
+    }
+}
+
 bool load_texture(const aiScene& scene, const aiMaterial& material,
     aiTextureType type, const std::filesystem::path& model_path,
-    std::array<uint8_t, 4> fallback, bool srgb, ModelTexture& result,
-    std::string& error)
+    std::array<uint8_t, 4> fallback, bool srgb, bool flip_y,
+    ModelTexture& result, std::string& error)
 {
     aiString requested;
     if (material.GetTextureCount(type) == 0
@@ -47,7 +64,11 @@ bool load_texture(const aiScene& scene, const aiMaterial& material,
                     reinterpret_cast<const uint8_t*>(embedded->pcData),
                     embedded->mWidth, result.width, result.height,
                     result.pixels, error))
+            {
+                if (flip_y)
+                    flip_texture_rows(result);
                 return true;
+            }
         }
         else
         {
@@ -65,6 +86,8 @@ bool load_texture(const aiScene& scene, const aiMaterial& material,
                 result.pixels[index * 4 + 2] = source.b;
                 result.pixels[index * 4 + 3] = source.a;
             }
+            if (flip_y)
+                flip_texture_rows(result);
             return true;
         }
     }
@@ -76,7 +99,11 @@ bool load_texture(const aiScene& scene, const aiMaterial& material,
             texture_path = model_path.parent_path() / texture_path;
         if (load_rgba8_image(texture_path, result.width, result.height,
                 result.pixels, error))
+        {
+            if (flip_y)
+                flip_texture_rows(result);
             return true;
+        }
         error = "Could not load model texture '" + texture_path.string()
             + "': " + error;
         return false;
@@ -89,17 +116,17 @@ bool load_texture(const aiScene& scene, const aiMaterial& material,
 
 glm::vec3 converted(const aiVector3D& value)
 {
-    return { value.x, -value.y, value.z };
+    return { value.x, value.y, value.z };
 }
 
 } // namespace
 
 bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
-    ModelData& model, std::string& error)
+    bool flip_texture_y, ModelData& model, std::string& error)
 {
     Assimp::Importer importer;
-    constexpr unsigned flags = aiProcess_FlipWindingOrder
-        | aiProcess_Triangulate | aiProcess_PreTransformVertices
+    constexpr unsigned flags = aiProcess_Triangulate
+        | aiProcess_PreTransformVertices
         | aiProcess_CalcTangentSpace | aiProcess_GenSmoothNormals;
     const aiScene* scene = importer.ReadFile(path.string(), flags);
     if (!scene || !scene->HasMeshes())
@@ -119,6 +146,7 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
     ModelData candidate;
     candidate.path = path;
     candidate.scale = scale;
+    candidate.flip_texture_y = flip_texture_y;
     candidate.materials.reserve(std::max(1u, scene->mNumMaterials));
     for (unsigned index = 0; index < scene->mNumMaterials; ++index)
     {
@@ -143,23 +171,27 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
         if (!load_texture(*scene, source,
             source.GetTextureCount(aiTextureType_BASE_COLOR)
                 ? aiTextureType_BASE_COLOR : aiTextureType_DIFFUSE,
-            path, { 255, 255, 255, 255 }, true, material.base_color, error)
+            path, { 255, 255, 255, 255 }, true, flip_texture_y,
+            material.base_color, error)
             || !load_texture(*scene, source,
             source.GetTextureCount(aiTextureType_NORMALS)
                 ? aiTextureType_NORMALS : aiTextureType_NORMAL_CAMERA,
-            path, { 128, 128, 255, 255 }, false, material.normal, error)
+            path, { 128, 128, 255, 255 }, false, flip_texture_y,
+            material.normal, error)
             || !load_texture(*scene, source,
             source.GetTextureCount(aiTextureType_METALNESS)
                 ? aiTextureType_METALNESS : aiTextureType_DIFFUSE_ROUGHNESS,
-            path, { 255, 255, 255, 255 }, false,
+            path, { 255, 255, 255, 255 }, false, flip_texture_y,
             material.metallic_roughness, error)
             || !load_texture(*scene, source,
             source.GetTextureCount(aiTextureType_EMISSIVE)
                 ? aiTextureType_EMISSIVE : aiTextureType_EMISSION_COLOR,
-            path, { 255, 255, 255, 255 }, true, material.emissive, error)
+            path, { 255, 255, 255, 255 }, true, flip_texture_y,
+            material.emissive, error)
             || !load_texture(*scene, source,
             aiTextureType_AMBIENT_OCCLUSION, path,
-            { 255, 255, 255, 255 }, false, material.occlusion, error))
+            { 255, 255, 255, 255 }, false, flip_texture_y,
+            material.occlusion, error))
             return false;
         candidate.materials.push_back(std::move(material));
     }

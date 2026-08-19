@@ -92,3 +92,10 @@ py do.py test debug --rezonality
 py do.py smoke --skip-build
 ```
 
+The Rezonality scope loads the staged native module through the exported ABI,
+copies the real `pbr_robot` project, and drives valid shader edits, invalid GLSL,
+scene errors, missing textures, and successful recovery. On Windows it also
+renders the fixed paused robot and compares it with the checked-in reference
+image. These checks are opt-in: core-only tests do not run them, and Draxul does
+not register the render cases when the Rezonality submodule/target is absent.
+

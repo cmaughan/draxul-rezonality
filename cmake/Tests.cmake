@@ -15,9 +15,12 @@ target_link_libraries(draxul-test-rezonality PRIVATE
     Draxul::PluginSupport::Adapter
     assimp::assimp
     glm::glm
-    nlohmann_json::nlohmann_json)
+    nlohmann_json::nlohmann_json
+    ${CMAKE_DL_LIBS})
 target_compile_definitions(draxul-test-rezonality PRIVATE
-    GLM_FORCE_DEPTH_ZERO_TO_ONE)
+    GLM_FORCE_DEPTH_ZERO_TO_ONE
+    DRAXUL_REZONALITY_MODULE_PATH="$<TARGET_FILE:draxul-rezonality-plugin>")
+add_dependencies(draxul-test-rezonality draxul-rezonality-plugin)
 target_include_directories(draxul-test-rezonality PRIVATE
     "${_rezonality_root}/src"
     ${stb_SOURCE_DIR})

@@ -3,10 +3,12 @@
 #include <draxul/plugin_api.h>
 
 #include "camera.h"
+#include "image_loader.h"
 #include "model_loader.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -14,6 +16,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace
 {
@@ -84,6 +92,61 @@ std::filesystem::path plugin_root()
     return std::filesystem::path(DRAXUL_PROJECT_ROOT)
         / "plugins" / "rezonality";
 }
+
+std::string read_text(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE(input);
+    return { std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>() };
+}
+
+class DynamicPluginModule
+{
+public:
+    explicit DynamicPluginModule(const std::filesystem::path& path)
+    {
+#if defined(_WIN32)
+        handle_ = LoadLibraryW(path.c_str());
+        if (handle_)
+            query_ = reinterpret_cast<Query>(
+                GetProcAddress(handle_, "draxul_plugin_query_v2"));
+#else
+        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle_)
+            query_ = reinterpret_cast<Query>(
+                dlsym(handle_, "draxul_plugin_query_v2"));
+#endif
+    }
+
+    ~DynamicPluginModule()
+    {
+#if defined(_WIN32)
+        if (handle_)
+            FreeLibrary(handle_);
+#else
+        if (handle_)
+            dlclose(handle_);
+#endif
+    }
+
+    DynamicPluginModule(const DynamicPluginModule&) = delete;
+    DynamicPluginModule& operator=(const DynamicPluginModule&) = delete;
+
+    const DraxulPluginApiV2* api() const
+    {
+        return query_ ? query_(DRAXUL_PLUGIN_ABI_VERSION) : nullptr;
+    }
+
+private:
+    using Query = const DraxulPluginApiV2* (*)(uint32_t);
+#if defined(_WIN32)
+    HMODULE handle_ = nullptr;
+#else
+    void* handle_ = nullptr;
+#endif
+    Query query_ = nullptr;
+};
 
 } // namespace
 
@@ -370,29 +433,50 @@ TEST_CASE("Rezonality model assets load immutably and fail as a candidate",
     rezonality::ModelData first;
     std::string error;
     REQUIRE(rezonality::load_model(
-        fixture / "triangle.obj", { 2.0f, 1.0f, 1.0f }, first, error));
+        fixture / "triangle.obj", { 2.0f, 1.0f, 1.0f }, true,
+        first, error));
     REQUIRE(first.vertices.size() == 3);
     CHECK(first.indices.size() == 3);
     REQUIRE_FALSE(first.materials.empty());
     CHECK(first.vertices[0].position.x == Catch::Approx(-2.0f));
+    CHECK(first.vertices[2].position.y == Catch::Approx(1.0f));
     const auto first_pixels = first.materials.back().base_color.pixels;
     REQUIRE_FALSE(first_pixels.empty());
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    std::vector<uint8_t> source_pixels;
+    REQUIRE(rezonality::load_rgba8_image(fixture / "texture.png",
+        source_width, source_height, source_pixels, error));
+    const size_t source_row_bytes = static_cast<size_t>(source_width) * 4;
+    REQUIRE(first_pixels.size() == source_pixels.size());
+    CHECK(std::equal(first_pixels.begin(),
+        first_pixels.begin() + source_row_bytes,
+        source_pixels.end() - source_row_bytes));
 
     REQUIRE(fs::copy_file(second_texture, fixture / "texture.png",
         fs::copy_options::overwrite_existing));
     rezonality::ModelData second;
     error.clear();
     REQUIRE(rezonality::load_model(
-        fixture / "triangle.obj", { 2.0f, 1.0f, 1.0f }, second, error));
+        fixture / "triangle.obj", { 2.0f, 1.0f, 1.0f }, false,
+        second, error));
     REQUIRE_FALSE(second.materials.empty());
     CHECK(second.materials.back().base_color.pixels != first_pixels);
+    source_pixels.clear();
+    REQUIRE(rezonality::load_rgba8_image(fixture / "texture.png",
+        source_width, source_height, source_pixels, error));
+    const size_t second_row_bytes = static_cast<size_t>(source_width) * 4;
+    CHECK(std::equal(second.materials.back().base_color.pixels.begin(),
+        second.materials.back().base_color.pixels.begin() + second_row_bytes,
+        source_pixels.begin()));
     CHECK(first.materials.back().base_color.pixels == first_pixels);
 
     REQUIRE(fs::remove(fixture / "texture.png"));
     rezonality::ModelData rejected;
     error.clear();
     CHECK_FALSE(rezonality::load_model(
-        fixture / "triangle.obj", { 1.0f, 1.0f, 1.0f }, rejected, error));
+        fixture / "triangle.obj", { 1.0f, 1.0f, 1.0f }, true,
+        rejected, error));
     CHECK(error.find("texture.png") != std::string::npos);
     CHECK(rejected.vertices.empty());
     CHECK(first.materials.back().base_color.pixels == first_pixels);
@@ -416,4 +500,110 @@ TEST_CASE("Rezonality camera orbit, dolly, and resize stay pane-local",
     const auto wide = rezonality::camera_projection(first, 960, 360);
     const auto tall = rezonality::camera_projection(first, 360, 960);
     CHECK(wide != tall);
+}
+
+TEST_CASE("The staged Rezonality module survives real PBR project edits",
+    "[rezonality][integration][dynamic][pbr]")
+{
+    namespace fs = std::filesystem;
+    DynamicPluginModule module(fs::path(DRAXUL_REZONALITY_MODULE_PATH));
+    const auto* api = module.api();
+    REQUIRE(api != nullptr);
+    REQUIRE(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
+    REQUIRE(std::string_view(api->plugin_version) == "0.4.0");
+
+    const fs::path fixture = fs::temp_directory_path()
+        / "draxul-rezonality-pbr-edit-smoke";
+    std::error_code ec;
+    fs::remove_all(fixture, ec);
+    fs::copy(plugin_root() / "examples" / "pbr_robot", fixture,
+        fs::copy_options::recursive, ec);
+    REQUIRE_FALSE(ec);
+
+    HostState host_state;
+    DraxulPluginHostApiV2 host{};
+    host.struct_size = sizeof(host);
+    host.abi_version = DRAXUL_PLUGIN_ABI_VERSION;
+    host.host_context = &host_state;
+    host.request_redraw = &request_redraw;
+    host.request_tick = &request_tick;
+    host.notify_presentation_changed = &request_noop;
+    host.log = &log_noop;
+    host.query_service = &query_service_noop;
+
+    const std::string directory = plugin_root().string();
+    const std::string config = nlohmann::json{
+        { "project_path", fixture.string() },
+        { "auto_reload", false },
+        { "paused", true },
+        { "compile_debounce_ms", 25 },
+    }.dump();
+    DraxulPluginCreateInfoV2 create_info{};
+    create_info.struct_size = sizeof(create_info);
+    create_info.host = &host;
+    create_info.plugin_id = api->plugin_id;
+    create_info.plugin_directory_utf8 = directory.c_str();
+    create_info.config_json = config.data();
+    create_info.config_json_length = config.size();
+    create_info.initial_viewport = {
+        sizeof(DraxulPluginViewportV2), 0, 0, 960, 640, 1.0f, 96.0f
+    };
+    void* instance = api->create_instance(&create_info);
+    REQUIRE(instance != nullptr);
+
+    DraxulPluginPresentationExtensionV2 presentation{};
+    REQUIRE(api->query_extension(instance,
+        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+        &presentation, sizeof(presentation)) != 0);
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g1"));
+
+    const auto reload_and_wait = [&](std::string_view expected) {
+        REQUIRE(presentation.dispatch_action(instance,
+            "rezonality_reload", sizeof("rezonality_reload") - 1) != 0);
+        REQUIRE(wait_for_status(*api, instance, presentation, expected));
+    };
+    const fs::path shader_path = fixture / "pbr.frag";
+    const std::string shader = read_text(shader_path);
+    write_text(shader_path, shader + "\n// valid live shader edit\n");
+    reload_and_wait("ready g2");
+    write_text(shader_path, shader + "\nthis is not valid GLSL\n");
+    reload_and_wait("error g3");
+    CHECK(presentation_status(instance, presentation).find("pbr.frag")
+        != std::string::npos);
+    write_text(shader_path, shader);
+    reload_and_wait("ready g4");
+
+    const fs::path scene_path = fixture / "default.scenegraph";
+    const std::string scene = read_text(scene_path);
+    std::string broken_scene = scene;
+    const size_t model_reference = broken_scene.rfind("model: robot");
+    REQUIRE(model_reference != std::string::npos);
+    broken_scene.replace(model_reference, sizeof("model: robot") - 1,
+        "model: missing_robot");
+    write_text(scene_path, broken_scene);
+    reload_and_wait("error g5");
+    CHECK(presentation_status(instance, presentation).find("missing_robot")
+        != std::string::npos);
+    write_text(scene_path, scene + "\n// valid live scene edit\n");
+    reload_and_wait("ready g6");
+
+    const fs::path texture = fixture / "models" / "robot" / "textures"
+        / "RobotChest_baseColor.jpeg";
+    const fs::path hidden_texture = texture.string() + ".missing";
+    fs::rename(texture, hidden_texture, ec);
+    REQUIRE_FALSE(ec);
+    reload_and_wait("error g7");
+    CHECK(presentation_status(instance, presentation).find(
+              "RobotChest_baseColor.jpeg")
+        != std::string::npos);
+    fs::rename(hidden_texture, texture, ec);
+    REQUIRE_FALSE(ec);
+    write_text(scene_path, scene);
+    reload_and_wait("ready g8");
+
+    api->quiesce_instance(instance);
+    api->destroy_instance(instance);
+    fs::remove_all(fixture, ec);
 }

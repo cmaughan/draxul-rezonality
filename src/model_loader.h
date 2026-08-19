@@ -57,6 +57,7 @@ struct ModelData
 {
     std::filesystem::path path;
     glm::vec3 scale{ 1.0f };
+    bool flip_texture_y = true;
     std::vector<ModelVertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<ModelPart> parts;
@@ -64,6 +65,6 @@ struct ModelData
 };
 
 bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
-    ModelData& model, std::string& error);
+    bool flip_texture_y, ModelData& model, std::string& error);
 
 } // namespace rezonality
