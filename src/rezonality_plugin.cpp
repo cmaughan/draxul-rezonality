@@ -1,10 +1,14 @@
 #include "live_project.h"
 
 #include "camera.h"
+#include "diagnostics.h"
 #include "model_loader.h"
 
 #include <draxul/plugin_adapter.h>
 #include <draxul/plugin_api.h>
+#include <draxul/plugin_host_services.h>
+
+#include <nlohmann/json.hpp>
 
 #if defined(__APPLE__)
 #import <Foundation/Foundation.h>
@@ -18,6 +22,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -40,11 +46,14 @@ using rezonality::AudioAnalyzer;
 using rezonality::AudioOptions;
 using rezonality::AudioTextureFrame;
 using rezonality::BuildResult;
+using rezonality::DiagnosticState;
+using rezonality::DiagnosticsPublisher;
 using rezonality::LiveProject;
+using rezonality::ProjectOptions;
 using rezonality::ShaderBuild;
 
 constexpr const char* kPluginId = "dev.draxul.rezonality";
-constexpr const char* kPluginVersion = "0.6.0";
+constexpr const char* kPluginVersion = "0.7.0";
 constexpr size_t kCommonUniformFloatCount = 192;
 using CommonUniformBlock = std::array<float, kCommonUniformFloatCount>;
 
@@ -2735,6 +2744,9 @@ struct RezonalityInstance
 {
     const DraxulPluginHostApiV2* host = nullptr;
     std::filesystem::path plugin_directory;
+    ProjectOptions options;
+    std::unique_ptr<draxul::plugin_support::HostServices> services;
+    DiagnosticsPublisher diagnostics;
     DraxulPluginViewportV2 viewport{};
     std::unique_ptr<LiveProject> project;
     AudioOptions audio_options;
@@ -2744,6 +2756,7 @@ struct RezonalityInstance
     BackendState backend;
     uint64_t attempted_generation = 0;
     uint64_t active_generation = 0;
+    uint64_t last_success_unix_ms = 0;
     bool visible = true;
     bool focused = false;
     bool paused = false;
@@ -2802,6 +2815,50 @@ void log(RezonalityInstance* instance, uint32_t level,
     if (instance && instance->host && instance->host->log)
         instance->host->log(instance->host->host_context,
             level, message.data(), message.size());
+}
+
+uint64_t unix_milliseconds()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+std::string diagnostic_stage(const BuildResult& result)
+{
+    const std::string extension = result.diagnostic_path.extension().string();
+    if (extension == ".scenegraph" || extension == ".toml")
+        return "parse";
+    if (extension == ".vert" || extension == ".frag"
+        || extension == ".geom" || extension == ".rgen"
+        || extension == ".rmiss" || extension == ".rchit"
+        || extension == ".metal")
+        return "compile";
+    return "prepare";
+}
+
+void publish_diagnostics(RezonalityInstance* instance,
+    std::string stage, std::string severity,
+    const std::filesystem::path& path, int line,
+    std::string message)
+{
+    if (!instance || !instance->diagnostics.available())
+        return;
+    DiagnosticState state;
+    state.project_path = instance->options.project_path;
+    state.scenegraph_path
+        = instance->options.project_path / instance->options.scenegraph;
+    state.path = path;
+    state.attempted_generation = instance->attempted_generation;
+    state.active_generation = instance->active_generation;
+    state.last_success_unix_ms = instance->last_success_unix_ms;
+    state.stage = std::move(stage);
+    state.severity = std::move(severity);
+    state.line = line;
+    state.message = std::move(message);
+    std::string error;
+    if (!instance->diagnostics.publish(state, error))
+        log(instance, DRAXUL_PLUGIN_LOG_WARNING, error);
 }
 
 void request_tick(RezonalityInstance* instance)
@@ -2877,6 +2934,12 @@ void* create_instance(const DraxulPluginCreateInfoV2* info)
         log(instance.get(), DRAXUL_PLUGIN_LOG_ERROR, error);
         return nullptr;
     }
+    instance->options = *options;
+    instance->services
+        = std::make_unique<draxul::plugin_support::HostServices>(*info);
+    instance->diagnostics = DiagnosticsPublisher(
+        instance->services->path(DRAXUL_PLUGIN_PATH_CACHE),
+        options->project_path, options->diagnostics_id);
     auto* raw = instance.get();
     instance->project = std::make_unique<LiveProject>(
         instance->plugin_directory, *options, [raw] {
@@ -2885,6 +2948,8 @@ void* create_instance(const DraxulPluginCreateInfoV2* info)
     instance->audio_options = options->audio;
     instance->paused = instance->project->options().paused;
     instance->project->start();
+    publish_diagnostics(instance.get(), "watch", "info", {}, -1,
+        "building generation 1");
     return instance.release();
 }
 
@@ -2993,6 +3058,8 @@ DraxulPluginTickResultV2 tick(void* opaque,
             instance->pending_build = std::move(*result->build);
             instance->status = "ready g"
                 + std::to_string(result->generation);
+            publish_diagnostics(instance, "build", "info", {}, -1,
+                "candidate generation ready");
             if (instance->visible)
                 request_redraw(instance);
         }
@@ -3001,6 +3068,9 @@ DraxulPluginTickResultV2 tick(void* opaque,
             instance->status = format_error(
                 *result, instance->active_generation);
             log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
+            publish_diagnostics(instance, diagnostic_stage(*result),
+                "error", result->diagnostic_path,
+                result->diagnostic_line, result->error);
         }
         notify_presentation(instance);
     }
@@ -3067,6 +3137,9 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                 + std::to_string(instance->active_generation) + " | "
                 + std::to_string(desired->passes.size()) + " passes | "
                 + std::to_string(desired->surfaces.size()) + " surfaces";
+            instance->last_success_unix_ms = unix_milliseconds();
+            publish_diagnostics(instance, "render", "info", {}, -1,
+                "active generation ready");
             notify_presentation(instance);
         }
         else
@@ -3078,6 +3151,8 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                 instance->status += " | live g"
                     + std::to_string(instance->active_generation);
             log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
+            publish_diagnostics(instance, "prepare", "error", {}, -1,
+                error);
             notify_presentation(instance);
         }
     }
@@ -3363,6 +3438,9 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
                 + std::to_string(instance->active_generation) + " | "
                 + std::to_string(desired->passes.size()) + " passes | "
                 + std::to_string(desired->surfaces.size()) + " surfaces";
+            instance->last_success_unix_ms = unix_milliseconds();
+            publish_diagnostics(instance, "render", "info", {}, -1,
+                "active generation ready");
             notify_presentation(instance);
         }
         else
@@ -3374,6 +3452,8 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
                 instance->status += " | live g"
                     + std::to_string(instance->active_generation);
             log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
+            publish_diagnostics(instance, "prepare", "error", {}, -1,
+                error);
             notify_presentation(instance);
         }
     }
@@ -3545,7 +3625,9 @@ int32_t get_presentation_state(void* opaque,
     if (!instance || !state
         || state->struct_size < sizeof(DraxulPluginPresentationStateV2))
         return 0;
-    instance->presentation_status = instance->status;
+    instance->presentation_status
+        = instance->options.project_path.filename().string()
+        + " | " + instance->status;
     if (!instance->audio_status.empty())
         instance->presentation_status += " | " + instance->audio_status;
     if (instance->paused)
@@ -3590,6 +3672,127 @@ constexpr draxul::plugin_support::AdapterAction kActions[] = {
 using Presentation = draxul::plugin_support::PresentationAdapter<kActions,
     &get_presentation_state, &dispatch_action>;
 
+int32_t export_reload_json(void* opaque, char* buffer,
+    size_t* in_out_size)
+{
+    auto* instance = static_cast<RezonalityInstance*>(opaque);
+    if (!instance || !in_out_size)
+        return 0;
+    const std::string value = nlohmann::json{
+        { "project_path", instance->options.project_path.generic_string() },
+        { "scenegraph", instance->options.scenegraph.generic_string() },
+        { "time_seconds", instance->animation_elapsed_seconds },
+        { "paused", instance->paused },
+        { "camera_position", {
+            instance->camera.position.x,
+            instance->camera.position.y,
+            instance->camera.position.z } },
+        { "camera_focal_point", {
+            instance->camera.focal_point.x,
+            instance->camera.focal_point.y,
+            instance->camera.focal_point.z } },
+    }.dump();
+    const size_t required = value.size() + 1;
+    if (!buffer)
+    {
+        *in_out_size = required;
+        return required <= DRAXUL_PLUGIN_MAX_HOT_RELOAD_JSON_BYTES + 1;
+    }
+    if (*in_out_size < required)
+    {
+        *in_out_size = required;
+        return 0;
+    }
+    std::memcpy(buffer, value.c_str(), required);
+    *in_out_size = required;
+    return 1;
+}
+
+std::optional<glm::vec3> reload_vec3(
+    const nlohmann::json& state, const char* key)
+{
+    const auto value = state.find(key);
+    if (value == state.end() || !value->is_array() || value->size() != 3)
+        return std::nullopt;
+    glm::vec3 result;
+    for (size_t index = 0; index < 3; ++index)
+    {
+        if (!(*value)[index].is_number())
+            return std::nullopt;
+        result[index] = (*value)[index].get<float>();
+        if (!std::isfinite(result[index]) || std::abs(result[index]) > 1e6f)
+            return std::nullopt;
+    }
+    return result;
+}
+
+int32_t import_reload_json(void* opaque, const char* json,
+    size_t json_length, const char* source_schema_id,
+    uint32_t source_schema_version)
+{
+    auto* instance = static_cast<RezonalityInstance*>(opaque);
+    if (!instance || !json || !source_schema_id
+        || std::string_view(source_schema_id)
+            != "dev.draxul.rezonality.state"
+        || source_schema_version != 1
+        || json_length > DRAXUL_PLUGIN_MAX_HOT_RELOAD_JSON_BYTES)
+        return 0;
+    try
+    {
+        const auto state = nlohmann::json::parse(json, json + json_length);
+        if (!state.is_object()
+            || state.value("project_path", std::string{})
+                != instance->options.project_path.generic_string()
+            || state.value("scenegraph", std::string{})
+                != instance->options.scenegraph.generic_string())
+            return 0;
+        const double time = state.value("time_seconds", 0.0);
+        const auto position = reload_vec3(state, "camera_position");
+        const auto focal_point = reload_vec3(state, "camera_focal_point");
+        if (!std::isfinite(time) || time < 0.0 || time > 1e12
+            || !position || !focal_point)
+            return 0;
+        instance->animation_elapsed_seconds = time;
+        instance->last_animation_seconds = -1.0;
+        instance->paused = state.value("paused", instance->paused);
+        rezonality::camera_set_pos_lookat(
+            instance->camera, *position, *focal_point);
+        instance->camera_initialized = true;
+        request_redraw(instance);
+        notify_presentation(instance);
+        return 1;
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+int32_t query_extension(void* instance, const char* extension_id,
+    size_t extension_id_length, uint32_t requested_version,
+    void* extension_table, size_t extension_table_size)
+{
+    const std::string_view id(extension_id ? extension_id : "",
+        extension_id ? extension_id_length : 0);
+    if (id == DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID
+        && requested_version == DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_VERSION
+        && extension_table
+        && extension_table_size >= sizeof(DraxulPluginHotReloadExtensionV2))
+    {
+        auto* extension = static_cast<DraxulPluginHotReloadExtensionV2*>(
+            extension_table);
+        *extension = {
+            sizeof(*extension), DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_VERSION,
+            "dev.draxul.rezonality.state", 1,
+            &export_reload_json, &import_reload_json
+        };
+        return 1;
+    }
+    return Presentation::query_extension(instance, extension_id,
+        extension_id_length, requested_version, extension_table,
+        extension_table_size);
+}
+
 const DraxulPluginApiV2 kApi = draxul::plugin_support::make_plugin_api(
     { kPluginId, "Rezonality", kPluginVersion,
         draxul::plugin_support::kNativeBackendMask },
@@ -3607,7 +3810,7 @@ const DraxulPluginApiV2 kApi = draxul::plugin_support::make_plugin_api(
 #else
         .render_vulkan = &render_vulkan,
 #endif
-        .query_extension = &Presentation::query_extension,
+        .query_extension = &query_extension,
     });
 
 } // namespace

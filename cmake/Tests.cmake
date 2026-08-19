@@ -7,6 +7,7 @@ draxul_add_test_target(
     ${_rezonality_test_sources}
     "${_rezonality_root}/src/audio_analysis.cpp"
     "${_rezonality_root}/src/camera.cpp"
+    "${_rezonality_root}/src/diagnostics.cpp"
     "${_rezonality_root}/src/image_loader.cpp"
     "${_rezonality_root}/src/live_project.cpp"
     "${_rezonality_root}/src/model_loader.cpp"
@@ -31,6 +32,19 @@ target_compile_definitions(draxul-test-rezonality PRIVATE
 add_dependencies(draxul-test-rezonality draxul-rezonality-plugin)
 set_tests_properties(draxul-test-rezonality-shard-0
     PROPERTIES RUN_SERIAL TRUE)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME draxul-rezonality-agent-layout
+    COMMAND ${Python3_EXECUTABLE}
+        "${_rezonality_root}/tests/rezonality_layout_integration.py"
+        --draxul "$<TARGET_FILE:draxul>"
+        --python "${Python3_EXECUTABLE}"
+        --generator "${_rezonality_root}/tools/rezonality_layout.py"
+        --project "${_rezonality_root}/examples/simple")
+set_tests_properties(draxul-rezonality-agent-layout PROPERTIES
+    LABELS "rezonality;integration"
+    RUN_SERIAL TRUE
+    TIMEOUT 60)
+add_dependencies(draxul-test-rezonality draxul)
 target_include_directories(draxul-test-rezonality PRIVATE
     "${_rezonality_root}/src"
     ${stb_SOURCE_DIR})

@@ -25,6 +25,7 @@ struct ProjectOptions
     bool auto_reload = true;
     bool paused = false;
     uint32_t compile_debounce_ms = 150;
+    std::string diagnostics_id;
     AudioOptions audio;
 };
 

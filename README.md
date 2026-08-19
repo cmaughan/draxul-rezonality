@@ -6,7 +6,7 @@ viewer for shader and scene editing. It will render inside a Draxul pane using
 Vulkan on Windows and Metal on macOS while projects are edited from any other
 terminal or editor pane.
 
-The first five live-renderer slices are implemented. Rezonality parses ordered
+All six planned vertical slices are implemented. Rezonality parses ordered
 VkLive-style passes, named surfaces, cameras, and Assimp-backed OBJ/glTF models.
 It renders pane-sized intermediate targets, uploads immutable geometry and PBR
 material generations, binds HDR and material textures, then composites through
@@ -45,6 +45,7 @@ Instances accept a bounded JSON configuration like this:
   "auto_reload": true,
   "paused": false,
   "compile_debounce_ms": 150,
+  "diagnostics_id": "my-live-view",
   "audio_source": "input",
   "audio_device": ""
 }
@@ -54,7 +55,9 @@ Instances accept a bounded JSON configuration like this:
 deterministic test signal), or `silent` (an explicit inert fallback). Set
 `audio_device` to an exact SDL recording-device name to override the default.
 The setting is only used by projects declaring the reserved `AudioAnalysis`
-surface.
+surface. `diagnostics_id` is an optional stable lowercase filename stem for
+the agent-readable status described below; it accepts letters, digits, `.`,
+`_`, and `-`.
 
 Omit `project_path` to open the bundled `examples/simple` project. Bundled
 `default`, `blend_waves`, `deferred_shading`, `protoplanetary_disc`,
@@ -85,6 +88,23 @@ draxul tab create --space <space-id> --name Rezonality \
 Edit `screen.frag` from another Draxul terminal and save it. No embedded editor
 or application menu is involved.
 
+For an atomic terminal-plus-view workspace, generate a declarative layout and
+pipe it directly to the Draxul server. Repeat `--project` to add more views:
+
+```text
+py plugins/rezonality/tools/rezonality_layout.py --project D:/art/my-shader-project | draxul layout apply - --json
+```
+
+The generator gives each view a stable `diagnostics_id`. Rezonality atomically
+publishes bounded JSON at the plugin cache path under
+`diagnostics/<diagnostics_id>.json`. The record contains the project and source
+paths, attempted and active generations, stage, severity, line/column, message,
+timestamp, and last successful render time. Agents can therefore watch a
+compile fail, confirm the old active generation remains, repair the source, and
+observe the next successful generation without scraping pixels. Plugin module
+replacement also preserves the matching project's elapsed time, pause state,
+and camera position through Draxul's hot-reload handoff.
+
 ## Product boundary
 
 Rezonality owns the scene parser, shader compiler, model and texture loading,
@@ -114,8 +134,10 @@ py do.py smoke --skip-build
 The Rezonality scope loads the staged native module through the exported ABI,
 copies the real PBR and Cornell-box projects, and drives valid shader edits,
 invalid GLSL, scene errors, missing models/textures, and successful recovery.
-On Windows it also renders the fixed paused robot, ray-traced Cornell box, and
-synthetic audio spectrum and compares them with checked-in references. These checks are opt-in:
+It also creates an isolated server, applies the generated terminal-plus-view
+layout, and drives the terminal through the public pane commands. On Windows
+it renders every registered Rezonality scenario—default, waves, deferred,
+disc, robot, ray, and audio—and compares them with checked-in references. These checks are opt-in:
 core-only tests do not run them, and Draxul does not register the render cases
 when the Rezonality submodule/target is absent.
 

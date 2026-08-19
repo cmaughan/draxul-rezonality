@@ -71,6 +71,8 @@ set(_rezonality_sources
     src/audio_analysis.h
     src/camera.cpp
     src/camera.h
+    src/diagnostics.cpp
+    src/diagnostics.h
     src/image_loader.cpp
     src/image_loader.h
     src/live_project.cpp

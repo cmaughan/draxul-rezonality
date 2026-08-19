@@ -844,6 +844,26 @@ std::optional<ProjectOptions> parse_project_options(
         options.paused = config.value("paused", false);
         options.compile_debounce_ms = std::clamp(
             config.value("compile_debounce_ms", 150u), 25u, 5000u);
+        if (const auto diagnostics = config.find("diagnostics_id");
+            diagnostics != config.end())
+        {
+            if (!diagnostics->is_string())
+                throw std::runtime_error("diagnostics_id must be a string");
+            options.diagnostics_id = diagnostics->get<std::string>();
+            if (options.diagnostics_id.empty()
+                || options.diagnostics_id.size() > 64
+                || !std::all_of(options.diagnostics_id.begin(),
+                    options.diagnostics_id.end(), [](unsigned char value) {
+                        return (value >= 'a' && value <= 'z')
+                            || (value >= '0' && value <= '9')
+                            || value == '.' || value == '_'
+                            || value == '-';
+                    }))
+            {
+                throw std::runtime_error(
+                    "diagnostics_id must use 1-64 lowercase letters, digits, '.', '_', or '-'");
+            }
+        }
         if (const auto source = config.find("audio_source");
             source != config.end())
         {

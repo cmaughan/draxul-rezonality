@@ -376,6 +376,14 @@ the hidden pane stops driving frames and resumes cleanly.
 
 ### Slice 6 - Complete example and agent workflow acceptance
 
+Status: implemented in plugin version 0.7.0. All eight scenegraph projects are
+staged; a declarative layout generator creates terminal-plus-view workspaces;
+bounded atomic diagnostics expose candidate success, rollback, and repair; and
+Draxul's native-module hot reload preserves matching project time, pause, and
+camera state. Windows exercises every registered Vulkan render golden. Metal
+build, render-golden creation, and interactive workflow validation remain the
+explicit macOS acceptance gate.
+
 Deliver:
 
 - stage every supported VkLive example and shared shader include;

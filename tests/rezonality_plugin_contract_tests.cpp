@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -31,6 +32,7 @@ struct HostState
 {
     std::atomic_uint32_t ticks{ 0 };
     std::atomic_uint32_t redraws{ 0 };
+    std::filesystem::path cache_path;
 };
 
 void request_tick(void* context)
@@ -48,6 +50,44 @@ void log_noop(void*, uint32_t, const char*, size_t) {}
 int32_t query_service_noop(void*, const char*, size_t, uint32_t, void*, size_t)
 {
     return 0;
+}
+
+int32_t get_test_path(void* context, uint32_t kind, char* buffer,
+    size_t* in_out_size)
+{
+    auto* state = static_cast<HostState*>(context);
+    if (!state || !in_out_size || kind != DRAXUL_PLUGIN_PATH_CACHE
+        || state->cache_path.empty())
+        return 0;
+    const std::string value = state->cache_path.string();
+    const size_t required = value.size() + 1;
+    if (!buffer)
+    {
+        *in_out_size = required;
+        return 1;
+    }
+    if (*in_out_size < required)
+    {
+        *in_out_size = required;
+        return 0;
+    }
+    std::memcpy(buffer, value.c_str(), required);
+    *in_out_size = required;
+    return 1;
+}
+
+int32_t query_path_service(void* context, const char* id,
+    size_t id_length, uint32_t version, void* table, size_t table_size)
+{
+    if (!context || !id || !table
+        || std::string_view(id, id_length) != DRAXUL_PLUGIN_PATH_SERVICE_ID
+        || version != DRAXUL_PLUGIN_PATH_SERVICE_VERSION
+        || table_size < sizeof(DraxulPluginPathServiceV2))
+        return 0;
+    auto* service = static_cast<DraxulPluginPathServiceV2*>(table);
+    *service = { sizeof(*service), DRAXUL_PLUGIN_PATH_SERVICE_VERSION,
+        context, &get_test_path };
+    return 1;
 }
 
 std::string presentation_status(void* instance,
@@ -100,6 +140,11 @@ std::string read_text(const std::filesystem::path& path)
     REQUIRE(input);
     return { std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>() };
+}
+
+nlohmann::json read_json(const std::filesystem::path& path)
+{
+    return nlohmann::json::parse(read_text(path));
 }
 
 class DynamicPluginModule
@@ -159,7 +204,7 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     CHECK(api->abi_version == DRAXUL_PLUGIN_ABI_VERSION);
     CHECK(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
     CHECK(std::string_view(api->display_name) == "Rezonality");
-    CHECK(std::string_view(api->plugin_version) == "0.6.0");
+    CHECK(std::string_view(api->plugin_version) == "0.7.0");
 #if defined(__APPLE__)
     CHECK(api->supported_backends == DRAXUL_PLUGIN_BACKEND_METAL);
 #else
@@ -385,13 +430,13 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
     fs::remove_all(fixture, ec);
 }
 
-TEST_CASE("Rezonality compiles every staged multipass example",
-    "[rezonality][integration][multipass]")
+TEST_CASE("Rezonality compiles every staged example",
+    "[rezonality][integration][inventory]")
 {
     const auto* api = draxul_plugin_query_v2(DRAXUL_PLUGIN_ABI_VERSION);
     REQUIRE(api != nullptr);
     const std::string directory = plugin_root().string();
-    for (const std::string_view example : { "default", "blend_waves",
+    for (const std::string_view example : { "simple", "default", "blend_waves",
              "deferred_shading", "protoplanetary_disc", "pbr_robot",
              "ray_tracer", "audio_spectrum_analysis" })
     {
@@ -545,6 +590,174 @@ TEST_CASE("Rezonality camera orbit, dolly, and resize stay pane-local",
     CHECK(wide != tall);
 }
 
+TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands off state",
+    "[rezonality][integration][dynamic][agent]")
+{
+    namespace fs = std::filesystem;
+    DynamicPluginModule module(fs::path(DRAXUL_REZONALITY_MODULE_PATH));
+    const auto* api = module.api();
+    REQUIRE(api != nullptr);
+
+    const auto fixture_id = std::chrono::steady_clock::now()
+                                .time_since_epoch()
+                                .count();
+    const fs::path root = fs::temp_directory_path()
+        / ("draxul-rezonality-agent-workflow-"
+            + std::to_string(fixture_id));
+    const fs::path fixture = root / "project";
+    const fs::path cache = root / "cache";
+    std::error_code ec;
+    REQUIRE(fs::create_directories(fixture));
+    fs::copy(plugin_root() / "examples" / "simple", fixture,
+        fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+        ec);
+    REQUIRE_FALSE(ec);
+
+    HostState host_state;
+    host_state.cache_path = cache;
+    DraxulPluginHostApiV2 host{};
+    host.struct_size = sizeof(host);
+    host.abi_version = DRAXUL_PLUGIN_ABI_VERSION;
+    host.host_context = &host_state;
+    host.request_redraw = &request_redraw;
+    host.request_tick = &request_tick;
+    host.notify_presentation_changed = &request_noop;
+    host.log = &log_noop;
+    host.query_service = &query_path_service;
+
+    const std::string directory = plugin_root().string();
+    const std::string config = nlohmann::json{
+        { "project_path", fixture.string() },
+        { "auto_reload", false },
+        { "paused", true },
+        { "compile_debounce_ms", 25 },
+        { "diagnostics_id", "agent-workflow" },
+    }.dump();
+    DraxulPluginCreateInfoV2 create_info{};
+    create_info.struct_size = sizeof(create_info);
+    create_info.host = &host;
+    create_info.plugin_id = api->plugin_id;
+    create_info.plugin_directory_utf8 = directory.c_str();
+    create_info.config_json = config.data();
+    create_info.config_json_length = config.size();
+    create_info.initial_viewport = {
+        sizeof(DraxulPluginViewportV2), 0, 0, 640, 480, 1.0f, 96.0f
+    };
+
+    void* instance = api->create_instance(&create_info);
+    REQUIRE(instance != nullptr);
+    DraxulPluginPresentationExtensionV2 presentation{};
+    REQUIRE(api->query_extension(instance,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                &presentation, sizeof(presentation))
+        != 0);
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g1"));
+    CHECK(presentation_status(instance, presentation).find("project | ready g1")
+        != std::string::npos);
+
+    const fs::path diagnostics
+        = cache / "diagnostics" / "agent-workflow.json";
+    REQUIRE(fs::exists(diagnostics));
+    auto document = read_json(diagnostics);
+    CHECK(document["schema_version"] == 1);
+    CHECK(document["stage"] == "build");
+    CHECK(document["severity"] == "info");
+    CHECK(document["attempted_generation"] == 1);
+    CHECK(document["project_path"] == fixture.generic_string());
+
+    const auto reload_and_wait = [&](std::string_view expected) {
+        REQUIRE(presentation.dispatch_action(instance,
+                    "rezonality_reload", sizeof("rezonality_reload") - 1)
+            != 0);
+        REQUIRE(wait_for_status(*api, instance, presentation, expected));
+    };
+    const fs::path shader_path = fixture / "screen.frag";
+    const std::string shader = read_text(shader_path);
+    write_text(shader_path, shader + "\n// agent valid edit\n");
+    reload_and_wait("ready g2");
+    write_text(shader_path, shader + "\nthis is not valid GLSL\n");
+    reload_and_wait("error g3");
+    document = read_json(diagnostics);
+    CHECK(document["stage"] == "compile");
+    CHECK(document["severity"] == "error");
+    CHECK(document["attempted_generation"] == 3);
+    CHECK(document["path"].get<std::string>().find("screen.frag")
+        != std::string::npos);
+    CHECK(document["line"].get<int>() > 0);
+    CHECK_FALSE(document["message"].get<std::string>().empty());
+    write_text(shader_path, shader);
+    reload_and_wait("ready g4");
+    document = read_json(diagnostics);
+    CHECK(document["stage"] == "build");
+    CHECK(document["severity"] == "info");
+    CHECK(document["attempted_generation"] == 4);
+
+    DraxulPluginHotReloadExtensionV2 reload{};
+    REQUIRE(api->query_extension(instance,
+                DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_VERSION,
+                &reload, sizeof(reload))
+        != 0);
+    CHECK(std::string_view(reload.schema_id)
+        == "dev.draxul.rezonality.state");
+    const std::string imported = nlohmann::json{
+        { "project_path", fixture.generic_string() },
+        { "scenegraph", "default.scenegraph" },
+        { "time_seconds", 12.5 },
+        { "paused", false },
+        { "camera_position", { 2.0, 3.0, 7.0 } },
+        { "camera_focal_point", { 0.5, 0.25, 0.0 } },
+    }.dump();
+    REQUIRE(reload.import_json(instance, imported.data(), imported.size(),
+        reload.schema_id, reload.schema_version));
+    size_t required = 0;
+    REQUIRE(reload.export_json(instance, nullptr, &required));
+    std::vector<char> state(required);
+    size_t capacity = state.size();
+    REQUIRE(reload.export_json(instance, state.data(), &capacity));
+    const auto exported = nlohmann::json::parse(
+        state.data(), state.data() + capacity - 1);
+    CHECK(exported["time_seconds"].get<double>() == Catch::Approx(12.5));
+    CHECK(exported["paused"] == false);
+    CHECK(exported["camera_position"][0].get<float>()
+        == Catch::Approx(2.0f));
+
+    api->quiesce_instance(instance);
+    api->destroy_instance(instance);
+    instance = api->create_instance(&create_info);
+    REQUIRE(instance != nullptr);
+    DraxulPluginHotReloadExtensionV2 replacement_reload{};
+    REQUIRE(api->query_extension(instance,
+                DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_VERSION,
+                &replacement_reload, sizeof(replacement_reload))
+        != 0);
+    REQUIRE(replacement_reload.import_json(instance, state.data(), capacity - 1,
+        reload.schema_id, reload.schema_version));
+    required = 0;
+    REQUIRE(replacement_reload.export_json(instance, nullptr, &required));
+    std::vector<char> replacement_state(required);
+    capacity = replacement_state.size();
+    REQUIRE(replacement_reload.export_json(
+        instance, replacement_state.data(), &capacity));
+    const auto replacement = nlohmann::json::parse(
+        replacement_state.data(), replacement_state.data() + capacity - 1);
+    CHECK(replacement["time_seconds"].get<double>()
+        == Catch::Approx(12.5));
+    CHECK(replacement["paused"] == false);
+    CHECK(replacement["camera_focal_point"][1].get<float>()
+        == Catch::Approx(0.25f));
+
+    api->quiesce_instance(instance);
+    api->destroy_instance(instance);
+    fs::remove_all(root, ec);
+    CHECK_FALSE(ec);
+}
+
 TEST_CASE("The staged Rezonality module survives real PBR project edits",
     "[rezonality][integration][dynamic][pbr]")
 {
@@ -553,7 +766,7 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     const auto* api = module.api();
     REQUIRE(api != nullptr);
     REQUIRE(std::string_view(api->plugin_id) == "dev.draxul.rezonality");
-    REQUIRE(std::string_view(api->plugin_version) == "0.6.0");
+    REQUIRE(std::string_view(api->plugin_version) == "0.7.0");
 
     const auto fixture_id = std::chrono::steady_clock::now()
                                 .time_since_epoch()

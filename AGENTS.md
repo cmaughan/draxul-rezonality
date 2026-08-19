@@ -112,6 +112,22 @@ path for tests. A Draxul launch uses the staged copy under the selected build
 directory; editing a source checkout only reloads when `project_path` points to
 that checkout explicitly.
 
+For agent-driven work, prefer the checked-in layout generator over assembling
+an editor/view split piecemeal:
+
+```text
+py plugins/rezonality/tools/rezonality_layout.py --project D:/path/to/project | draxul layout apply - --json
+```
+
+Capture the returned `editor` and `view` aliases. The generated plugin config
+also contains a stable `diagnostics_id`. Read the corresponding bounded JSON
+from the Rezonality plugin cache at `diagnostics/<diagnostics_id>.json`; use
+`attempted_generation`, `active_generation`, `severity`, `path`, `line`, and
+`message` to distinguish success, rollback, and repair without scraping the
+rendered pane. Repeat `--project` to create multiple independent views. The
+`draxul-rezonality-agent-layout` isolated-server integration test protects this
+layout and terminal-control contract.
+
 The bundled Windows compiler is `tools/win/glslangValidator.exe`; the macOS
 payload is `tools/mac/glslangValidator`. Shader-stage suffixes are part of the
 project contract (`.vert`, `.frag`, and ray-stage suffixes such as `.rgen`,
