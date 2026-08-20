@@ -137,23 +137,32 @@ python3 plugins/rezonality/tools/install_neovim.py
 ```
 
 Restart Neovim after installation. Errors then appear as normal signs,
-underlines, and virtual text on every loaded source buffer. All live
-`diagnostics_id` files are considered, so errors from multiple Rezonality panes
-and projects share one editor view. Identical errors are shown once and retain
-the contributing pane IDs; unique errors from every pane remain visible. Give
-simultaneously running panes unique `diagnostics_id` values (the layout
-generator does this automatically).
+underlines, and virtual text on every loaded source buffer. In embedded Draxul
+Neovim panes, the package joins `draxul pane list --json` with diagnostic
+documents, so only currently live Rezonality panes are considered. Errors from
+multiple panes and projects share one editor view; identical errors are shown
+once while retaining their contributing named panes. Give simultaneously
+running panes unique `diagnostics_id` values (the layout generator does this
+automatically). Standalone Neovim falls back to current diagnostic documents
+when it cannot reach the live Draxul registry.
+
+Each embedded Neovim also receives the unique identity of its attached Draxul
+window. Focus and reload requests therefore route to the UI that owns the pane,
+even when several windows are attached to the same Session.
 
 The installer records its installation time so diagnostic files left by older
 Rezonality builds are not imported as live panes. Reload each already-running
 Rezonality pane once after a fresh install to publish its current state.
 
-Use `:RezonalityProblems` for the complete cross-file quickfix list,
-`:RezonalityRefresh` for an immediate rescan, and `:RezonalityStatus` for a
-count. `:RezonalityDisable` and `:RezonalityEnable` control the background
-500-ms refresh. Closed Rezonality instances remove their diagnostic record, and
-a successful rebuild clears their prior compile errors. Installation can be
-inspected or reversed with:
+Use `:RezonalityProblems` for the complete cross-file quickfix list and
+`:RezonalityInstances` for a live pane chooser. On an error line,
+`:RezonalityFocus` focuses a contributing pane and `:RezonalityReload`
+recompiles it; ambiguous errors open a pane chooser. `:RezonalityRefresh`
+rescans immediately, while `:RezonalityStatus` reports diagnostic, file, and
+registry counts. `:RezonalityDisable` and `:RezonalityEnable` control the
+background 500-ms refresh. Closed Rezonality instances remove their diagnostic
+record, and a successful rebuild clears their prior compile errors.
+Installation can be inspected or reversed with:
 
 ```powershell
 py plugins/rezonality/tools/install_neovim.py --check

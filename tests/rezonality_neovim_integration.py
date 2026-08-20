@@ -118,6 +118,11 @@ def main() -> int:
             project,
             [shared, diagnostic(second, 2, "right-only error")],
         )
+        write_batch(
+            diagnostics / "orphan-pane.json",
+            project,
+            [diagnostic(first, 1, "error from a closed pane")],
+        )
 
         result = root / "result.json"
         environment = os.environ.copy()
@@ -143,6 +148,11 @@ def main() -> int:
             "second_inline": 2,
             "quickfix": 3,
             "shared_sources": 2,
+            "instances": 2,
+            "failed_instances": 2,
+            "control_actions": ["focus:pane-left", "reload:pane-right"],
+            "registry_available": True,
+            "registry_commands": 3,
         }
         if observed != expected:
             raise RuntimeError(f"unexpected Neovim result: {observed!r}")
