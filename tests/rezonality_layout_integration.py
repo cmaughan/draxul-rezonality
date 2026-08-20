@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -29,6 +31,40 @@ def run(
             f"{completed.stderr}"
         )
     return completed.stdout
+
+
+def wait_for_process_exit(process_id: int, timeout_seconds: float) -> bool:
+    if os.name == "nt":
+        synchronize = 0x00100000
+        wait_object_0 = 0
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(synchronize, False, process_id)
+        if not handle:
+            return True
+        try:
+            timeout_ms = int(timeout_seconds * 1000)
+            return kernel32.WaitForSingleObject(handle, timeout_ms) == wait_object_0
+        finally:
+            kernel32.CloseHandle(handle)
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def main() -> int:
@@ -62,11 +98,12 @@ def main() -> int:
             )
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
-                if server_process.poll() is not None:
+                return_code = server_process.poll()
+                if return_code is not None and return_code != 0:
                     stderr = server_process.stderr.read() if server_process.stderr else ""
                     raise RuntimeError(
                         f"isolated Draxul server exited "
-                        f"({server_process.returncode}): {stderr}"
+                        f"({return_code}): {stderr}"
                     )
                 metadata = list(runtime.glob("*.control.json"))
                 if metadata:
@@ -170,15 +207,19 @@ def main() -> int:
             except Exception:
                 pass
             if server_process is not None:
-                try:
-                    server_process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    server_process.terminate()
-                    server_process.wait(timeout=10)
-                    raise RuntimeError(
-                        f"isolated Draxul server PID {server_pid} "
-                        "survived shutdown"
-                    )
+                if server_process.poll() is None:
+                    try:
+                        server_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        server_process.terminate()
+                        server_process.wait(timeout=10)
+                        raise RuntimeError(
+                            "isolated foreground Draxul server survived shutdown"
+                        )
+            if server_pid and not wait_for_process_exit(server_pid, 10.0):
+                raise RuntimeError(
+                    f"isolated Draxul server PID {server_pid} survived shutdown"
+                )
     return 0
 
 

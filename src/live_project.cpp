@@ -30,6 +30,8 @@ namespace rezonality
 namespace
 {
 
+constexpr size_t kMaximumBuildDiagnostics = 128;
+
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
 
@@ -720,49 +722,76 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
     return description;
 }
 
-void parse_compiler_diagnostic(const std::string& output,
-    const fs::path& shader, fs::path& diagnostic_path,
-    int& diagnostic_line, std::string& message)
+void parse_compiler_diagnostics(const std::string& output,
+    const fs::path& shader, std::vector<DiagnosticEntry>& diagnostics)
 {
-    diagnostic_path = shader;
-    diagnostic_line = -1;
+    const size_t initial_count = diagnostics.size();
     std::istringstream lines(output);
     std::string line;
     static const std::regex path_line(
-        R"((?:ERROR|WARNING):\s*(.*?):([0-9]+):\s*(.*))",
+        R"((ERROR|WARNING):\s*(.*?):([0-9]+):\s*(.*))",
         std::regex::icase);
     static const std::regex generic_line(
         R"((.*?):([0-9]+):\s*(.*))", std::regex::icase);
+    std::string fallback;
     while (std::getline(lines, line))
     {
-        if (line.empty())
+        if (line.empty() || diagnostics.size() >= kMaximumBuildDiagnostics)
             continue;
         std::smatch match;
-        if (std::regex_search(line, match, path_line)
-            || std::regex_search(line, match, generic_line))
+        if (std::regex_search(line, match, path_line))
         {
-            diagnostic_path = fs::u8path(trim(match[1].str()));
-            diagnostic_line = std::max(1, std::stoi(match[2].str()));
-            message = trim(match[3].str());
-            return;
+            std::string severity = trim(match[1].str());
+            std::transform(severity.begin(), severity.end(), severity.begin(),
+                [](unsigned char value) {
+                    return static_cast<char>(std::tolower(value));
+                });
+            diagnostics.push_back({
+                .path = fs::u8path(trim(match[2].str())),
+                .stage = "compile",
+                .severity = std::move(severity),
+                .line = std::max(1, std::stoi(match[3].str())),
+                .message = trim(match[4].str()),
+            });
+            continue;
         }
-        if (message.empty()
+        if (std::regex_search(line, match, generic_line))
+        {
+            diagnostics.push_back({
+                .path = fs::u8path(trim(match[1].str())),
+                .stage = "compile",
+                .severity = "error",
+                .line = std::max(1, std::stoi(match[2].str())),
+                .message = trim(match[3].str()),
+            });
+            continue;
+        }
+        if (fallback.empty()
             && (line.find("ERROR") != std::string::npos
                 || line.find("error") != std::string::npos))
         {
-            message = trim(line);
+            fallback = trim(line);
         }
     }
-    if (message.empty())
-        message = trim(output);
-    if (message.size() > 300)
-        message.resize(300);
+    if (diagnostics.size() == initial_count
+        && diagnostics.size() < kMaximumBuildDiagnostics)
+    {
+        if (fallback.empty())
+            fallback = trim(output);
+        if (fallback.size() > 300)
+            fallback.resize(300);
+        diagnostics.push_back({
+            .path = shader,
+            .stage = "compile",
+            .severity = "error",
+            .message = std::move(fallback),
+        });
+    }
 }
 
 bool compile_shader(const fs::path& compiler, const fs::path& project_path,
     const fs::path& shader, const fs::path& output_path,
-    std::vector<uint32_t>& spirv, fs::path& diagnostic_path,
-    int& diagnostic_line, std::string& error)
+    std::vector<uint32_t>& spirv, std::vector<DiagnosticEntry>& diagnostics)
 {
     std::vector<fs::path> arguments{
         compiler, "-V", "--target-env", "vulkan1.2", shader,
@@ -772,27 +801,74 @@ bool compile_shader(const fs::path& compiler, const fs::path& project_path,
     ProcessResult process = run_process(arguments);
     if (!process.error.empty())
     {
-        diagnostic_path = shader;
-        error = process.error;
+        if (diagnostics.size() < kMaximumBuildDiagnostics)
+        {
+            diagnostics.push_back({
+                .path = shader,
+                .stage = "compile",
+                .severity = "error",
+                .message = process.error,
+            });
+        }
         return false;
     }
     if (process.exit_code != 0)
     {
-        parse_compiler_diagnostic(process.output, shader,
-            diagnostic_path, diagnostic_line, error);
-        if (error.empty())
-            error = "glslangValidator rejected " + shader.filename().string();
+        parse_compiler_diagnostics(process.output, shader, diagnostics);
         return false;
     }
     spirv = read_spirv(output_path);
     if (spirv.empty())
     {
-        diagnostic_path = shader;
-        error = "glslangValidator produced no SPIR-V for "
-            + shader.filename().string();
+        if (diagnostics.size() < kMaximumBuildDiagnostics)
+        {
+            diagnostics.push_back({
+                .path = shader,
+                .stage = "compile",
+                .severity = "error",
+                .message = "glslangValidator produced no SPIR-V for "
+                    + shader.filename().string(),
+            });
+        }
         return false;
     }
     return true;
+}
+
+void finalize_compile_diagnostics(BuildResult& result)
+{
+    std::vector<DiagnosticEntry> unique;
+    unique.reserve(result.diagnostics.size());
+    for (auto& diagnostic : result.diagnostics)
+    {
+        const bool duplicate = std::any_of(unique.begin(), unique.end(),
+            [&diagnostic](const DiagnosticEntry& existing) {
+                return existing.path == diagnostic.path
+                    && existing.line == diagnostic.line
+                    && existing.column == diagnostic.column
+                    && existing.severity == diagnostic.severity
+                    && existing.message == diagnostic.message;
+            });
+        if (!duplicate)
+            unique.push_back(std::move(diagnostic));
+    }
+    result.diagnostics = std::move(unique);
+    if (result.diagnostics.empty())
+    {
+        result.error = "Shader compilation failed";
+        return;
+    }
+
+    const auto primary = std::find_if(result.diagnostics.begin(),
+        result.diagnostics.end(), [](const DiagnosticEntry& diagnostic) {
+            return diagnostic.severity == "error";
+        });
+    const auto& selected = primary != result.diagnostics.end()
+        ? *primary
+        : result.diagnostics.front();
+    result.diagnostic_path = selected.path;
+    result.diagnostic_line = selected.line;
+    result.error = selected.message;
 }
 
 fs::path compiler_path(const fs::path& plugin_directory)
@@ -1043,6 +1119,7 @@ BuildResult LiveProject::build(uint64_t generation) const
     candidate.surfaces = scene->surfaces;
     candidate.models = std::move(scene->models);
     candidate.passes = scene->passes;
+    bool shader_compile_failed = false;
     for (auto& surface : candidate.surfaces)
     {
         if (surface.path.empty())
@@ -1075,23 +1152,22 @@ BuildResult LiveProject::build(uint64_t generation) const
                 = output_directory / ("miss-" + stem + ".spv");
             const fs::path closest_output
                 = output_directory / ("closest-" + stem + ".spv");
-            if (!compile_shader(compiler, options_.project_path,
-                    pass.raygen_path, raygen_output, pass.raygen_spirv,
-                    result.diagnostic_path, result.diagnostic_line,
-                    result.error)
-                || !compile_shader(compiler, options_.project_path,
-                    pass.miss_path, miss_output, pass.miss_spirv,
-                    result.diagnostic_path, result.diagnostic_line,
-                    result.error)
-                || !compile_shader(compiler, options_.project_path,
-                    pass.closest_hit_path, closest_output,
-                    pass.closest_hit_spirv, result.diagnostic_path,
-                    result.diagnostic_line, result.error))
+            const bool raygen_ok = compile_shader(compiler,
+                options_.project_path, pass.raygen_path, raygen_output,
+                pass.raygen_spirv, result.diagnostics);
+            const bool miss_ok = compile_shader(compiler,
+                options_.project_path, pass.miss_path, miss_output,
+                pass.miss_spirv, result.diagnostics);
+            const bool closest_ok = compile_shader(compiler,
+                options_.project_path, pass.closest_hit_path, closest_output,
+                pass.closest_hit_spirv, result.diagnostics);
+            if (!raygen_ok || !miss_ok || !closest_ok)
             {
+                shader_compile_failed = true;
                 fs::remove(raygen_output, ec);
                 fs::remove(miss_output, ec);
                 fs::remove(closest_output, ec);
-                return result;
+                continue;
             }
             fs::remove(raygen_output, ec);
             fs::remove(miss_output, ec);
@@ -1110,19 +1186,26 @@ BuildResult LiveProject::build(uint64_t generation) const
             = output_directory / ("vertex-" + stem + ".spv");
         const fs::path fragment_output
             = output_directory / ("fragment-" + stem + ".spv");
-        if (!compile_shader(compiler, options_.project_path,
-                pass.vertex_path, vertex_output, pass.vertex_spirv,
-                result.diagnostic_path, result.diagnostic_line, result.error)
-            || !compile_shader(compiler, options_.project_path,
-                pass.fragment_path, fragment_output, pass.fragment_spirv,
-                result.diagnostic_path, result.diagnostic_line, result.error))
+        const bool vertex_ok = compile_shader(compiler,
+            options_.project_path, pass.vertex_path, vertex_output,
+            pass.vertex_spirv, result.diagnostics);
+        const bool fragment_ok = compile_shader(compiler,
+            options_.project_path, pass.fragment_path, fragment_output,
+            pass.fragment_spirv, result.diagnostics);
+        if (!vertex_ok || !fragment_ok)
         {
+            shader_compile_failed = true;
             fs::remove(vertex_output, ec);
             fs::remove(fragment_output, ec);
-            return result;
+            continue;
         }
         fs::remove(vertex_output, ec);
         fs::remove(fragment_output, ec);
+    }
+    if (shader_compile_failed)
+    {
+        finalize_compile_diagnostics(result);
+        return result;
     }
     result.build = std::move(candidate);
     return result;

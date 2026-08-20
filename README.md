@@ -110,10 +110,12 @@ py plugins/rezonality/tools/rezonality_layout.py --project D:/art/my-shader-proj
 ```
 
 The generator gives each view a stable `diagnostics_id`. Rezonality atomically
-publishes bounded JSON at the plugin cache path under
-`diagnostics/<diagnostics_id>.json`. The record contains the project and source
-paths, attempted and active generations, stage, severity, line/column, message,
-timestamp, and last successful render time. Agents can therefore watch a
+publishes bounded schema-v2 JSON at the plugin cache path under
+`diagnostics/<diagnostics_id>.json`. The record retains the primary diagnostic
+at the top level for simple consumers and includes a bounded `diagnostics`
+array with every compiler-reported file, stage, severity, line/column, and
+message. It also contains attempted and active generations, timestamps, and
+the last successful render time. Agents can therefore watch a
 compile fail, confirm the old active generation remains, repair the source, and
 observe the next successful generation without scraping pixels. Plugin module
 replacement also preserves the matching project's elapsed time, pause state,

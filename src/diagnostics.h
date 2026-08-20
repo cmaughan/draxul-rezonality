@@ -3,9 +3,20 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace rezonality
 {
+
+struct DiagnosticEntry
+{
+    std::filesystem::path path;
+    std::string stage;
+    std::string severity;
+    int line = -1;
+    int column = -1;
+    std::string message;
+};
 
 struct DiagnosticState
 {
@@ -20,6 +31,7 @@ struct DiagnosticState
     int line = -1;
     int column = -1;
     std::string message;
+    std::vector<DiagnosticEntry> diagnostics;
 };
 
 class DiagnosticsPublisher

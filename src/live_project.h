@@ -2,6 +2,7 @@
 
 #include "audio_analysis.h"
 #include "camera.h"
+#include "diagnostics.h"
 #include "model_loader.h"
 
 #include <atomic>
@@ -100,6 +101,7 @@ struct BuildResult
     std::filesystem::path diagnostic_path;
     int diagnostic_line = -1;
     std::string error;
+    std::vector<DiagnosticEntry> diagnostics;
 };
 
 class LiveProject

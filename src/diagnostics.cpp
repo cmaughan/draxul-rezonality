@@ -23,6 +23,7 @@ namespace
 
 constexpr size_t kMaximumMessageBytes = 16u * 1024u;
 constexpr size_t kMaximumPathBytes = 4u * 1024u;
+constexpr size_t kMaximumDiagnostics = 128;
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
 
@@ -123,8 +124,24 @@ bool DiagnosticsPublisher::publish(
 {
     if (path_.empty())
         return true;
+    nlohmann::json entries = nlohmann::json::array();
+    const size_t entry_count = std::min(
+        state.diagnostics.size(), kMaximumDiagnostics);
+    for (size_t index = 0; index < entry_count; ++index)
+    {
+        const auto& entry = state.diagnostics[index];
+        entries.push_back({
+            { "stage", bounded(entry.stage, 32) },
+            { "severity", bounded(entry.severity, 16) },
+            { "path", path_string(entry.path) },
+            { "line", entry.line },
+            { "column", entry.column },
+            { "message", bounded(entry.message, kMaximumMessageBytes) },
+        });
+    }
+
     const nlohmann::json document{
-        { "schema_version", 1 },
+        { "schema_version", 2 },
         { "plugin_id", "dev.draxul.rezonality" },
         { "project_path", path_string(state.project_path) },
         { "scenegraph_path", path_string(state.scenegraph_path) },
@@ -138,6 +155,9 @@ bool DiagnosticsPublisher::publish(
         { "line", state.line },
         { "column", state.column },
         { "message", bounded(state.message, kMaximumMessageBytes) },
+        { "diagnostic_count", state.diagnostics.size() },
+        { "diagnostics_truncated", state.diagnostics.size() > entry_count },
+        { "diagnostics", std::move(entries) },
     };
 
     std::error_code directory_error;

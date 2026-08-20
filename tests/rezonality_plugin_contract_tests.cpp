@@ -664,11 +664,13 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
         = cache / "diagnostics" / "agent-workflow.json";
     REQUIRE(fs::exists(diagnostics));
     auto document = read_json(diagnostics);
-    CHECK(document["schema_version"] == 1);
+    CHECK(document["schema_version"] == 2);
     CHECK(document["stage"] == "build");
     CHECK(document["severity"] == "info");
     CHECK(document["attempted_generation"] == 1);
     CHECK(document["project_path"] == canonical_fixture.generic_string());
+    REQUIRE(document["diagnostics"].is_array());
+    REQUIRE(document["diagnostics"].size() == 1);
 
     const auto reload_and_wait = [&](std::string_view expected) {
         REQUIRE(presentation.dispatch_action(instance,
@@ -678,10 +680,16 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
     };
     const fs::path shader_path = fixture / "screen.frag";
     const std::string shader = read_text(shader_path);
+    const fs::path second_shader_path = fixture / "copy.vert";
+    const std::string second_shader = read_text(second_shader_path);
     write_text(shader_path, shader + "\n// agent valid edit\n");
     reload_and_wait("ready g2");
     write_text(shader_path, shader + "\nthis is not valid GLSL\n");
+    write_text(second_shader_path,
+        second_shader + "\nthis is also not valid GLSL\n");
     reload_and_wait("BUILD FAILED g3");
+    CHECK(presentation_status(instance, presentation).find(" more")
+        != std::string::npos);
     document = read_json(diagnostics);
     CHECK(document["stage"] == "compile");
     CHECK(document["severity"] == "error");
@@ -690,7 +698,27 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
         != std::string::npos);
     CHECK(document["line"].get<int>() > 0);
     CHECK_FALSE(document["message"].get<std::string>().empty());
+    REQUIRE(document["diagnostics"].is_array());
+    REQUIRE(document["diagnostics"].size() >= 2);
+    CHECK(document["diagnostic_count"].get<size_t>()
+        == document["diagnostics"].size());
+    CHECK_FALSE(document["diagnostics_truncated"].get<bool>());
+    bool found_screen = false;
+    bool found_copy = false;
+    for (const auto& diagnostic : document["diagnostics"])
+    {
+        const std::string path = diagnostic["path"].get<std::string>();
+        found_screen = found_screen
+            || path.find("screen.frag") != std::string::npos;
+        found_copy = found_copy
+            || path.find("copy.vert") != std::string::npos;
+        CHECK(diagnostic["stage"] == "compile");
+        CHECK_FALSE(diagnostic["message"].get<std::string>().empty());
+    }
+    CHECK(found_screen);
+    CHECK(found_copy);
     write_text(shader_path, shader);
+    write_text(second_shader_path, second_shader);
     reload_and_wait("ready g4");
     document = read_json(diagnostics);
     CHECK(document["stage"] == "build");

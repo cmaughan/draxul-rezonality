@@ -46,6 +46,7 @@ using rezonality::AudioAnalyzer;
 using rezonality::AudioOptions;
 using rezonality::AudioTextureFrame;
 using rezonality::BuildResult;
+using rezonality::DiagnosticEntry;
 using rezonality::DiagnosticState;
 using rezonality::DiagnosticsPublisher;
 using rezonality::LiveProject;
@@ -2840,7 +2841,8 @@ std::string diagnostic_stage(const BuildResult& result)
 void publish_diagnostics(RezonalityInstance* instance,
     std::string stage, std::string severity,
     const std::filesystem::path& path, int line,
-    std::string message)
+    std::string message,
+    const std::vector<DiagnosticEntry>* diagnostics = nullptr)
 {
     if (!instance || !instance->diagnostics.available())
         return;
@@ -2856,6 +2858,21 @@ void publish_diagnostics(RezonalityInstance* instance,
     state.severity = std::move(severity);
     state.line = line;
     state.message = std::move(message);
+    if (diagnostics && !diagnostics->empty())
+    {
+        state.diagnostics = *diagnostics;
+    }
+    else
+    {
+        state.diagnostics.push_back({
+            .path = state.path,
+            .stage = state.stage,
+            .severity = state.severity,
+            .line = state.line,
+            .column = state.column,
+            .message = state.message,
+        });
+    }
     std::string error;
     if (!instance->diagnostics.publish(state, error))
         log(instance, DRAXUL_PLUGIN_LOG_WARNING, error);
@@ -2917,8 +2934,12 @@ std::string format_failure(uint64_t attempted_generation,
 std::string format_error(const BuildResult& result,
     uint64_t active_generation)
 {
-    return format_failure(result.generation, active_generation,
+    std::string status = format_failure(result.generation, active_generation,
         result.diagnostic_path, result.diagnostic_line, result.error);
+    if (result.diagnostics.size() > 1)
+        status += " | +" + std::to_string(result.diagnostics.size() - 1)
+            + " more";
+    return status;
 }
 
 void* create_instance(const DraxulPluginCreateInfoV2* info)
@@ -3080,7 +3101,8 @@ DraxulPluginTickResultV2 tick(void* opaque,
             log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
             publish_diagnostics(instance, diagnostic_stage(*result),
                 "error", result->diagnostic_path,
-                result->diagnostic_line, result->error);
+                result->diagnostic_line, result->error,
+                &result->diagnostics);
         }
         notify_presentation(instance);
     }
