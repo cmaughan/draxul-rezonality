@@ -2894,21 +2894,31 @@ double advance_animation(RezonalityInstance* instance,
     return instance->animation_elapsed_seconds;
 }
 
+std::string format_failure(uint64_t attempted_generation,
+    uint64_t active_generation, const std::filesystem::path& diagnostic_path,
+    int diagnostic_line, std::string_view error)
+{
+    std::string status = "BUILD FAILED g"
+        + std::to_string(attempted_generation);
+    if (active_generation != 0)
+        status += " | rendering last good g"
+            + std::to_string(active_generation);
+    if (!diagnostic_path.empty())
+    {
+        status += " | " + diagnostic_path.filename().string();
+        if (diagnostic_line > 0)
+            status += ":" + std::to_string(diagnostic_line);
+    }
+    if (!error.empty())
+        status += " | " + std::string(error);
+    return status;
+}
+
 std::string format_error(const BuildResult& result,
     uint64_t active_generation)
 {
-    std::string status = "error g" + std::to_string(result.generation);
-    if (!result.diagnostic_path.empty())
-    {
-        status += ": " + result.diagnostic_path.filename().string();
-        if (result.diagnostic_line > 0)
-            status += ":" + std::to_string(result.diagnostic_line);
-    }
-    if (!result.error.empty())
-        status += " " + result.error;
-    if (active_generation != 0)
-        status += " | live g" + std::to_string(active_generation);
-    return status;
+    return format_failure(result.generation, active_generation,
+        result.diagnostic_path, result.diagnostic_line, result.error);
 }
 
 void* create_instance(const DraxulPluginCreateInfoV2* info)
@@ -3145,11 +3155,8 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         else
         {
             instance->pending_build.reset();
-            instance->status = "error g"
-                + std::to_string(desired_generation) + ": " + error;
-            if (instance->active_generation)
-                instance->status += " | live g"
-                    + std::to_string(instance->active_generation);
+            instance->status = format_failure(desired_generation,
+                instance->active_generation, {}, -1, error);
             log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
             publish_diagnostics(instance, "prepare", "error", {}, -1,
                 error);
@@ -3446,11 +3453,8 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
         else
         {
             instance->pending_build.reset();
-            instance->status = "error g"
-                + std::to_string(desired_generation) + ": " + error;
-            if (instance->active_generation)
-                instance->status += " | live g"
-                    + std::to_string(instance->active_generation);
+            instance->status = format_failure(desired_generation,
+                instance->active_generation, {}, -1, error);
             log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
             publish_diagnostics(instance, "prepare", "error", {}, -1,
                 error);

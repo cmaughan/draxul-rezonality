@@ -66,6 +66,14 @@ ordered sampling, Assimp model loading, textured PBR materials, HDR
 environments, acceleration structures, and native ray dispatch. The
 `robot2` variant preserves the neon procedural environment and reflective
 lighting experiment while `pbr_robot` remains the original reference scene.
+The `examples/nyx_flight_deck` package combines multiple Rezonality projects,
+a glTF/PBR scene, and two PowerShell telemetry panes into a reproducible 5-by-2
+dashboard. Launch it from the parent Draxul checkout with:
+
+```powershell
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File plugins/rezonality/examples/nyx_flight_deck/launch.ps1
+```
+
 The
 protoplanetary demo now runs its preserved VkLive raymarch, sphere overlay, and
 composite shaders directly. Its active live-edit sources are
@@ -77,8 +85,11 @@ shaders receive frame-safe camera/model/view/projection uniforms at
 approximately 60 Hz while visible. Space pauses/resumes animation, left-drag
 orbits the active camera, and the mouse wheel dollies. Use the pane action
 **Reload Rezonality Project** to bypass the debounce and force a rebuild. The
-status progresses through `building`, `ready`, and `live`; errors include the
-attempted generation and source location.
+status progresses through `building`, `ready`, and `live`. A failed candidate
+is surfaced in the pane-local status pill as `BUILD FAILED gN`; when a prior
+generation remains active it explicitly says `rendering last good gM`, followed
+by the source location and compiler message. The indicator persists while that
+failed candidate is current and clears after the next successful reload.
 
 Typical live-edit check:
 

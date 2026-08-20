@@ -408,9 +408,10 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
         "#version 450\n"
         "layout(location=0) out vec4 fragColor;\n"
         "void main() { fragColor = vec4(; }\n");
-    REQUIRE(wait_for_status(*api, instance, presentation, "error g3"));
-    CHECK(presentation_status(instance, presentation).find("screen.frag")
-        != std::string::npos);
+    REQUIRE(wait_for_status(*api, instance, presentation,
+        "BUILD FAILED g3"));
+    const std::string failed_status = presentation_status(instance, presentation);
+    CHECK(failed_status.find("screen.frag") != std::string::npos);
 
     write_text(fixture / "screen.frag",
         "#version 450\n"
@@ -680,7 +681,7 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
     write_text(shader_path, shader + "\n// agent valid edit\n");
     reload_and_wait("ready g2");
     write_text(shader_path, shader + "\nthis is not valid GLSL\n");
-    reload_and_wait("error g3");
+    reload_and_wait("BUILD FAILED g3");
     document = read_json(diagnostics);
     CHECK(document["stage"] == "compile");
     CHECK(document["severity"] == "error");
@@ -835,7 +836,7 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     write_text(shader_path, shader + "\n// valid live shader edit\n");
     reload_and_wait("ready g2");
     write_text(shader_path, shader + "\nthis is not valid GLSL\n");
-    reload_and_wait("error g3");
+    reload_and_wait("BUILD FAILED g3");
     CHECK(presentation_status(instance, presentation).find("pbr.frag")
         != std::string::npos);
     write_text(shader_path, shader);
@@ -849,7 +850,7 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     broken_scene.replace(model_reference, sizeof("model: robot") - 1,
         "model: missing_robot");
     write_text(scene_path, broken_scene);
-    reload_and_wait("error g5");
+    reload_and_wait("BUILD FAILED g5");
     CHECK(presentation_status(instance, presentation).find("missing_robot")
         != std::string::npos);
     write_text(scene_path, scene + "\n// valid live scene edit\n");
@@ -860,7 +861,7 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     const fs::path hidden_texture = texture.string() + ".missing";
     fs::rename(texture, hidden_texture, ec);
     REQUIRE_FALSE(ec);
-    reload_and_wait("error g7");
+    reload_and_wait("BUILD FAILED g7");
     CHECK(presentation_status(instance, presentation).find("RobotChest_baseColor.jpeg")
         != std::string::npos);
     fs::rename(hidden_texture, texture, ec);
@@ -945,7 +946,7 @@ TEST_CASE("The staged Rezonality module rejects and repairs ray candidates",
     write_text(raygen_path, raygen + "\n// valid ray shader edit\n");
     reload_and_wait("ready g2");
     write_text(raygen_path, raygen + "\nthis is not valid GLSL\n");
-    reload_and_wait("error g3");
+    reload_and_wait("BUILD FAILED g3");
     CHECK(presentation_status(instance, presentation).find("rt_gen.rgen")
         != std::string::npos);
     write_text(raygen_path, raygen);
@@ -955,7 +956,7 @@ TEST_CASE("The staged Rezonality module rejects and repairs ray candidates",
     const fs::path hidden_model = model.string() + ".missing";
     fs::rename(model, hidden_model, ec);
     REQUIRE_FALSE(ec);
-    reload_and_wait("error g5");
+    reload_and_wait("BUILD FAILED g5");
     CHECK(presentation_status(instance, presentation).find("cornell-box.obj")
         != std::string::npos);
     fs::rename(hidden_model, model, ec);
