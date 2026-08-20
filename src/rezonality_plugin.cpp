@@ -184,10 +184,6 @@ struct MetalGeneration
 struct RetiredGeneration
 {
     MetalGeneration generation;
-    generation.ray_project = std::any_of(build.passes.begin(),
-        build.passes.end(), [](const auto& pass) {
-            return pass.ray_trace;
-        });
     uint64_t pending_slots = 0;
 };
 
@@ -477,6 +473,10 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         = MTLVertexStepFunctionPerVertex;
 
     MetalGeneration generation;
+    generation.ray_project = std::any_of(build.passes.begin(),
+        build.passes.end(), [](const auto& pass) {
+            return pass.ray_trace;
+        });
     generation.width = static_cast<uint32_t>(std::max(1, frame.viewport.width));
     generation.height = static_cast<uint32_t>(std::max(1, frame.viewport.height));
     generation.buffered_frame_count

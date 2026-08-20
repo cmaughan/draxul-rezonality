@@ -13,6 +13,11 @@ draxul_add_test_target(
     "${_rezonality_root}/src/model_loader.cpp"
     "${_rezonality_root}/src/rezonality_plugin.cpp")
 if(APPLE)
+    # The shared plugin entry point contains Metal and Foundation syntax, so
+    # compile it with the same Objective-C++ language used by the product.
+    set_source_files_properties(
+        "${_rezonality_root}/src/rezonality_plugin.cpp"
+        PROPERTIES LANGUAGE OBJCXX)
     target_sources(draxul-test-rezonality PRIVATE
         "${_rezonality_root}/src/mic_permission.mm")
 else()
@@ -49,7 +54,9 @@ target_include_directories(draxul-test-rezonality PRIVATE
     "${_rezonality_root}/src"
     ${stb_SOURCE_DIR})
 if(APPLE)
-    target_link_libraries(draxul-test-rezonality PRIVATE SDL3::Headers)
+    # Unlike the product module, this test is an executable and therefore owns
+    # the SDL implementation that its audio-analysis cases call.
+    target_link_libraries(draxul-test-rezonality PRIVATE SDL3::SDL3)
     set_source_files_properties("${_rezonality_root}/src/mic_permission.mm"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(draxul-test-rezonality PRIVATE

@@ -4,11 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
-import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -32,44 +31,6 @@ def run(
     return completed.stdout
 
 
-def wait_for_process_exit(process_id: int, timeout_seconds: float) -> bool:
-    if os.name == "nt":
-        synchronize = 0x00100000
-        wait_object_0 = 0
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [
-            ctypes.c_ulong,
-            ctypes.c_int,
-            ctypes.c_ulong,
-        ]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-        kernel32.WaitForSingleObject.restype = ctypes.c_ulong
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
-        handle = kernel32.OpenProcess(synchronize, False, process_id)
-        if not handle:
-            return True
-        try:
-            return (
-                kernel32.WaitForSingleObject(
-                    handle, int(timeout_seconds * 1000)
-                )
-                == wait_object_0
-            )
-        finally:
-            kernel32.CloseHandle(handle)
-
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.kill(process_id, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.05)
-    return False
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--draxul", required=True)
@@ -81,15 +42,32 @@ def main() -> int:
     executable = str(pathlib.Path(args.draxul).resolve())
     generator = str(pathlib.Path(args.generator).resolve())
     project = pathlib.Path(args.project).resolve()
-    with tempfile.TemporaryDirectory(prefix="draxul-rezonality-layout-") as temp:
+    # Darwin's Unix-domain socket path limit is only 103 bytes. Keep the
+    # isolated runtime below /tmp instead of the much longer per-user temp root.
+    temp_root = "/tmp" if sys.platform == "darwin" else None
+    with tempfile.TemporaryDirectory(
+        prefix="draxul-rezonality-layout-", dir=temp_root
+    ) as temp:
         runtime = pathlib.Path(temp) / "runtime"
         runtime.mkdir()
         route = ["--server-runtime-dir", str(runtime)]
         server_pid = 0
+        server_process: subprocess.Popen[str] | None = None
         try:
-            run([executable, "--server", *route])
+            server_process = subprocess.Popen(
+                [executable, "--server", *route],
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
+                if server_process.poll() is not None:
+                    stderr = server_process.stderr.read() if server_process.stderr else ""
+                    raise RuntimeError(
+                        f"isolated Draxul server exited "
+                        f"({server_process.returncode}): {stderr}"
+                    )
                 metadata = list(runtime.glob("*.control.json"))
                 if metadata:
                     try:
@@ -191,10 +169,16 @@ def main() -> int:
                 run([executable, "--shutdown-server", "--yes", *route], timeout=15)
             except Exception:
                 pass
-            if server_pid and not wait_for_process_exit(server_pid, 10.0):
-                raise RuntimeError(
-                    f"isolated Draxul server PID {server_pid} survived shutdown"
-                )
+            if server_process is not None:
+                try:
+                    server_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server_process.terminate()
+                    server_process.wait(timeout=10)
+                    raise RuntimeError(
+                        f"isolated Draxul server PID {server_pid} "
+                        "survived shutdown"
+                    )
     return 0
 
 

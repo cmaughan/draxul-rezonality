@@ -29,7 +29,15 @@ if(NOT TARGET assimp::assimp)
     set(ASSIMP_BUILD_NO_EXPORT ON CACHE BOOL "" FORCE)
     set(ASSIMP_BUILD_GLTF_IMPORTER ON CACHE BOOL "" FORCE)
     set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
-    set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
+    set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+    # Assimp's bundled zlib treats modern macOS as classic Mac OS and replaces
+    # fdopen with a macro that collides with the SDK declaration. Use the SDK's
+    # zlib on Apple platforms; keep the bundled dependency elsewhere.
+    if(APPLE)
+        set(ASSIMP_BUILD_ZLIB OFF CACHE BOOL "" FORCE)
+    else()
+        set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
+    endif()
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
         rezonality_assimp
@@ -111,6 +119,10 @@ if(APPLE)
         "-framework Metal"
         "-framework Foundation"
         ${REZONALITY_AVFOUNDATION_FRAMEWORK})
+    # The host already embeds SDL3. Resolve the module's SDL audio calls from
+    # that copy instead of linking a second static SDL into the dylib.
+    target_link_options(draxul-rezonality-plugin PRIVATE
+        "LINKER:-undefined,dynamic_lookup")
 else()
     target_link_libraries(draxul-rezonality-plugin PRIVATE
         Vulkan::Vulkan
@@ -153,5 +165,3 @@ draxul_register_bundled_plugin(
     PRODUCT_TARGETS draxul-rezonality-plugin
     TEST_SOURCES ${_rezonality_test_sources}
     TEST_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Tests.cmake")
-
-

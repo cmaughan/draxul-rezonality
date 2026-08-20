@@ -608,6 +608,8 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
     const fs::path cache = root / "cache";
     std::error_code ec;
     REQUIRE(fs::create_directories(fixture));
+    const fs::path canonical_fixture = fs::weakly_canonical(fixture, ec);
+    REQUIRE_FALSE(ec);
     fs::copy(plugin_root() / "examples" / "simple", fixture,
         fs::copy_options::recursive | fs::copy_options::overwrite_existing,
         ec);
@@ -665,7 +667,7 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
     CHECK(document["stage"] == "build");
     CHECK(document["severity"] == "info");
     CHECK(document["attempted_generation"] == 1);
-    CHECK(document["project_path"] == fixture.generic_string());
+    CHECK(document["project_path"] == canonical_fixture.generic_string());
 
     const auto reload_and_wait = [&](std::string_view expected) {
         REQUIRE(presentation.dispatch_action(instance,
@@ -704,7 +706,7 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
     CHECK(std::string_view(reload.schema_id)
         == "dev.draxul.rezonality.state");
     const std::string imported = nlohmann::json{
-        { "project_path", fixture.generic_string() },
+        { "project_path", canonical_fixture.generic_string() },
         { "scenegraph", "default.scenegraph" },
         { "time_seconds", 12.5 },
         { "paused", false },
