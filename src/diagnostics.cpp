@@ -191,4 +191,16 @@ bool DiagnosticsPublisher::publish(
     return false;
 }
 
+bool DiagnosticsPublisher::remove(std::string& error) const
+{
+    if (path_.empty())
+        return true;
+    std::error_code remove_error;
+    std::filesystem::remove(path_, remove_error);
+    if (!remove_error)
+        return true;
+    error = "could not remove diagnostics: " + remove_error.message();
+    return false;
+}
+
 } // namespace rezonality

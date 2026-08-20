@@ -49,6 +49,18 @@ set_tests_properties(draxul-rezonality-agent-layout PROPERTIES
     LABELS "rezonality;integration"
     RUN_SERIAL TRUE
     TIMEOUT 60)
+find_program(REZONALITY_NVIM_EXECUTABLE nvim)
+if(REZONALITY_NVIM_EXECUTABLE)
+    add_test(NAME draxul-rezonality-neovim
+        COMMAND ${Python3_EXECUTABLE}
+            "${_rezonality_root}/tests/rezonality_neovim_integration.py"
+            --nvim "${REZONALITY_NVIM_EXECUTABLE}"
+            --installer "${_rezonality_root}/tools/install_neovim.py"
+            --script "${_rezonality_root}/tests/rezonality_neovim_test.lua")
+    set_tests_properties(draxul-rezonality-neovim PROPERTIES
+        LABELS "rezonality;integration;nvim"
+        TIMEOUT 30)
+endif()
 add_dependencies(draxul-test-rezonality draxul)
 target_include_directories(draxul-test-rezonality PRIVATE
     "${_rezonality_root}/src"

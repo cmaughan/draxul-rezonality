@@ -3001,6 +3001,9 @@ void destroy_instance(void* opaque)
         return;
     if (instance->project)
         instance->project->stop();
+    std::string diagnostics_error;
+    if (!instance->diagnostics.remove(diagnostics_error))
+        log(instance, DRAXUL_PLUGIN_LOG_WARNING, diagnostics_error);
 #if !defined(__APPLE__)
     destroy_backend(instance->backend);
 #endif

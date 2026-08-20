@@ -1,0 +1,26 @@
+*rezonality.nvim*  Rezonality compiler diagnostics for Neovim
+
+Install with Rezonality's tools/install_neovim.py script. The package uses
+Neovim's native pack/*/start loading and does not edit init.lua.
+
+Commands:
+  :RezonalityRefresh       Read every current Rezonality diagnostic document.
+  :RezonalityProblems      Populate and open the quickfix list.
+  :RezonalityProblems!     Populate quickfix without opening it.
+  :RezonalityStatus        Report the current diagnostic and file counts.
+  :RezonalityEnable        Enable polling and diagnostics.
+  :RezonalityDisable       Stop polling and clear diagnostics.
+
+The default refresh interval is 500 ms. Configure explicitly if desired:
+>
+  require("rezonality").setup({
+    refresh_ms = 500,
+    virtual_text = true,
+    signs = true,
+    underline = true,
+  })
+<
+Set g:rezonality_auto_setup = 0 before packages load when calling setup()
+yourself. REZONALITY_DIAGNOSTICS_DIR overrides cache discovery for testing.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

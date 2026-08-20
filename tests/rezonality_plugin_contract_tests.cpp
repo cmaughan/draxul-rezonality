@@ -758,6 +758,7 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
 
     api->quiesce_instance(instance);
     api->destroy_instance(instance);
+    CHECK_FALSE(fs::exists(diagnostics));
     instance = api->create_instance(&create_info);
     REQUIRE(instance != nullptr);
     DraxulPluginHotReloadExtensionV2 replacement_reload{};

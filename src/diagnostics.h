@@ -45,6 +45,7 @@ public:
     [[nodiscard]] bool available() const;
     [[nodiscard]] const std::filesystem::path& path() const;
     bool publish(const DiagnosticState& state, std::string& error) const;
+    bool remove(std::string& error) const;
 
 private:
     std::filesystem::path path_;
