@@ -1,0 +1,24 @@
+surface: Signal {
+    scale: (0.24, 0.24, 1.0)
+    format: default_color
+}
+
+pass: Instrument9 {
+    targets: (Signal)
+    clear: (0.001, 0.004, 0.012, 1.0)
+    geometry: signal {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: panel-9.frag
+    }
+}
+
+pass: CRT9 {
+    samplers: (Signal)
+    targets: (default_color)
+    geometry: display {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: crt.frag
+    }
+}
