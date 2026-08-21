@@ -1,5 +1,5 @@
-# Full-resolution default. Select crt.scenegraph to restore the downsampled
-# signal and CRT presentation pass.
+# Optional low-resolution CRT presentation. Launch this project with
+# scenegraph = "crt.scenegraph" to enable it.
 camera: default_camera {
     position: (0.0, 1.55, 6.0)
     look_at: (0.0, 1.55, 0.0)
@@ -13,12 +13,12 @@ environment: studio_sky {
 }
 
 surface: Depth {
-    scale: (1.0, 1.0, 1.0)
+    scale: (0.24, 0.24, 1.0)
     format: default_depth
 }
 
-surface: Color {
-    scale: (1.0, 1.0, 1.0)
+surface: Signal {
+    scale: (0.24, 0.24, 1.0)
     format: default_color
 }
 
@@ -29,7 +29,7 @@ model: robot {
 }
 
 pass: Sky {
-    targets: (Color, Depth)
+    targets: (Signal, Depth)
     clear: (0.0, 0.0, 0.0, 1.0)
     samplers: (studio_sky)
     camera: default_camera
@@ -41,7 +41,7 @@ pass: Sky {
 }
 
 pass: Robot {
-    targets: (Color, Depth)
+    targets: (Signal, Depth)
     samplers: (studio_sky)
     camera: default_camera
     geometry: robot_mesh {
@@ -51,12 +51,12 @@ pass: Robot {
     }
 }
 
-pass: Present {
-    samplers: (Color)
+pass: CRT {
+    samplers: (Signal)
     targets: (default_color)
     geometry: display {
         path: screen_rect
         vs: copy.vert
-        fs: copy.frag
+        fs: crt.frag
     }
 }

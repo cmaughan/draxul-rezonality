@@ -3,7 +3,8 @@ param(
     [string]$SpaceId = '',
     [string]$Session = '',
     [string]$ServerRuntimeDir = '',
-    [string]$TabName = 'NYX // FLIGHT DECK'
+    [string]$TabName = 'NYX // FLIGHT DECK',
+    [switch]$Crt
 )
 
 $ErrorActionPreference = 'Stop'
@@ -99,6 +100,15 @@ function New-RezonalityConfig {
         [Parameter(Mandatory = $true)][string]$Scenegraph,
         [Parameter(Mandatory = $true)][int]$Index
     )
+
+    if ($script:Crt) {
+        if ($Scenegraph -eq 'default.scenegraph') {
+            $Scenegraph = 'crt.scenegraph'
+        }
+        else {
+            $Scenegraph = $Scenegraph -replace '\.scenegraph$', '-crt.scenegraph'
+        }
+    }
 
     return ([ordered]@{
         auto_reload = $true

@@ -1,2 +1,3 @@
 [settings]
+# Use "crt.scenegraph" here to restore the optional downsample/TV effect.
 scenegraph = "default.scenegraph"

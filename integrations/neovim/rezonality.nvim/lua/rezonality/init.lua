@@ -46,6 +46,7 @@ local function normalize(path)
   end
   local result = vim.fs and vim.fs.normalize
       and vim.fs.normalize(path) or vim.fn.fnamemodify(path, ":p")
+  result = (vim.uv or vim.loop).fs_realpath(result) or result
   result = result:gsub("\\", "/"):gsub("/$", "")
   return is_windows() and result:lower() or result
 end
@@ -58,12 +59,14 @@ local function default_diagnostics_dir()
   local base
   if is_windows() then
     base = vim.env.LOCALAPPDATA or vim.env.APPDATA
+    return join(base or "", "draxul", "cache", "plugins",
+      "dev.draxul.rezonality", "diagnostics")
   elseif (vim.uv or vim.loop).os_uname().sysname == "Darwin" then
     base = join(vim.env.HOME or "", "Library", "Caches")
   else
     base = vim.env.XDG_CACHE_HOME or join(vim.env.HOME or "", ".cache")
   end
-  return join(base or "", "draxul", "cache", "plugins",
+  return join(base or "", "draxul", "plugins",
     "dev.draxul.rezonality", "diagnostics")
 end
 

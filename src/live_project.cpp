@@ -798,6 +798,9 @@ bool compile_shader(const fs::path& compiler, const fs::path& project_path,
         "-o", output_path, "-l", "-g",
         fs::path("-I" + project_path.string())
     };
+#if defined(__APPLE__)
+    arguments.emplace_back("-DREZONALITY_METAL_SEPARATE_MODEL_SAMPLER=1");
+#endif
     ProcessResult process = run_process(arguments);
     if (!process.error.empty())
     {

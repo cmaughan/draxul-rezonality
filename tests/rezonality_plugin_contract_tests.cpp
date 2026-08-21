@@ -196,6 +196,49 @@ private:
 
 } // namespace
 
+TEST_CASE("Rezonality Metal model passes test and write depth",
+    "[rezonality][metal][depth]")
+{
+    const std::string source
+        = read_text(plugin_root() / "src" / "rezonality_plugin.cpp");
+    CHECK(source.find("depthCompareFunction = MTLCompareFunctionLessEqual")
+        != std::string::npos);
+    CHECK(source.find("depthWriteEnabled = YES") != std::string::npos);
+    CHECK(source.find("scene_pass.model_index && scene_pass.has_depth")
+        != std::string::npos);
+    CHECK(source.find("[encoder setDepthStencilState:")
+        != std::string::npos);
+}
+
+TEST_CASE("NYX panels default to full resolution and retain CRT variants",
+    "[rezonality][nyx][scenegraph]")
+{
+    const auto shaders
+        = plugin_root() / "examples" / "nyx_flight_deck" / "shaders";
+    for (int panel = 0; panel < 10; ++panel)
+    {
+        const std::string prefix = "panel-" + std::to_string(panel);
+        const std::string clean
+            = read_text(shaders / (prefix + ".scenegraph"));
+        const std::string crt
+            = read_text(shaders / (prefix + "-crt.scenegraph"));
+        CAPTURE(panel);
+        CHECK(clean.find("targets: (default_color)") != std::string::npos);
+        CHECK(clean.find("crt.frag") == std::string::npos);
+        CHECK(clean.find("scale: (0.24, 0.24, 1.0)")
+            == std::string::npos);
+        CHECK(crt.find("targets: (Signal)") != std::string::npos);
+        CHECK(crt.find("scale: (0.24, 0.24, 1.0)")
+            != std::string::npos);
+        CHECK(crt.find("fs: crt.frag") != std::string::npos);
+    }
+
+    const std::string launcher = read_text(
+        plugin_root() / "examples" / "nyx_flight_deck" / "launch.ps1");
+    CHECK(launcher.find("[switch]$Crt") != std::string::npos);
+    CHECK(launcher.find("'-crt.scenegraph'") != std::string::npos);
+}
+
 TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     "[rezonality][plugin]")
 {
@@ -434,14 +477,32 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
 TEST_CASE("Rezonality compiles every staged example",
     "[rezonality][integration][inventory]")
 {
+    struct Example
+    {
+        std::string_view path;
+        std::string_view scenegraph;
+    };
     const auto* api = draxul_plugin_query_v2(DRAXUL_PLUGIN_ABI_VERSION);
     REQUIRE(api != nullptr);
     const std::string directory = plugin_root().string();
-    for (const std::string_view example : { "simple", "default", "blend_waves",
-             "deferred_shading", "protoplanetary_disc", "pbr_robot",
-             "robot2", "ray_tracer", "audio_spectrum_analysis" })
+    for (const Example example : {
+             Example{ "simple", {} },
+             Example{ "default", {} },
+             Example{ "blend_waves", {} },
+             Example{ "deferred_shading", {} },
+             Example{ "protoplanetary_disc", {} },
+             Example{ "pbr_robot", {} },
+             Example{ "robot2", {} },
+             Example{ "ray_tracer", {} },
+             Example{ "audio_spectrum_analysis", {} },
+             Example{ "nyx_flight_deck/robot-crt", "default.scenegraph" },
+             Example{ "nyx_flight_deck/robot-crt", "crt.scenegraph" },
+         })
     {
-        DYNAMIC_SECTION(example)
+        DYNAMIC_SECTION(example.path << " / "
+                                     << (example.scenegraph.empty()
+                                                ? "project default"
+                                                : example.scenegraph))
         {
             HostState host_state;
             DraxulPluginHostApiV2 host{};
@@ -453,13 +514,15 @@ TEST_CASE("Rezonality compiles every staged example",
             host.notify_presentation_changed = &request_noop;
             host.log = &log_noop;
             host.query_service = &query_service_noop;
-            const std::string config = nlohmann::json{
+            nlohmann::json config_json{
                 { "project_path",
-                    (plugin_root() / "examples" / example).string() },
+                    (plugin_root() / "examples" / example.path).string() },
                 { "auto_reload", false },
                 { "compile_debounce_ms", 25 },
-            }
-                                           .dump();
+            };
+            if (!example.scenegraph.empty())
+                config_json["scenegraph"] = example.scenegraph;
+            const std::string config = config_json.dump();
             DraxulPluginCreateInfoV2 create_info{};
             create_info.struct_size = sizeof(create_info);
             create_info.host = &host;

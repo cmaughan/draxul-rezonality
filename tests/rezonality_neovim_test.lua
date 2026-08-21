@@ -5,7 +5,6 @@ local rezonality = require("rezonality")
 local control_actions = {}
 rezonality.setup({
   auto_refresh = false,
-  diagnostics_dir = vim.env.REZONALITY_DIAGNOSTICS_DIR,
   registry_provider = function()
     local project = vim.fn.fnamemodify(vim.env.REZONALITY_TEST_FIRST, ":h")
     return {
