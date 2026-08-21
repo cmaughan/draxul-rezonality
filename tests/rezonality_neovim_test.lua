@@ -73,6 +73,7 @@ rezonality.focus_instance(instances[1])
 rezonality.reload_instance(instances[2])
 local selected_file = ""
 local selected_file_has_both_instances = false
+local apply_picker_opened = false
 vim.ui.select = function(items, options, callback)
   if options.prompt == "Rezonality active shader files" then
     local selected = items[1]
@@ -87,6 +88,7 @@ vim.ui.select = function(items, options, callback)
         ~= nil and formatted:find("Right camera", 1, true) ~= nil
     callback(selected)
   elseif options.prompt == "Apply shader to Rezonality pane" then
+    apply_picker_opened = true
     callback(items[1])
   end
 end
@@ -135,6 +137,7 @@ output:write(vim.json.encode({
   apply_mapping_installed = apply_mapping_installed,
   apply_saved = apply_saved,
   apply_flash_started = apply_flash_started,
+  apply_picker_opened = apply_picker_opened,
   failed_instances = failed_instances,
   control_actions = control_actions,
   registry_available = rezonality._state().registry_available,

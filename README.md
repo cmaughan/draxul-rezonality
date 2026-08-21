@@ -163,8 +163,9 @@ Rezonality builds are not imported as live panes. Reload each already-running
 Rezonality pane once after a fresh install to publish its current state.
 
 Press `Ctrl+Enter` in a listed Rezonality source buffer (or run `:RezApply`) to
-save it, choose a contributing pane when necessary, flash the visible text
-orange for 750 ms, and request a rebuild. Use `:help rezonality` for the complete
+save it, flash the visible text orange for 750 ms, and rebuild every pane that
+uses the file. Shared sources apply without a chooser so their instances stay
+synchronized. Use `:help rezonality` for the complete
 command and multiple-pane behavior reference. Use `:RezProblems` for the complete cross-file quickfix list,
 `:RezInstances` for a live pane chooser, and `:RezFiles` for the exact files in
 each current valid compiled generation (GPU-active or ready to present). The file picker includes each scenegraph,

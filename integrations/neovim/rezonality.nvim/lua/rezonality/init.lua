@@ -952,13 +952,30 @@ function M.apply()
   M.refresh()
   local buffer = vim.api.nvim_get_current_buf()
   local window = vim.api.nvim_get_current_win()
-  choose_instance(contextual_instances(),
-    "Apply shader to Rezonality pane", function(instance)
-      if save_buffer(buffer) then
-        flash_buffer(buffer, window)
-        M.reload_instance(instance)
-      end
-    end)
+  local contextual = instances_for_current_file()
+  if #contextual == 0 then
+    contextual = instances_at_cursor()
+  end
+  if #contextual == 0 then
+    contextual = state.instances
+  end
+  local instances, unique = {}, {}
+  for _, instance in ipairs(contextual) do
+    if instance.pane_id and not unique[instance.pane_id] then
+      unique[instance.pane_id] = true
+      table.insert(instances, instance)
+    end
+  end
+  if #instances == 0 then
+    vim.notify("Rezonality: no matching live pane", vim.log.levels.WARN)
+    return
+  end
+  if save_buffer(buffer) then
+    flash_buffer(buffer, window)
+    for _, instance in ipairs(instances) do
+      M.reload_instance(instance)
+    end
+  end
 end
 
 function M.instances()

@@ -42,9 +42,8 @@ Pressing CTRL-ENTER performs the original VkLive/Zep apply gesture:
 
 1. Save the current buffer when it is modified.
 2. Resolve the Rezonality pane or panes using that file.
-3. Ask for a pane only when the file is shared by multiple instances.
-4. Pulse the visible text through an orange 750-ms flash.
-5. Request an immediate project rebuild in the selected pane.
+3. Pulse the visible text through an orange 750-ms flash.
+4. Request an immediate project rebuild in every contributing pane.
 
 The flash acknowledges that the text was applied; it does not mean that the
 candidate compiled successfully. The last valid GPU generation continues
@@ -59,10 +58,11 @@ COMMANDS                                                    *rezonality-commands
 
                                                         *:RezApply*
 :RezApply
-        Save the current buffer, flash its visible text, and rebuild the
-        contributing Rezonality pane. A diagnostic under the cursor takes
-        priority; otherwise the current file's contributors are used. If
-        neither is known, all live instances are offered.
+        Save the current buffer, flash its visible text, and rebuild every
+        Rezonality pane contributing the current file. A diagnostic under the
+        cursor is used only when the current file is not in the source
+        inventory; if neither is known, all live instances are rebuilt. Shared
+        files never open a pane chooser for apply.
 
                                                         *:RezFiles*
 :RezFiles
@@ -134,10 +134,11 @@ The other views aggregate deliberately:
 
 - |:RezFiles| deduplicates normalized paths and shows every pane using them.
 - |:RezProblems| deduplicates identical errors and retains every contributor.
-- |:RezApply|, |:RezFocus|, and |:RezReload| first use a diagnostic under the
-  cursor, then panes using the current file, then all live instances.
-- A single target is used immediately; multiple targets open
-  |vim.ui.select()|.
+- |:RezApply| first uses every pane contributing the current file, then a
+  diagnostic under the cursor, then all live instances. It rebuilds every
+  resolved pane without a chooser so shared shaders remain synchronized.
+- |:RezFocus| and |:RezReload| use the same contextual order, but multiple
+  targets open |vim.ui.select()| because those commands act on one pane.
 
 An external Neovim can see panes from every attached Draxul UI. Focus targets
 the only UI or asks which UI to raise. Reload/apply fans out through the server

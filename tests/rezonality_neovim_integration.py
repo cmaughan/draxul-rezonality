@@ -203,11 +203,13 @@ def main() -> int:
             "apply_mapping_installed": True,
             "apply_saved": True,
             "apply_flash_started": True,
+            "apply_picker_opened": False,
             "failed_instances": 2,
             "control_actions": [
                 "focus:pane-left",
                 "reload:pane-right",
                 "reload:pane-left",
+                "reload:pane-right",
             ],
             "registry_available": True,
             "rez_commands": 10,
