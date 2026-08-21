@@ -1,38 +1,190 @@
-*rezonality.nvim*  Rezonality compiler diagnostics for Neovim
+*rezonality.nvim*  Rezonality live shader workflow for Neovim
 
-Install with Rezonality's tools/install_neovim.py script. The package uses
-Neovim's native pack/*/start loading and does not edit init.lua.
+==============================================================================
+CONTENTS                                                   *rezonality-contents*
 
-Commands:
-  :RezonalityRefresh       Read every current Rezonality diagnostic document.
-  :RezonalityProblems      Populate and open the quickfix list.
-  :RezonalityProblems!     Populate quickfix without opening it.
-  :RezonalityInstances     List live Rezonality panes; select one to focus it.
-  :RezonalityFocus         Focus the pane for the diagnostic under the cursor.
-  :RezonalityReload        Recompile the pane for the diagnostic under the cursor.
-  :RezonalityStatus        Report the current diagnostic and file counts.
-  :RezonalityEnable        Enable polling and diagnostics.
-  :RezonalityDisable       Stop polling and clear diagnostics.
+1. Introduction ......................................... |rezonality-intro|
+2. Applying shader edits ................................ |rezonality-apply|
+3. Commands ........................................... |rezonality-commands|
+4. Multiple panes ................................... |rezonality-multipane|
+5. Configuration ..................................... |rezonality-config|
+6. Discovery and routing ........................... |rezonality-discovery|
 
-The default refresh interval is 500 ms. Configure explicitly if desired:
+==============================================================================
+INTRODUCTION                                                  *rezonality-intro*
+
+The package joins compiler records from live Rezonality panes with Draxul's
+Session registry. It provides normal Neovim diagnostics, a cross-file quickfix
+list, a browser for shader sources, and commands that focus or reload the exact
+pane contributing a file or error.
+
+Install it from the parent Draxul checkout:
+>
+  py plugins/rezonality/tools/install_neovim.py
+<
+Restart Neovim after installation. The installer uses Neovim's native
+pack/*/start layout, generates help tags, and does not edit init.lua. This file
+is then available with:
+>
+  :help rezonality
+  :help :RezApply
+  :help :RezFiles
+<
+The longer :Rezonality* command names remain compatibility aliases.
+
+==============================================================================
+APPLYING SHADER EDITS                                        *rezonality-apply*
+
+The default apply key is CTRL-ENTER, represented by |<C-CR>| in Neovim. It is
+installed only in buffers that belong to a current Rezonality generation.
+
+Pressing CTRL-ENTER performs the original VkLive/Zep apply gesture:
+
+1. Save the current buffer when it is modified.
+2. Resolve the Rezonality pane or panes using that file.
+3. Ask for a pane only when the file is shared by multiple instances.
+4. Pulse the visible text through an orange 750-ms flash.
+5. Request an immediate project rebuild in the selected pane.
+
+The flash acknowledges that the text was applied; it does not mean that the
+candidate compiled successfully. The last valid GPU generation continues
+rendering if the new candidate fails, and diagnostics appear in Neovim.
+
+Use |:RezApply| to perform the same action without the key mapping. Use
+|:RezReload| when the on-disk project should be rebuilt without saving or
+flashing the current editor buffer.
+
+==============================================================================
+COMMANDS                                                    *rezonality-commands*
+
+                                                        *:RezApply*
+:RezApply
+        Save the current buffer, flash its visible text, and rebuild the
+        contributing Rezonality pane. A diagnostic under the cursor takes
+        priority; otherwise the current file's contributors are used. If
+        neither is known, all live instances are offered.
+
+                                                        *:RezFiles*
+:RezFiles
+        List and open files from every current valid generation. The picker
+        includes scenegraphs, vertex/fragment/geometry/ray/Metal entrypoints,
+        and recursively resolved quoted includes. Shared paths appear once and
+        retain every contributing pane name. GPU-active sources are preferred;
+        a ready candidate is used for a hidden pane that has not presented yet.
+        One result opens immediately. No results produce an informational
+        message.
+
+                                                        *:RezInstances*
+:RezInstances
+        List every live Rezonality pane as STATUS SPACE / TAB / PANE. Selecting
+        an entry focuses its exact Draxul pane. One instance focuses
+        immediately. Status values are LIVE, READY, FAILED, BUILDING, and
+        PENDING.
+
+                                                        *:RezProblems*
+:RezProblems[!]
+        Replace Neovim's quickfix list with current Rezonality diagnostics.
+        Identical file/line/message entries from multiple panes appear once but
+        retain all contributor names. Without ! the quickfix window opens;
+        with ! it is populated without changing the window layout.
+
+                                                        *:RezFocus*
+:RezFocus
+        Focus the pane contributing the diagnostic under the cursor. When the
+        cursor is not on a diagnostic, use the current shader file's panes;
+        otherwise offer all live instances. Shared errors or files open a pane
+        chooser.
+
+                                                        *:RezReload*
+:RezReload
+        Force the contextually selected pane to rebuild its project. This does
+        not save or flash the current buffer. Use |:RezApply| for the complete
+        save/flash/rebuild gesture.
+
+                                                        *:RezStatus*
+:RezStatus
+        Refresh discovery and report unique diagnostic count, diagnostic-file
+        count, shader-source count, live-pane count, and the diagnostics cache
+        path. If live discovery fails, the message reports diagnostic-cache
+        fallback and its reason.
+
+                                                        *:RezRefresh*
+:RezRefresh
+        Immediately reread diagnostic documents and refresh the Draxul pane
+        registry instead of waiting for the background timers.
+
+                                                        *:RezEnable*
+:RezEnable
+        Enable diagnostics, perform an immediate refresh, and start background
+        polling when configured.
+
+                                                        *:RezDisable*
+:RezDisable
+        Stop background polling and clear Rezonality diagnostics from loaded
+        buffers. It does not stop rendering, close panes, or delete compiler
+        records. Use |:RezEnable| to resume.
+
+==============================================================================
+MULTIPLE PANES                                            *rezonality-multipane*
+
+Each Rezonality pane has its own diagnostics_id and remains a separate entry
+in |:RezInstances|, even when several panes share one project.
+
+The other views aggregate deliberately:
+
+- |:RezFiles| deduplicates normalized paths and shows every pane using them.
+- |:RezProblems| deduplicates identical errors and retains every contributor.
+- |:RezApply|, |:RezFocus|, and |:RezReload| first use a diagnostic under the
+  cursor, then panes using the current file, then all live instances.
+- A single target is used immediately; multiple targets open
+  |vim.ui.select()|.
+
+An external Neovim can see panes from every attached Draxul UI. Focus targets
+the only UI or asks which UI to raise. Reload/apply fans out through the server
+to every attached UI projecting the selected pane, keeping duplicate windows
+converged.
+
+Closed instances disappear when the live registry refreshes. If the registry
+is unavailable, source and diagnostic views fall back to current cache records
+and |:RezStatus| makes that fallback explicit.
+
+==============================================================================
+CONFIGURATION                                                *rezonality-config*
+
+Defaults:
 >
   require("rezonality").setup({
     refresh_ms = 500,
     registry_refresh_ms = 2000,
+    apply_key = "<C-CR>",
+    flash_ms = 750,
     virtual_text = true,
     signs = true,
     underline = true,
   })
 <
+Set apply_key to an empty string to disable the buffer-local mapping. The
+|:RezApply| command remains available. flash_ms is clamped to at least 100 ms.
+
 Set g:rezonality_auto_setup = 0 before packages load when calling setup()
 yourself. REZONALITY_DIAGNOSTICS_DIR overrides cache discovery for testing.
+Set server_runtime_dir for an isolated server runtime, or draxul_command as an
+explicit CLI override.
+
+==============================================================================
+DISCOVERY AND ROUTING                                      *rezonality-discovery*
 
 Inside an embedded Draxul Neovim pane, Draxul injects its executable, Session,
 UI-control identity, and server-runtime route. The package queries
-`draxul pane list --json`, filters
-diagnostics to currently live Rezonality panes, and uses pane names in inline
-diagnostic and quickfix sources. If the live registry is unavailable, it falls
-back to all current diagnostic documents and reports that fallback in
-:RezonalityStatus.
+`draxul pane list --json`, filters records to currently live Rezonality panes,
+and uses Space, tab, and pane names in editor sources and pickers.
+
+External Neovim discovers the matching Debug, Release, or custom-build CLI
+from the active server's secured runtime metadata. It discovers authenticated
+UI routes from that server rather than requiring draxul on PATH.
+
+If no UI is running, there is no live Rezonality renderer to focus or reload.
+The package can still show eligible cache records, clearly reported as a
+fallback by |:RezStatus|.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

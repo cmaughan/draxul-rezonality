@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import shutil
 import subprocess
@@ -49,13 +50,32 @@ def package_target(data_directory: pathlib.Path) -> pathlib.Path:
     )
 
 
-def install(target: pathlib.Path) -> None:
+def generate_helptags(executable: str, package: pathlib.Path) -> None:
+    doc_directory = package / "doc"
+    lua = (
+        "lua local p="
+        + json.dumps(doc_directory.as_posix())
+        + "; vim.cmd('helptags ' .. vim.fn.fnameescape(p))"
+    )
+    completed = subprocess.run(
+        [executable, "--headless", "--clean", "-n", f"+{lua}", "+qa!"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0 or not (doc_directory / "tags").is_file():
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"could not generate Neovim help tags: {detail}")
+
+
+def install(target: pathlib.Path, executable: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     incoming = target.parent / f".{PACKAGE_NAME}.incoming-{uuid.uuid4().hex}"
     backup = target.parent / f".{PACKAGE_NAME}.backup-{uuid.uuid4().hex}"
     shutil.copytree(PACKAGE_SOURCE, incoming)
     marker = incoming / "lua" / "rezonality" / "installed_at"
     marker.write_text(str(time.time_ns() // 1_000_000), encoding="ascii")
+    generate_helptags(executable, incoming)
     try:
         if target.exists():
             target.replace(backup)
@@ -87,8 +107,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     required = target / "lua" / "rezonality" / "init.lua"
     marker = target / "lua" / "rezonality" / "installed_at"
+    help_tags = target / "doc" / "tags"
     if args.check:
-        if required.is_file() and marker.is_file():
+        if required.is_file() and marker.is_file() and help_tags.is_file():
             print(f"Rezonality Neovim package is installed at {target}")
             return 0
         print(f"Rezonality Neovim package is not installed at {target}")
@@ -101,9 +122,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Rezonality Neovim package is not installed at {target}")
         return 0
 
-    install(target)
+    install(target, args.nvim)
     print(f"Installed Rezonality Neovim package at {target}")
-    print("Restart Neovim, then run :RezonalityStatus or :RezonalityProblems")
+    print("Restart Neovim, then run :help rezonality or :RezStatus")
     return 0
 
 

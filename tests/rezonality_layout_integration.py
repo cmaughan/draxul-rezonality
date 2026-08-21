@@ -8,6 +8,7 @@ import ctypes
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,7 +76,8 @@ def main() -> int:
     parser.add_argument("--project", required=True)
     args = parser.parse_args()
 
-    executable = str(pathlib.Path(args.draxul).resolve())
+    source_executable = pathlib.Path(args.draxul).resolve()
+    executable = str(source_executable)
     generator = str(pathlib.Path(args.generator).resolve())
     project = pathlib.Path(args.project).resolve()
     # Darwin's Unix-domain socket path limit is only 103 bytes. Keep the
@@ -86,6 +88,16 @@ def main() -> int:
     ) as temp:
         runtime = pathlib.Path(temp) / "runtime"
         runtime.mkdir()
+        if os.name == "nt":
+            # A user's long-lived Debug server legitimately keeps the sibling
+            # draxul-server.exe helper open. Stage this isolated scenario's
+            # launcher beside its private runtime so helper refresh cannot
+            # collide with or require stopping that server.
+            isolated_app = pathlib.Path(temp) / "app"
+            isolated_app.mkdir()
+            isolated_executable = isolated_app / source_executable.name
+            shutil.copy2(source_executable, isolated_executable)
+            executable = str(isolated_executable)
         route = ["--server-runtime-dir", str(runtime)]
         server_pid = 0
         server_process: subprocess.Popen[str] | None = None

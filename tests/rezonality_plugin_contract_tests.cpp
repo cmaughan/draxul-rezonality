@@ -615,6 +615,10 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
         fs::copy_options::recursive | fs::copy_options::overwrite_existing,
         ec);
     REQUIRE_FALSE(ec);
+    write_text(fixture / "agent_include.glsl", "// contract include\n");
+    const fs::path fixture_fragment = fixture / "screen.frag";
+    write_text(fixture_fragment, read_text(fixture_fragment)
+        + "\n#include \"agent_include.glsl\"\n");
 
     HostState host_state;
     host_state.cache_path = cache;
@@ -664,11 +668,35 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
         = cache / "diagnostics" / "agent-workflow.json";
     REQUIRE(fs::exists(diagnostics));
     auto document = read_json(diagnostics);
-    CHECK(document["schema_version"] == 2);
+    CHECK(document["schema_version"] == 3);
     CHECK(document["stage"] == "build");
     CHECK(document["severity"] == "info");
     CHECK(document["attempted_generation"] == 1);
     CHECK(document["project_path"] == canonical_fixture.generic_string());
+    REQUIRE(document["active_source_files"].is_array());
+    CHECK(document["active_source_file_count"] == 0);
+    CHECK_FALSE(document["active_source_files_truncated"].get<bool>());
+    REQUIRE(document["candidate_source_files"].is_array());
+    CHECK(document["candidate_source_file_count"].get<size_t>()
+        == document["candidate_source_files"].size());
+    CHECK(document["candidate_source_file_count"].get<size_t>() >= 4);
+    CHECK_FALSE(document["candidate_source_files_truncated"].get<bool>());
+    bool found_scenegraph = false;
+    bool found_fragment = false;
+    bool found_include = false;
+    for (const auto& source : document["candidate_source_files"])
+    {
+        const std::string path = source.get<std::string>();
+        found_scenegraph = found_scenegraph
+            || path.find("default.scenegraph") != std::string::npos;
+        found_fragment = found_fragment
+            || path.find("screen.frag") != std::string::npos;
+        found_include = found_include
+            || path.find("agent_include.glsl") != std::string::npos;
+    }
+    CHECK(found_scenegraph);
+    CHECK(found_fragment);
+    CHECK(found_include);
     REQUIRE(document["diagnostics"].is_array());
     REQUIRE(document["diagnostics"].size() == 1);
 

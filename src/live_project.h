@@ -89,6 +89,7 @@ struct ShaderBuild
     uint64_t generation = 0;
     std::filesystem::path project_path;
     std::filesystem::path scenegraph_path;
+    std::vector<std::filesystem::path> source_files;
     std::vector<Surface> surfaces;
     std::vector<ModelData> models;
     std::vector<Pass> passes;

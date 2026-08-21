@@ -46,11 +46,19 @@ def write_batch(
     entries: list[dict[str, object]],
 ) -> None:
     primary = entries[0]
+    source_files = sorted({
+        (project / "default.scenegraph").as_posix(),
+        *(str(entry["path"]) for entry in entries),
+    })
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "plugin_id": "dev.draxul.rezonality",
         "project_path": project.as_posix(),
         "attempted_generation": 4,
+        "active_generation": 3,
+        "active_source_file_count": len(source_files),
+        "active_source_files_truncated": False,
+        "active_source_files": source_files,
         "timestamp_unix_ms": time.time_ns() // 1_000_000,
         **primary,
         "diagnostic_count": len(entries),
@@ -63,6 +71,7 @@ def write_batch(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nvim", required=True)
+    parser.add_argument("--draxul", type=pathlib.Path, required=True)
     parser.add_argument("--installer", type=pathlib.Path, required=True)
     parser.add_argument("--script", type=pathlib.Path, required=True)
     args = parser.parse_args()
@@ -71,11 +80,17 @@ def main() -> int:
         root = pathlib.Path(temporary)
         installed = root / "installed" / "rezonality.nvim"
         diagnostics = root / "diagnostics"
+        server_runtime = root / "server-runtime"
         project = root / "project"
         diagnostics.mkdir()
+        server_runtime.mkdir()
         project.mkdir()
         first = project / "screen.frag"
         second = project / "copy.vert"
+        (project / "default.scenegraph").write_text(
+            "[[pass]]\nvertex = \"copy.vert\"\nfragment = \"screen.frag\"\n",
+            encoding="utf-8",
+        )
         first.write_text("line one\nline two\n", encoding="utf-8")
         second.write_text("one\ntwo\n", encoding="utf-8")
 
@@ -96,6 +111,16 @@ def main() -> int:
         ])
         if not (installed / "lua" / "rezonality" / "init.lua").is_file():
             raise RuntimeError("installer did not copy the Lua package")
+        help_tags = installed / "doc" / "tags"
+        if not help_tags.is_file() or ":RezApply" not in help_tags.read_text(
+            encoding="utf-8"
+        ):
+            raise RuntimeError("installer did not generate Rezonality help tags")
+        (server_runtime / "server.control.json").write_text(json.dumps({
+            "state": "ready",
+            "published_unix_ms": time.time_ns() // 1_000_000,
+            "client_executable": str(args.draxul.resolve()),
+        }), encoding="utf-8")
 
         stale = diagnostic(first, 1, "error from a pre-install pane")
         write_batch(diagnostics / "stale-pane.json", project, [stale])
@@ -132,7 +157,10 @@ def main() -> int:
             "REZONALITY_TEST_FIRST": str(first),
             "REZONALITY_TEST_SECOND": str(second),
             "REZONALITY_TEST_RESULT": str(result),
+            "REZONALITY_TEST_DRAXUL": str(args.draxul.resolve()),
+            "DRAXUL_SERVER_RUNTIME_DIR": str(server_runtime),
         })
+        environment.pop("DRAXUL_EXECUTABLE", None)
         run([
             args.nvim,
             "--headless",
@@ -149,10 +177,23 @@ def main() -> int:
             "quickfix": 3,
             "shared_sources": 2,
             "instances": 2,
+            "active_files": 3,
+            "selected_file": "default.scenegraph",
+            "selected_file_has_both_instances": True,
+            "apply_mapping_installed": True,
+            "apply_saved": True,
+            "apply_flash_started": True,
             "failed_instances": 2,
-            "control_actions": ["focus:pane-left", "reload:pane-right"],
+            "control_actions": [
+                "focus:pane-left",
+                "reload:pane-right",
+                "reload:pane-left",
+            ],
             "registry_available": True,
-            "registry_commands": 3,
+            "rez_commands": 10,
+            "compatibility_commands": 10,
+            "status_visible": True,
+            "server_discovery": True,
         }
         if observed != expected:
             raise RuntimeError(f"unexpected Neovim result: {observed!r}")

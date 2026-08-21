@@ -9,6 +9,7 @@
 #include <fstream>
 #include <map>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <system_error>
 
@@ -71,6 +72,73 @@ std::optional<std::string> read_text(const fs::path& path)
     if (!input.good() && !input.eof())
         return std::nullopt;
     return stream.str();
+}
+
+fs::path normalized_path(const fs::path& path)
+{
+    std::error_code ec;
+    fs::path normalized = fs::weakly_canonical(path, ec);
+    return ec ? path.lexically_normal() : normalized;
+}
+
+void collect_shader_source(const fs::path& project_path,
+    const fs::path& path, std::vector<fs::path>& sources,
+    std::set<std::string>& seen)
+{
+    if (path.empty())
+        return;
+    const fs::path normalized = normalized_path(path);
+    if (!seen.insert(normalized.generic_string()).second)
+        return;
+    sources.push_back(normalized);
+
+    const auto contents = read_text(normalized);
+    if (!contents)
+        return;
+    static const std::regex include_pattern(
+        R"(^\s*#\s*include\s*\"([^\"]+)\")");
+    std::istringstream lines(*contents);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+        std::smatch match;
+        if (!std::regex_search(line, match, include_pattern))
+            continue;
+        fs::path dependency = normalized.parent_path()
+            / fs::u8path(match[1].str());
+        if (!fs::is_regular_file(dependency))
+            dependency = project_path / fs::u8path(match[1].str());
+        if (fs::is_regular_file(dependency))
+            collect_shader_source(project_path, dependency, sources, seen);
+    }
+}
+
+void collect_active_sources(ShaderBuild& build)
+{
+    std::set<std::string> seen;
+    build.source_files.clear();
+    if (!build.scenegraph_path.empty())
+    {
+        const fs::path scenegraph = normalized_path(build.scenegraph_path);
+        seen.insert(scenegraph.generic_string());
+        build.source_files.push_back(scenegraph);
+    }
+    for (const auto& pass : build.passes)
+    {
+        collect_shader_source(build.project_path, pass.vertex_path,
+            build.source_files, seen);
+        collect_shader_source(build.project_path, pass.fragment_path,
+            build.source_files, seen);
+        collect_shader_source(build.project_path, pass.raygen_path,
+            build.source_files, seen);
+        collect_shader_source(build.project_path, pass.miss_path,
+            build.source_files, seen);
+        collect_shader_source(build.project_path, pass.closest_hit_path,
+            build.source_files, seen);
+        collect_shader_source(build.project_path, pass.metal_ray_path,
+            build.source_files, seen);
+    }
+    std::sort(build.source_files.begin(), build.source_files.end());
 }
 
 std::vector<uint32_t> read_spirv(const fs::path& path)
@@ -1119,6 +1187,7 @@ BuildResult LiveProject::build(uint64_t generation) const
     candidate.surfaces = scene->surfaces;
     candidate.models = std::move(scene->models);
     candidate.passes = scene->passes;
+    collect_active_sources(candidate);
     bool shader_compile_failed = false;
     for (auto& surface : candidate.surfaces)
     {

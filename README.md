@@ -148,20 +148,35 @@ when it cannot reach the live Draxul registry.
 
 Each embedded Neovim also receives the unique identity of its attached Draxul
 window. Focus and reload requests therefore route to the UI that owns the pane,
-even when several windows are attached to the same Session.
+even when several windows are attached to the same Session. An external Neovim
+discovers the authenticated UI routes from the shared server: reload fans out
+to every attached UI projection, while focus targets the sole UI or opens a UI
+chooser when several Draxul windows are attached.
+
+External Neovim discovers the matching CLI from the active server's secured
+runtime metadata, so Debug, Release, and custom build directories do not need
+to be placed on `PATH`. Set `server_runtime_dir` for an isolated server runtime,
+or `draxul_command` as an explicit override.
 
 The installer records its installation time so diagnostic files left by older
 Rezonality builds are not imported as live panes. Reload each already-running
 Rezonality pane once after a fresh install to publish its current state.
 
-Use `:RezonalityProblems` for the complete cross-file quickfix list and
-`:RezonalityInstances` for a live pane chooser. On an error line,
-`:RezonalityFocus` focuses a contributing pane and `:RezonalityReload`
-recompiles it; ambiguous errors open a pane chooser. `:RezonalityRefresh`
-rescans immediately, while `:RezonalityStatus` reports diagnostic, file, and
-registry counts. `:RezonalityDisable` and `:RezonalityEnable` control the
-background 500-ms refresh. Closed Rezonality instances remove their diagnostic
-record, and a successful rebuild clears their prior compile errors.
+Press `Ctrl+Enter` in a listed Rezonality source buffer (or run `:RezApply`) to
+save it, choose a contributing pane when necessary, flash the visible text
+orange for 750 ms, and request a rebuild. Use `:help rezonality` for the complete
+command and multiple-pane behavior reference. Use `:RezProblems` for the complete cross-file quickfix list,
+`:RezInstances` for a live pane chooser, and `:RezFiles` for the exact files in
+each current valid compiled generation (GPU-active or ready to present). The file picker includes each scenegraph,
+shader entrypoint, and recursively resolved quoted include; shared files are
+shown once with every contributing pane and open directly when selected. On an
+error line, `:RezFocus` focuses a contributing pane and `:RezReload` recompiles
+it; ambiguous errors open a pane chooser. `:RezRefresh` rescans immediately,
+while `:RezStatus` reports diagnostic, active-source, and registry counts.
+`:RezDisable` and `:RezEnable` control the background 500-ms refresh. The former
+`:Rezonality*` command names remain compatibility aliases. Closed Rezonality
+instances remove their diagnostic record, and a successful rebuild clears
+their prior compile errors.
 Installation can be inspected or reversed with:
 
 ```powershell

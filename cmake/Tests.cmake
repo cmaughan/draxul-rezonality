@@ -55,6 +55,7 @@ if(REZONALITY_NVIM_EXECUTABLE)
         COMMAND ${Python3_EXECUTABLE}
             "${_rezonality_root}/tests/rezonality_neovim_integration.py"
             --nvim "${REZONALITY_NVIM_EXECUTABLE}"
+            --draxul "$<TARGET_FILE:draxul>"
             --installer "${_rezonality_root}/tools/install_neovim.py"
             --script "${_rezonality_root}/tests/rezonality_neovim_test.lua")
     set_tests_properties(draxul-rezonality-neovim PROPERTIES

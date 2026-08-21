@@ -24,6 +24,7 @@ namespace
 constexpr size_t kMaximumMessageBytes = 16u * 1024u;
 constexpr size_t kMaximumPathBytes = 4u * 1024u;
 constexpr size_t kMaximumDiagnostics = 128;
+constexpr size_t kMaximumSourceFiles = 1024;
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
 
@@ -140,11 +141,34 @@ bool DiagnosticsPublisher::publish(
         });
     }
 
+    nlohmann::json source_files = nlohmann::json::array();
+    const size_t source_file_count = std::min(
+        state.active_source_files.size(), kMaximumSourceFiles);
+    for (size_t index = 0; index < source_file_count; ++index)
+        source_files.push_back(path_string(state.active_source_files[index]));
+    nlohmann::json candidate_source_files = nlohmann::json::array();
+    const size_t candidate_source_file_count = std::min(
+        state.candidate_source_files.size(), kMaximumSourceFiles);
+    for (size_t index = 0; index < candidate_source_file_count; ++index)
+    {
+        candidate_source_files.push_back(
+            path_string(state.candidate_source_files[index]));
+    }
+
     const nlohmann::json document{
-        { "schema_version", 2 },
+        { "schema_version", 3 },
         { "plugin_id", "dev.draxul.rezonality" },
         { "project_path", path_string(state.project_path) },
         { "scenegraph_path", path_string(state.scenegraph_path) },
+        { "active_source_file_count", state.active_source_files.size() },
+        { "active_source_files_truncated",
+            state.active_source_files.size() > source_file_count },
+        { "active_source_files", std::move(source_files) },
+        { "candidate_source_file_count",
+            state.candidate_source_files.size() },
+        { "candidate_source_files_truncated",
+            state.candidate_source_files.size() > candidate_source_file_count },
+        { "candidate_source_files", std::move(candidate_source_files) },
         { "attempted_generation", state.attempted_generation },
         { "active_generation", state.active_generation },
         { "timestamp_unix_ms", unix_milliseconds() },

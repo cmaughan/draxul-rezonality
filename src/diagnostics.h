@@ -22,6 +22,8 @@ struct DiagnosticState
 {
     std::filesystem::path project_path;
     std::filesystem::path scenegraph_path;
+    std::vector<std::filesystem::path> active_source_files;
+    std::vector<std::filesystem::path> candidate_source_files;
     std::filesystem::path path;
     uint64_t attempted_generation = 0;
     uint64_t active_generation = 0;
