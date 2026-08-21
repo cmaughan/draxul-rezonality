@@ -432,7 +432,7 @@ void main()
     float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
     float bezel = lineGlow(edge - 0.018, 0.004);
     float corner = step(0.92, max(abs(uv.x * 2.0 - 1.0), abs(uv.y * 2.0 - 1.0)));
-    col *= 0.55 + 0.45 * vignette * 10;
+    col *= 0.55 + 0.45 * vignette * 1.0;
     col += vec3(0.02, 0.30, 0.55) * bezel;
     col += vec3(0.04, 0.18, 0.32) * corner * 0.16;
     col = 1.0 - exp(-col * 1.15);

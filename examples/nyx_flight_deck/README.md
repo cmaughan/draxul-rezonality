@@ -23,6 +23,8 @@ pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File plugins/rezonality/example
 The launcher discovers a local Draxul build automatically. Use `-DraxulPath`
 when the executable is elsewhere, and `-Session` or `-ServerRuntimeDir` for a
 non-default server route. Every run creates a new `NYX // FLIGHT DECK` tab.
+The default is full-resolution rendering with no final TV pass; pass `-Crt` to
+launch every graphical pane with its preserved low-resolution CRT scenegraph.
 
 ## Pane map
 
@@ -42,7 +44,7 @@ to avoid flicker, wrapping, and scroll churn.
 The Neon Sentinel uses the `robot-crt/` scenegraph and shaders while referencing
 the adjacent `../robot2` model rather than duplicating
 its large glTF texture set. It is actual depth-tested mesh geometry with animated
-vertex rotation, PBR materials, a procedural neon environment, and the same
-low-resolution CRT composite used by the procedural monitors. In a visible
-Rezonality pane, left-drag orbits, the mouse wheel dollies, and Space toggles
-animation.
+vertex rotation, PBR materials, and a procedural neon environment. Each graphical
+pane has a full-resolution default scenegraph and an optional `*-crt.scenegraph`
+variant. In a visible Rezonality pane, left-drag orbits, the mouse wheel dollies,
+and Space toggles animation.

@@ -1,24 +1,11 @@
-surface: Signal {
-    scale: (0.24, 0.24, 1.0)
-    format: default_color
-}
-
+# Full-resolution default. Select panel-5-crt.scenegraph to restore
+# the low-resolution signal and CRT presentation pass.
 pass: Instrument5 {
-    targets: (Signal)
+    targets: (default_color)
     clear: (0.001, 0.004, 0.012, 1.0)
     geometry: signal {
         path: screen_rect
         vs: fullscreen.vert
         fs: panel-5.frag
-    }
-}
-
-pass: CRT5 {
-    samplers: (Signal)
-    targets: (default_color)
-    geometry: display {
-        path: screen_rect
-        vs: fullscreen.vert
-        fs: crt.frag
     }
 }

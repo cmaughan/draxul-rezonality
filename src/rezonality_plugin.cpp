@@ -148,6 +148,7 @@ struct MetalGeneration
         std::optional<size_t> model_index;
         bool ray_trace = false;
         bool direct = false;
+        bool has_depth = false;
         bool has_clear = false;
         float clear[4] = { 0, 0, 0, 1 };
     };
@@ -174,6 +175,7 @@ struct MetalGeneration
     uint32_t buffered_frame_count = 1;
     id<MTLSamplerState> clamp_sampler = nil;
     id<MTLSamplerState> repeat_sampler = nil;
+    id<MTLDepthStencilState> model_depth_state = nil;
     MTLPixelFormat format = MTLPixelFormatInvalid;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -248,6 +250,12 @@ bool convert_to_msl(const std::vector<uint32_t>& spirv,
             texture.msl_sampler = texture.msl_texture;
             compiler.add_msl_resource_binding(texture);
         }
+        spirv_cross::MSLResourceBinding material_sampler{};
+        material_sampler.stage = model;
+        material_sampler.desc_set = 2;
+        material_sampler.binding = 6;
+        material_sampler.msl_sampler = 15;
+        compiler.add_msl_resource_binding(material_sampler);
         compiler.rename_entry_point("main", entry_point, model);
         compiler.set_entry_point(entry_point, model);
         source = compiler.compile();
@@ -514,6 +522,17 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     sampler_descriptor.tAddressMode = MTLSamplerAddressModeRepeat;
     generation.repeat_sampler
         = [device newSamplerStateWithDescriptor:sampler_descriptor];
+    MTLDepthStencilDescriptor* depth_descriptor
+        = [[MTLDepthStencilDescriptor alloc] init];
+    depth_descriptor.depthCompareFunction = MTLCompareFunctionLessEqual;
+    depth_descriptor.depthWriteEnabled = YES;
+    generation.model_depth_state
+        = [device newDepthStencilStateWithDescriptor:depth_descriptor];
+    if (!generation.model_depth_state)
+    {
+        error = "Rezonality could not create its Metal model depth state";
+        return std::nullopt;
+    }
     for (const auto& source : build.surfaces)
     {
         MetalGeneration::Surface surface;
@@ -618,6 +637,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                 return std::nullopt;
             }
             pass.targets.push_back(*surface);
+            pass.has_depth = pass.has_depth
+                || generation.surfaces[*surface].depth;
         }
         for (const auto& sampler : source.samplers)
         {
@@ -3333,6 +3354,11 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         id<MTLRenderCommandEncoder> encoder
             = [command renderCommandEncoderWithDescriptor:render_pass];
         [encoder setRenderPipelineState:scene_pass.pipeline];
+        if (scene_pass.model_index && scene_pass.has_depth)
+        {
+            [encoder setDepthStencilState:
+                         instance->backend.active->model_depth_state];
+        }
         if (scene_pass.model_index)
             [encoder setVertexBuffer:instance->backend.active->models[*scene_pass.model_index].vertex_buffer
                               offset:0
@@ -3362,6 +3388,9 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
             [encoder setFragmentBuffer:model.material_buffer
                                 offset:0
                                atIndex:2];
+            [encoder setFragmentSamplerState:
+                         instance->backend.active->repeat_sampler
+                                     atIndex:15];
             for (NSUInteger kind = 0; kind < model.textures.size(); ++kind)
             {
                 for (NSUInteger index = 0;
@@ -3371,9 +3400,6 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                     const NSUInteger binding = 16
                         + kind * rezonality::kMaxModelMaterials + index;
                     [encoder setFragmentTexture:texture atIndex:binding];
-                    [encoder setFragmentSamplerState:
-                                 instance->backend.active->repeat_sampler
-                                             atIndex:binding];
                 }
             }
         }

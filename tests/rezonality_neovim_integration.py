@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import pathlib
+import platform
 import subprocess
 import sys
 import tempfile
@@ -79,11 +80,32 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="rezonality-nvim-") as temporary:
         root = pathlib.Path(temporary)
         installed = root / "installed" / "rezonality.nvim"
-        diagnostics = root / "diagnostics"
         server_runtime = root / "server-runtime"
-        project = root / "project"
-        diagnostics.mkdir()
         server_runtime.mkdir()
+        environment = os.environ.copy()
+        if platform.system() == "Windows":
+            cache_root = root / "local-app-data"
+            environment["LOCALAPPDATA"] = str(cache_root)
+            diagnostics = (
+                cache_root / "draxul" / "cache" / "plugins"
+                / "dev.draxul.rezonality" / "diagnostics"
+            )
+        elif platform.system() == "Darwin":
+            home = root / "home"
+            environment["HOME"] = str(home)
+            diagnostics = (
+                home / "Library" / "Caches" / "draxul" / "plugins"
+                / "dev.draxul.rezonality" / "diagnostics"
+            )
+        else:
+            cache_root = root / "cache"
+            environment["XDG_CACHE_HOME"] = str(cache_root)
+            diagnostics = (
+                cache_root / "draxul" / "plugins"
+                / "dev.draxul.rezonality" / "diagnostics"
+            )
+        project = root / "project"
+        diagnostics.mkdir(parents=True)
         project.mkdir()
         first = project / "screen.frag"
         second = project / "copy.vert"
@@ -150,10 +172,8 @@ def main() -> int:
         )
 
         result = root / "result.json"
-        environment = os.environ.copy()
         environment.update({
             "REZONALITY_TEST_PACKAGE": str(installed),
-            "REZONALITY_DIAGNOSTICS_DIR": str(diagnostics),
             "REZONALITY_TEST_FIRST": str(first),
             "REZONALITY_TEST_SECOND": str(second),
             "REZONALITY_TEST_RESULT": str(result),
