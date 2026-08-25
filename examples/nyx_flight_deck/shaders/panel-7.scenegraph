@@ -2,7 +2,7 @@
 # the low-resolution signal and CRT presentation pass.
 pass: Instrument7 {
     targets: (default_color)
-    clear: (0.001, 0.004, 0.012, 1.0)
+    clear: (1.001, 0.004, 0.012, 1.0)
     geometry: signal {
         path: screen_rect
         vs: fullscreen.vert

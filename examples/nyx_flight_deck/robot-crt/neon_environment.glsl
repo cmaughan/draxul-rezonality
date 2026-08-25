@@ -103,7 +103,7 @@ vec3 neonEnvironment(vec3 direction, float time)
     float horizon = exp(-abs(ray.y + 0.10) * 18.0);
     color += mix(vec3(0.02, 0.12, 0.42), vec3(0.72, 0.015, 0.46), uv.x) * horizon * 0.33;
 
-    color += neonRibbon(uv, time, 0.0, vec3(0.0, 0.95, 1.35));
+    color += neonRibbon(uv, time * 30, 0.0, vec3(0.0, 0.15, 1.35));
     color += neonRibbon(uv + vec2(0.0, 0.072), time, 2.1, vec3(1.25, 0.01, 0.62));
     color += neonRibbon(uv + vec2(0.0, -0.055), time, 4.4, vec3(0.24, 0.12, 1.35)) * 0.7;
 

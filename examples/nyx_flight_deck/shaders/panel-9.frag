@@ -3,5 +3,3 @@
 #define PANEL_ID 9
 // Live generation: UV-local coordinate and geometry upgrade v5.
 #include "nyx_bridge.glsl"
-
-f
