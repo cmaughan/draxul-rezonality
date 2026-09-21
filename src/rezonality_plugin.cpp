@@ -1,8 +1,10 @@
 #include "live_project.h"
 
+#include "audio_analysis.h"
 #include "camera.h"
 #include "diagnostics.h"
 #include "model_loader.h"
+#include "runtime_controller.h"
 
 #include <draxul/plugin_adapter.h>
 #include <draxul/plugin_api.h>
@@ -28,6 +30,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -57,6 +60,38 @@ constexpr const char* kPluginId = "dev.draxul.rezonality";
 constexpr const char* kPluginVersion = "0.7.0";
 constexpr size_t kCommonUniformFloatCount = 192;
 using CommonUniformBlock = std::array<float, kCommonUniformFloatCount>;
+
+bool valid_uploaded_surface(const ShaderBuild::Surface& source,
+    std::string& error)
+{
+    const bool byte_storage = !source.image_pixels.empty();
+    const bool float_storage = !source.image_float_pixels.empty();
+    if (!byte_storage && !float_storage)
+        return true;
+    if (source.image_width == 0 || source.image_height == 0
+        || byte_storage == float_storage
+        || source.image_width > std::numeric_limits<size_t>::max()
+                / source.image_height / 4)
+    {
+        error = "Rezonality image surface '" + source.name
+            + "' has invalid upload storage";
+        return false;
+    }
+    const size_t expected = static_cast<size_t>(source.image_width)
+        * source.image_height * 4;
+    const bool valid = byte_storage
+        ? source.format == ShaderBuild::SurfaceFormat::Color8
+            && source.image_pixels.size() == expected
+        : source.format == ShaderBuild::SurfaceFormat::Color32Float
+            && source.image_float_pixels.size() == expected;
+    if (!valid)
+    {
+        error = "Rezonality image surface '" + source.name
+            + "' has invalid upload storage";
+        return false;
+    }
+    return true;
+}
 
 size_t align_up(size_t value, size_t alignment)
 {
@@ -550,6 +585,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                                                   : std::max<NSUInteger>(1, static_cast<NSUInteger>(generation.height * std::max(0.01f, source.scale_y)));
         const bool has_image = !source.image_pixels.empty()
             || !source.image_float_pixels.empty();
+        if (has_image && !valid_uploaded_surface(source, error))
+            return std::nullopt;
         texture.storageMode = !has_image
             ? MTLStorageModePrivate
             : MTLStorageModeManaged;
@@ -1001,15 +1038,15 @@ bool ensure_vertex_buffer(BackendState& backend,
         return true;
     if (backend.device && backend.device != device)
         destroy_backend(backend);
-    backend.device = device;
-    backend.physical_device = physical;
+    VkBuffer vertex_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory vertex_memory = VK_NULL_HANDLE;
 
     VkBufferCreateInfo buffer_info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     buffer_info.size = sizeof(kScreenVertices);
     buffer_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(device, &buffer_info, nullptr,
-            &backend.vertex_buffer)
+            &vertex_buffer)
         != VK_SUCCESS)
     {
         error = "Rezonality could not create its Vulkan screen rectangle";
@@ -1017,39 +1054,51 @@ bool ensure_vertex_buffer(BackendState& backend,
     }
     VkMemoryRequirements requirements{};
     vkGetBufferMemoryRequirements(
-        device, backend.vertex_buffer, &requirements);
+        device, vertex_buffer, &requirements);
     const uint32_t memory_type = find_memory_type(physical,
         requirements.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
             | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (memory_type == UINT32_MAX)
     {
+        vkDestroyBuffer(device, vertex_buffer, nullptr);
         error = "Rezonality could not find host-visible vertex memory";
         return false;
     }
     VkMemoryAllocateInfo allocation{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = memory_type;
-    if (vkAllocateMemory(device, &allocation, nullptr,
-            &backend.vertex_memory)
-            != VK_SUCCESS
-        || vkBindBufferMemory(device, backend.vertex_buffer,
-               backend.vertex_memory, 0)
-            != VK_SUCCESS)
+    if (vkAllocateMemory(device, &allocation, nullptr, &vertex_memory)
+        != VK_SUCCESS)
     {
+        vkDestroyBuffer(device, vertex_buffer, nullptr);
         error = "Rezonality could not allocate vertex memory";
         return false;
     }
+    if (vkBindBufferMemory(device, vertex_buffer, vertex_memory, 0)
+        != VK_SUCCESS)
+    {
+        vkFreeMemory(device, vertex_memory, nullptr);
+        vkDestroyBuffer(device, vertex_buffer, nullptr);
+        error = "Rezonality could not bind vertex memory";
+        return false;
+    }
     void* mapped = nullptr;
-    if (vkMapMemory(device, backend.vertex_memory, 0,
+    if (vkMapMemory(device, vertex_memory, 0,
             sizeof(kScreenVertices), 0, &mapped)
         != VK_SUCCESS)
     {
+        vkFreeMemory(device, vertex_memory, nullptr);
+        vkDestroyBuffer(device, vertex_buffer, nullptr);
         error = "Rezonality could not map vertex memory";
         return false;
     }
     std::memcpy(mapped, kScreenVertices, sizeof(kScreenVertices));
-    vkUnmapMemory(device, backend.vertex_memory);
+    vkUnmapMemory(device, vertex_memory);
+    backend.device = device;
+    backend.physical_device = physical;
+    backend.vertex_buffer = vertex_buffer;
+    backend.vertex_memory = vertex_memory;
     return true;
 }
 
@@ -1096,6 +1145,8 @@ bool create_surface(VulkanGeneration& generation,
     const ShaderBuild::Surface& source, uint32_t pane_width,
     uint32_t pane_height, std::string& error)
 {
+    if (!valid_uploaded_surface(source, error))
+        return false;
     VulkanSurfaceResource surface;
     surface.name = source.name;
     surface.audio_analysis = source.audio_analysis;
@@ -1246,6 +1297,8 @@ bool create_model_texture(VulkanGeneration& generation,
             &texture.sampler)
         != VK_SUCCESS)
     {
+        draxul::vkresources::destroy_attachment(generation.device,
+            generation.allocator, texture.attachment);
         error = "Rezonality could not create a model texture sampler";
         return false;
     }
@@ -1257,7 +1310,13 @@ bool create_model_texture(VulkanGeneration& generation,
         draxul::vkresources::LifetimeScope::Persistent);
     if (!draxul::vkresources::create_buffer(generation.device,
             generation.allocator, upload_request, upload, error))
+    {
+        vkDestroySampler(generation.device, texture.sampler, nullptr);
+        texture.sampler = VK_NULL_HANDLE;
+        draxul::vkresources::destroy_attachment(generation.device,
+            generation.allocator, texture.attachment);
         return false;
+    }
     texture.upload_buffer = upload.release();
     std::memcpy(texture.upload_buffer.mapped,
         source.pixels.data(), source.pixels.size());
@@ -2773,12 +2832,8 @@ struct RezonalityInstance
     std::unique_ptr<LiveProject> project;
     AudioOptions audio_options;
     std::unique_ptr<AudioAnalyzer> audio;
-    std::optional<ShaderBuild> pending_build;
-    std::optional<ShaderBuild> active_build;
+    rezonality::RuntimeController runtime;
     BackendState backend;
-    uint64_t attempted_generation = 0;
-    uint64_t active_generation = 0;
-    uint64_t last_success_unix_ms = 0;
     bool visible = true;
     bool focused = false;
     bool paused = false;
@@ -2787,7 +2842,6 @@ struct RezonalityInstance
     double last_animation_seconds = -1.0;
     rezonality::Camera camera;
     bool camera_initialized = false;
-    std::string status = "building g1";
     std::string presentation_status;
     std::string audio_status;
 };
@@ -2839,13 +2893,6 @@ void log(RezonalityInstance* instance, uint32_t level,
             level, message.data(), message.size());
 }
 
-uint64_t unix_milliseconds()
-{
-    return static_cast<uint64_t>(std::chrono::duration_cast<
-        std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
-}
-
 std::string diagnostic_stage(const BuildResult& result)
 {
     const std::string extension = result.diagnostic_path.extension().string();
@@ -2872,9 +2919,9 @@ void publish_diagnostics(RezonalityInstance* instance,
     state.scenegraph_path
         = instance->options.project_path / instance->options.scenegraph;
     state.path = path;
-    state.attempted_generation = instance->attempted_generation;
-    state.active_generation = instance->active_generation;
-    state.last_success_unix_ms = instance->last_success_unix_ms;
+    state.attempted_generation = instance->runtime.attempted_generation();
+    state.active_generation = instance->runtime.active_generation();
+    state.last_success_unix_ms = instance->runtime.last_success_unix_ms();
     state.stage = std::move(stage);
     state.severity = std::move(severity);
     state.line = line;
@@ -2930,37 +2977,6 @@ double advance_animation(RezonalityInstance* instance,
     }
     instance->last_animation_seconds = monotonic_seconds;
     return instance->animation_elapsed_seconds;
-}
-
-std::string format_failure(uint64_t attempted_generation,
-    uint64_t active_generation, const std::filesystem::path& diagnostic_path,
-    int diagnostic_line, std::string_view error)
-{
-    std::string status = "BUILD FAILED g"
-        + std::to_string(attempted_generation);
-    if (active_generation != 0)
-        status += " | rendering last good g"
-            + std::to_string(active_generation);
-    if (!diagnostic_path.empty())
-    {
-        status += " | " + diagnostic_path.filename().string();
-        if (diagnostic_line > 0)
-            status += ":" + std::to_string(diagnostic_line);
-    }
-    if (!error.empty())
-        status += " | " + std::string(error);
-    return status;
-}
-
-std::string format_error(const BuildResult& result,
-    uint64_t active_generation)
-{
-    std::string status = format_failure(result.generation, active_generation,
-        result.diagnostic_path, result.diagnostic_line, result.error);
-    if (result.diagnostics.size() > 1)
-        status += " | +" + std::to_string(result.diagnostics.size() - 1)
-            + " more";
-    return status;
 }
 
 void* create_instance(const DraxulPluginCreateInfoV2* info)
@@ -3107,12 +3123,10 @@ DraxulPluginTickResultV2 tick(void* opaque,
         return tick_result(false, DRAXUL_PLUGIN_NO_DEADLINE);
     if (auto result = instance->project->take_result())
     {
-        instance->attempted_generation = result->generation;
-        if (result->build)
+        const bool ready = result->build.has_value();
+        instance->runtime.accept(*result);
+        if (ready)
         {
-            instance->pending_build = std::move(*result->build);
-            instance->status = "ready g"
-                + std::to_string(result->generation);
             publish_diagnostics(instance, "build", "info", {}, -1,
                 "candidate generation ready");
             if (instance->visible)
@@ -3120,9 +3134,8 @@ DraxulPluginTickResultV2 tick(void* opaque,
         }
         else
         {
-            instance->status = format_error(
-                *result, instance->active_generation);
-            log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
+            log(instance, DRAXUL_PLUGIN_LOG_ERROR,
+                instance->runtime.status());
             publish_diagnostics(instance, diagnostic_stage(*result),
                 "error", result->diagnostic_path,
                 result->diagnostic_line, result->error,
@@ -3156,23 +3169,19 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
 
     id<MTLTexture> target
         = (__bridge id<MTLTexture>)frame->drawable_texture;
-    const ShaderBuild* desired = nullptr;
-    if (instance->pending_build)
-        desired = &*instance->pending_build;
-    else if (instance->active_build
-        && (!instance->backend.active
-            || instance->backend.active->format != target.pixelFormat
-            || instance->backend.active->width
-                != static_cast<uint32_t>(frame->viewport.width)
-            || instance->backend.active->height
-                != static_cast<uint32_t>(frame->viewport.height)))
-        desired = &*instance->active_build;
+    const bool active_backend_compatible = instance->backend.active
+        && instance->backend.active->format == target.pixelFormat
+        && instance->backend.active->width
+            == static_cast<uint32_t>(frame->viewport.width)
+        && instance->backend.active->height
+            == static_cast<uint32_t>(frame->viewport.height);
+    const ShaderBuild* desired
+        = instance->runtime.desired(active_backend_compatible);
     if (desired)
     {
         ensure_camera(instance, *desired);
         static thread_local std::string error;
         error.clear();
-        const uint64_t desired_generation = desired->generation;
         auto candidate = create_generation(
             instance->backend, *desired, *frame,
             animation_seconds, instance->camera, error);
@@ -3185,25 +3194,17 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
                 instance->backend.retired.push_back({ std::move(*instance->backend.active), used });
             }
             instance->backend.active = std::move(*candidate);
-            instance->active_build = *desired;
-            configure_audio(instance, *instance->active_build);
-            instance->active_generation = desired_generation;
-            instance->pending_build.reset();
-            instance->status = "live g"
-                + std::to_string(instance->active_generation) + " | "
-                + std::to_string(desired->passes.size()) + " passes | "
-                + std::to_string(desired->surfaces.size()) + " surfaces";
-            instance->last_success_unix_ms = unix_milliseconds();
+            instance->runtime.activate_prepared();
+            configure_audio(instance, *instance->runtime.active_build());
             publish_diagnostics(instance, "render", "info", {}, -1,
                 "active generation ready");
             notify_presentation(instance);
         }
         else
         {
-            instance->pending_build.reset();
-            instance->status = format_failure(desired_generation,
-                instance->active_generation, {}, -1, error);
-            log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
+            instance->runtime.reject_prepared(error);
+            log(instance, DRAXUL_PLUGIN_LOG_ERROR,
+                instance->runtime.status());
             publish_diagnostics(instance, "prepare", "error", {}, -1,
                 error);
             notify_presentation(instance);
@@ -3457,25 +3458,21 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
 
     const VkRenderPass render_pass = reinterpret_cast<VkRenderPass>(
         static_cast<uintptr_t>(frame->continuation_render_pass));
-    const ShaderBuild* desired = nullptr;
-    if (instance->pending_build)
-        desired = &*instance->pending_build;
-    else if (instance->active_build
-        && (!instance->backend.active
-            || instance->backend.active->target_generation
-                != frame->target_generation
-            || instance->backend.active->render_pass != render_pass
-            || instance->backend.active->width
-                != static_cast<uint32_t>(frame->viewport.width)
-            || instance->backend.active->height
-                != static_cast<uint32_t>(frame->viewport.height)))
-        desired = &*instance->active_build;
+    const bool active_backend_compatible = instance->backend.active
+        && instance->backend.active->target_generation
+            == frame->target_generation
+        && instance->backend.active->render_pass == render_pass
+        && instance->backend.active->width
+            == static_cast<uint32_t>(frame->viewport.width)
+        && instance->backend.active->height
+            == static_cast<uint32_t>(frame->viewport.height);
+    const ShaderBuild* desired
+        = instance->runtime.desired(active_backend_compatible);
     if (desired)
     {
         ensure_camera(instance, *desired);
         static thread_local std::string error;
         error.clear();
-        const uint64_t desired_generation = desired->generation;
         auto candidate = create_generation(
             instance->backend, *desired, *frame,
             animation_seconds, instance->camera, error);
@@ -3488,25 +3485,17 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
                 instance->backend.retired.push_back({ std::move(*instance->backend.active), used });
             }
             instance->backend.active = std::move(*candidate);
-            instance->active_build = *desired;
-            configure_audio(instance, *instance->active_build);
-            instance->active_generation = desired_generation;
-            instance->pending_build.reset();
-            instance->status = "live g"
-                + std::to_string(instance->active_generation) + " | "
-                + std::to_string(desired->passes.size()) + " passes | "
-                + std::to_string(desired->surfaces.size()) + " surfaces";
-            instance->last_success_unix_ms = unix_milliseconds();
+            instance->runtime.activate_prepared();
+            configure_audio(instance, *instance->runtime.active_build());
             publish_diagnostics(instance, "render", "info", {}, -1,
                 "active generation ready");
             notify_presentation(instance);
         }
         else
         {
-            instance->pending_build.reset();
-            instance->status = format_failure(desired_generation,
-                instance->active_generation, {}, -1, error);
-            log(instance, DRAXUL_PLUGIN_LOG_ERROR, instance->status);
+            instance->runtime.reject_prepared(error);
+            log(instance, DRAXUL_PLUGIN_LOG_ERROR,
+                instance->runtime.status());
             publish_diagnostics(instance, "prepare", "error", {}, -1,
                 error);
             notify_presentation(instance);
@@ -3682,7 +3671,7 @@ int32_t get_presentation_state(void* opaque,
         return 0;
     instance->presentation_status
         = instance->options.project_path.filename().string()
-        + " | " + instance->status;
+        + " | " + instance->runtime.status();
     if (!instance->audio_status.empty())
         instance->presentation_status += " | " + instance->audio_status;
     if (instance->paused)
@@ -3713,8 +3702,7 @@ int32_t dispatch_action(void* opaque, const char* action,
     if (!instance || !action || instance->quiesced
         || std::string_view(action, action_length) != "rezonality_reload")
         return 0;
-    instance->status = "building g"
-        + std::to_string(instance->attempted_generation + 1);
+    instance->runtime.begin_reload();
     instance->project->force_reload();
     notify_presentation(instance);
     return 1;

@@ -93,6 +93,18 @@ device. Manual live-audio checks use `"audio_source":"input"`. Rezonality
 shares live capture per exact recording-device selection and pauses/clears it
 when all subscribers are hidden.
 
+`src/audio_types.h` is the value-only boundary for `AudioOptions` and
+`AudioTextureFrame`. It must stay free of SDL, platform permission, renderer,
+and App headers so the project scheduler and focused audio lifecycle tests can
+consume it without native rendering.
+
+`draxul-rezonality-project` owns CPU parsing, assets, compiler execution, and
+the live watcher. `draxul-rezonality-audio` owns capture, permission, sharing,
+and DSP. `draxul-rezonality-runtime` owns pending/active candidates and the
+activation outcome; Metal and Vulkan only decide compatibility and prepare,
+record, and retire native generations. Keep native handles out of all three
+product-internal interfaces.
+
 ## Live-edit and failure-recovery checks
 
 Exercise live editing against a copied fixture, never by destructively editing
@@ -161,4 +173,3 @@ Put a terminal/editor beside the view, save a valid change, break it, and
 repair it. Resize the split throughout. Confirm the image remains pane-local,
 the terminal stays responsive, hidden tabs stop scheduling frames, and orbit,
 wheel dolly, pause, and reload affect only the intended instance.
-

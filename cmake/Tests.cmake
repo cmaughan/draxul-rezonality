@@ -1,16 +1,7 @@
 set(_rezonality_root "${CMAKE_CURRENT_LIST_DIR}/..")
-file(GLOB _rezonality_test_sources CONFIGURE_DEPENDS
-    "${_rezonality_root}/tests/rezonality_*_tests.cpp")
-
 draxul_add_test_target(
     draxul-test-rezonality rezonality 1
-    ${_rezonality_test_sources}
-    "${_rezonality_root}/src/audio_analysis.cpp"
-    "${_rezonality_root}/src/camera.cpp"
-    "${_rezonality_root}/src/diagnostics.cpp"
-    "${_rezonality_root}/src/image_loader.cpp"
-    "${_rezonality_root}/src/live_project.cpp"
-    "${_rezonality_root}/src/model_loader.cpp"
+    "${_rezonality_root}/tests/rezonality_plugin_contract_tests.cpp"
     "${_rezonality_root}/src/rezonality_plugin.cpp")
 if(APPLE)
     # The shared plugin entry point contains Metal and Foundation syntax, so
@@ -18,18 +9,13 @@ if(APPLE)
     set_source_files_properties(
         "${_rezonality_root}/src/rezonality_plugin.cpp"
         PROPERTIES LANGUAGE OBJCXX)
-    target_sources(draxul-test-rezonality PRIVATE
-        "${_rezonality_root}/src/mic_permission.mm")
-else()
-    target_sources(draxul-test-rezonality PRIVATE
-        "${_rezonality_root}/src/mic_permission_stub.cpp")
 endif()
 target_link_libraries(draxul-test-rezonality PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
-    assimp::assimp
-    glm::glm
-    nlohmann_json::nlohmann_json
+    draxul-rezonality-project
+    draxul-rezonality-runtime
+    draxul-rezonality-audio
     ${CMAKE_DL_LIBS})
 target_compile_definitions(draxul-test-rezonality PRIVATE
     GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -62,15 +48,10 @@ if(REZONALITY_NVIM_EXECUTABLE)
         TIMEOUT 30)
 endif()
 add_dependencies(draxul-test-rezonality draxul)
-target_include_directories(draxul-test-rezonality PRIVATE
-    "${_rezonality_root}/src"
-    ${stb_SOURCE_DIR})
 if(APPLE)
     # Unlike the product module, this test is an executable and therefore owns
     # the SDL implementation that its audio-analysis cases call.
     target_link_libraries(draxul-test-rezonality PRIVATE SDL3::SDL3)
-    set_source_files_properties("${_rezonality_root}/src/mic_permission.mm"
-        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(draxul-test-rezonality PRIVATE
         spirv-cross-msl
         "-framework Metal"
@@ -82,4 +63,32 @@ else()
         Vulkan::Vulkan
         Draxul::PluginSupport::VulkanResources
         GPUOpen::VulkanMemoryAllocator)
+endif()
+
+draxul_add_test_target(
+    draxul-test-rezonality-project rezonality 1
+    "${_rezonality_root}/tests/rezonality_project_tests.cpp")
+target_link_libraries(draxul-test-rezonality-project PRIVATE
+    draxul-rezonality-project
+    Draxul::PluginSupport::Types)
+target_compile_definitions(draxul-test-rezonality-project PRIVATE
+    "DRAXUL_REZONALITY_TEST_ROOT=\"${_rezonality_root}\"")
+
+draxul_add_test_target(
+    draxul-test-rezonality-runtime rezonality 1
+    "${_rezonality_root}/tests/rezonality_runtime_tests.cpp")
+target_link_libraries(draxul-test-rezonality-runtime PRIVATE
+    draxul-rezonality-runtime
+    Draxul::PluginSupport::Types)
+
+draxul_add_test_target(
+    draxul-test-rezonality-audio rezonality 1
+    "${_rezonality_root}/tests/rezonality_audio_tests.cpp")
+target_link_libraries(draxul-test-rezonality-audio PRIVATE
+    draxul-rezonality-audio
+    Draxul::PluginSupport::Types)
+if(APPLE)
+    # Product modules resolve SDL from the host. The focused executable owns
+    # the implementation for the audio capture code it links statically.
+    target_link_libraries(draxul-test-rezonality-audio PRIVATE SDL3::SDL3)
 endif()

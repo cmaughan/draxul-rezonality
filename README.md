@@ -176,6 +176,17 @@ Vulkan/Metal scene renderers, examples, diagnostics, tests, and file watching.
 Draxul owns the window, pane layout, input routing, swapchain/drawable, command
 submission, presentation, plugin discovery, and command palette.
 
+Within the product, the worker turns project files into an immutable
+`ShaderBuild`; the render callback prepares a backend generation and only then
+activates it. A rejected parser, compiler, filesystem, image-storage, or GPU
+candidate leaves the active generation intact. `audio_types.h` contains the
+SDL-free audio option and frame values shared by the project and runtime paths;
+capture, permission, and device operations remain private to `AudioAnalyzer`.
+The product-private `draxul-rezonality-project`,
+`draxul-rezonality-runtime`, and `draxul-rezonality-audio` libraries give the
+CPU pipeline, activation policy, and capture implementation one owner each and
+allow their focused tests to run without the native renderer or application.
+
 There is deliberately no embedded source editor, project menu, node-graph
 panel, standalone SDL window, or ImGui application shell in this port.
 
@@ -204,4 +215,3 @@ it renders every registered Rezonality scenario—default, waves, deferred,
 disc, robot, ray, and audio—and compares them with checked-in references. These checks are opt-in:
 core-only tests do not run them, and Draxul does not register the render cases
 when the Rezonality submodule/target is absent.
-

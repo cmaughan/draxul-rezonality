@@ -1,6 +1,6 @@
 #pragma once
 
-#include "audio_analysis.h"
+#include "audio_types.h"
 #include "camera.h"
 #include "diagnostics.h"
 #include "model_loader.h"
@@ -45,6 +45,7 @@ struct ShaderBuild
         std::string name;
         std::filesystem::path path;
         SurfaceFormat format = SurfaceFormat::Color8;
+        bool format_explicit = false;
         float scale_x = 1.0f;
         float scale_y = 1.0f;
         float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -104,6 +105,32 @@ struct BuildResult
     std::vector<DiagnosticEntry> diagnostics;
 };
 
+// Synchronous, CPU-only project construction seam. The live watcher owns one
+// pipeline and only schedules/publishes its immutable results.
+class ProjectPipeline
+{
+public:
+    using CompileShader = std::function<bool(
+        const std::filesystem::path& shader,
+        std::vector<uint32_t>& spirv,
+        std::vector<DiagnosticEntry>& diagnostics)>;
+
+    ProjectPipeline(std::filesystem::path plugin_directory,
+        ProjectOptions options, CompileShader compile_shader = {});
+
+    [[nodiscard]] BuildResult build(uint64_t generation) const;
+    [[nodiscard]] uint64_t fingerprint() const;
+    [[nodiscard]] const ProjectOptions& options() const
+    {
+        return options_;
+    }
+
+private:
+    std::filesystem::path plugin_directory_;
+    ProjectOptions options_;
+    CompileShader compile_shader_;
+};
+
 class LiveProject
 {
 public:
@@ -123,16 +150,13 @@ public:
 
     const ProjectOptions& options() const
     {
-        return options_;
+        return pipeline_.options();
     }
 
 private:
     void run(std::stop_token stop_token);
-    BuildResult build(uint64_t generation) const;
-    uint64_t project_fingerprint() const;
 
-    std::filesystem::path plugin_directory_;
-    ProjectOptions options_;
+    ProjectPipeline pipeline_;
     WakeCallback wake_;
     std::jthread worker_;
     mutable std::mutex mutex_;

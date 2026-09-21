@@ -27,10 +27,81 @@ constexpr size_t kMaximumDiagnostics = 128;
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
 
+std::string valid_utf8(std::string_view value)
+{
+    std::string result;
+    result.reserve(value.size());
+    for (size_t index = 0; index < value.size();)
+    {
+        const auto lead = static_cast<unsigned char>(value[index]);
+        size_t width = 1;
+        uint32_t codepoint = 0;
+        if (lead < 0x80)
+            codepoint = lead;
+        else if (lead >= 0xc2 && lead <= 0xdf)
+        {
+            width = 2;
+            codepoint = lead & 0x1f;
+        }
+        else if (lead >= 0xe0 && lead <= 0xef)
+        {
+            width = 3;
+            codepoint = lead & 0x0f;
+        }
+        else if (lead >= 0xf0 && lead <= 0xf4)
+        {
+            width = 4;
+            codepoint = lead & 0x07;
+        }
+        else
+        {
+            result += "\xEF\xBF\xBD";
+            ++index;
+            continue;
+        }
+        if (index + width > value.size())
+        {
+            result += "\xEF\xBF\xBD";
+            ++index;
+            continue;
+        }
+        bool continuation = true;
+        for (size_t offset = 1; offset < width; ++offset)
+        {
+            const auto next = static_cast<unsigned char>(value[index + offset]);
+            if ((next & 0xc0) != 0x80)
+            {
+                continuation = false;
+                break;
+            }
+            codepoint = (codepoint << 6) | (next & 0x3f);
+        }
+        const bool overlong = (width == 2 && codepoint < 0x80)
+            || (width == 3 && codepoint < 0x800)
+            || (width == 4 && codepoint < 0x10000);
+        if (!continuation || overlong || (codepoint >= 0xd800 && codepoint <= 0xdfff)
+            || codepoint > 0x10ffff)
+        {
+            result += "\xEF\xBF\xBD";
+            ++index;
+            continue;
+        }
+        result.append(value, index, width);
+        index += width;
+    }
+    return result;
+}
+
 std::string bounded(std::string value, size_t maximum)
 {
-    if (value.size() > maximum)
-        value.resize(maximum);
+    value = valid_utf8(value);
+    if (value.size() <= maximum)
+        return value;
+    size_t length = maximum;
+    while (length > 0
+        && (static_cast<unsigned char>(value[length]) & 0xc0) == 0x80)
+        --length;
+    value.resize(length);
     return value;
 }
 
@@ -124,6 +195,8 @@ bool DiagnosticsPublisher::publish(
 {
     if (path_.empty())
         return true;
+    try
+    {
     nlohmann::json entries = nlohmann::json::array();
     const size_t entry_count = std::min(
         state.diagnostics.size(), kMaximumDiagnostics);
@@ -189,6 +262,18 @@ bool DiagnosticsPublisher::publish(
     std::error_code cleanup_error;
     std::filesystem::remove(temporary, cleanup_error);
     return false;
+    }
+    catch (const std::exception& exception)
+    {
+        error = std::string("could not publish diagnostics: ")
+            + exception.what();
+        return false;
+    }
+    catch (...)
+    {
+        error = "could not publish diagnostics: unknown serialization error";
+        return false;
+    }
 }
 
 bool DiagnosticsPublisher::remove(std::string& error) const

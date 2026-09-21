@@ -5,11 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #if defined(_WIN32)
@@ -359,6 +363,21 @@ std::vector<std::string> parse_list(
     return values;
 }
 
+float checked_float(std::string_view text, std::string_view field)
+{
+    std::string owned(text);
+    char* end = nullptr;
+    errno = 0;
+    const float value = std::strtof(owned.c_str(), &end);
+    if (end != owned.data() + owned.size() || errno == ERANGE
+        || !std::isfinite(value))
+    {
+        throw std::runtime_error("invalid finite number for '"
+            + std::string(field) + "': " + owned);
+    }
+    return value;
+}
+
 void parse_vec4(const std::string& body, std::string_view key,
     float (&value)[4], bool* found = nullptr)
 {
@@ -372,7 +391,7 @@ void parse_vec4(const std::string& body, std::string_view key,
         return;
     }
     for (size_t index = 0; index < 4; ++index)
-        value[index] = std::stof(match[index + 1].str());
+        value[index] = checked_float(match[index + 1].str(), key);
     if (found)
         *found = true;
 }
@@ -385,8 +404,9 @@ bool parse_vec3(const std::string& body, std::string_view key,
     std::smatch match;
     if (!std::regex_search(body, match, expression))
         return false;
-    value = { std::stof(match[1].str()), std::stof(match[2].str()),
-        std::stof(match[3].str()) };
+    value = { checked_float(match[1].str(), key),
+        checked_float(match[2].str(), key),
+        checked_float(match[3].str(), key) };
     return true;
 }
 
@@ -398,7 +418,8 @@ bool parse_vec2(const std::string& body, std::string_view key,
     std::smatch match;
     if (!std::regex_search(body, match, expression))
         return false;
-    value = { std::stof(match[1].str()), std::stof(match[2].str()) };
+    value = { checked_float(match[1].str(), key),
+        checked_float(match[2].str(), key) };
     return true;
 }
 
@@ -410,7 +431,7 @@ bool parse_scalar(const std::string& body, std::string_view key,
     const auto matched = first_match(body, expression);
     if (!matched)
         return false;
-    value = std::stof(*matched);
+    value = checked_float(*matched, key);
     return true;
 }
 
@@ -553,6 +574,7 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         if (const auto format = first_match(body,
                 std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))")))
         {
+            surface.format_explicit = true;
             if (*format == "rgba16f")
                 surface.format = ShaderBuild::SurfaceFormat::Color16Float;
             else if (*format == "rgba32f")
@@ -565,8 +587,8 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         std::smatch scale;
         if (std::regex_search(body, scale, scale_expression))
         {
-            surface.scale_x = std::stof(scale[1].str());
-            surface.scale_y = std::stof(scale[2].str());
+            surface.scale_x = checked_float(scale[1].str(), "scale");
+            surface.scale_y = checked_float(scale[2].str(), "scale");
         }
         parse_vec4(body, "clear", surface.clear);
         description.surfaces.push_back(std::move(surface));
@@ -1000,10 +1022,17 @@ std::optional<ProjectOptions> parse_project_options(
     return options;
 }
 
-LiveProject::LiveProject(fs::path plugin_directory,
-    ProjectOptions options, WakeCallback wake)
+ProjectPipeline::ProjectPipeline(fs::path plugin_directory,
+    ProjectOptions options, CompileShader compile_shader)
     : plugin_directory_(std::move(plugin_directory))
     , options_(std::move(options))
+    , compile_shader_(std::move(compile_shader))
+{
+}
+
+LiveProject::LiveProject(fs::path plugin_directory,
+    ProjectOptions options, WakeCallback wake)
+    : pipeline_(std::move(plugin_directory), std::move(options))
     , wake_(std::move(wake))
 {
 }
@@ -1045,16 +1074,24 @@ std::optional<BuildResult> LiveProject::take_result()
     return result;
 }
 
-uint64_t LiveProject::project_fingerprint() const
+uint64_t ProjectPipeline::fingerprint() const
 {
     uint64_t hash = kFnvOffset;
     std::error_code ec;
     fs::recursive_directory_iterator iterator(options_.project_path,
         fs::directory_options::skip_permission_denied, ec);
+    if (ec)
+        throw std::runtime_error("could not scan Rezonality project: "
+            + ec.message());
     std::vector<fs::path> files;
-    for (const auto& entry : iterator)
+    for (; iterator != fs::recursive_directory_iterator(); iterator.increment(ec))
     {
-        if (entry.is_regular_file(ec))
+        if (ec)
+            throw std::runtime_error("could not scan Rezonality project: "
+                + ec.message());
+        const auto& entry = *iterator;
+        std::error_code entry_error;
+        if (entry.is_regular_file(entry_error))
         {
             const auto extension = entry.path().extension().string();
             if (extension == ".toml" || extension == ".scenegraph"
@@ -1069,7 +1106,13 @@ uint64_t LiveProject::project_fingerprint() const
                 || extension == ".mtl" || extension == ".bin")
                 files.push_back(entry.path());
         }
+        else if (entry_error)
+            throw std::runtime_error("could not inspect Rezonality project file: "
+                + entry_error.message());
     }
+    if (ec)
+        throw std::runtime_error("could not scan Rezonality project: "
+            + ec.message());
     std::sort(files.begin(), files.end());
     for (const auto& file : files)
     {
@@ -1080,10 +1123,12 @@ uint64_t LiveProject::project_fingerprint() const
     return hash;
 }
 
-BuildResult LiveProject::build(uint64_t generation) const
+BuildResult ProjectPipeline::build(uint64_t generation) const
 {
     BuildResult result;
     result.generation = generation;
+    try
+    {
     int line = -1;
     fs::path diagnostic;
     std::string error;
@@ -1097,7 +1142,8 @@ BuildResult LiveProject::build(uint64_t generation) const
     }
 
     const fs::path compiler = compiler_path(plugin_directory_);
-    if (!fs::is_regular_file(compiler))
+    std::error_code compiler_error;
+    if (!fs::is_regular_file(compiler, compiler_error))
     {
         result.diagnostic_path = compiler;
         result.error = "Bundled glslangValidator is missing";
@@ -1123,6 +1169,31 @@ BuildResult LiveProject::build(uint64_t generation) const
     candidate.models = std::move(scene->models);
     candidate.passes = scene->passes;
     bool shader_compile_failed = false;
+    const auto compile = [this, &compiler, &result](
+                             const fs::path& shader,
+                             const fs::path& output,
+                             std::vector<uint32_t>& spirv) {
+        if (!compile_shader_)
+        {
+            return compile_shader(compiler, options_.project_path,
+                shader, output, spirv, result.diagnostics);
+        }
+        if (!compile_shader_(shader, spirv, result.diagnostics))
+            return false;
+        if (!spirv.empty())
+            return true;
+        if (result.diagnostics.size() < kMaximumBuildDiagnostics)
+        {
+            result.diagnostics.push_back({
+                .path = shader,
+                .stage = "compile",
+                .severity = "error",
+                .message = "injected compiler produced no SPIR-V for "
+                    + shader.filename().string(),
+            });
+        }
+        return false;
+    };
     for (auto& surface : candidate.surfaces)
     {
         if (surface.path.empty())
@@ -1139,8 +1210,18 @@ BuildResult LiveProject::build(uint64_t generation) const
             result.diagnostic_path = surface.path;
             return result;
         }
-        if (hdr)
-            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+        const auto storage_format = hdr
+            ? ShaderBuild::SurfaceFormat::Color32Float
+            : ShaderBuild::SurfaceFormat::Color8;
+        if (surface.format_explicit && surface.format != storage_format)
+        {
+            result.diagnostic_path = surface.path;
+            result.error = "Image surface '" + surface.name
+                + "' has a format that is incompatible with decoded "
+                  "pixel storage";
+            return result;
+        }
+        surface.format = storage_format;
     }
     for (size_t index = 0; index < candidate.passes.size(); ++index)
     {
@@ -1155,15 +1236,12 @@ BuildResult LiveProject::build(uint64_t generation) const
                 = output_directory / ("miss-" + stem + ".spv");
             const fs::path closest_output
                 = output_directory / ("closest-" + stem + ".spv");
-            const bool raygen_ok = compile_shader(compiler,
-                options_.project_path, pass.raygen_path, raygen_output,
-                pass.raygen_spirv, result.diagnostics);
-            const bool miss_ok = compile_shader(compiler,
-                options_.project_path, pass.miss_path, miss_output,
-                pass.miss_spirv, result.diagnostics);
-            const bool closest_ok = compile_shader(compiler,
-                options_.project_path, pass.closest_hit_path, closest_output,
-                pass.closest_hit_spirv, result.diagnostics);
+            const bool raygen_ok = compile(pass.raygen_path,
+                raygen_output, pass.raygen_spirv);
+            const bool miss_ok = compile(pass.miss_path,
+                miss_output, pass.miss_spirv);
+            const bool closest_ok = compile(pass.closest_hit_path,
+                closest_output, pass.closest_hit_spirv);
             if (!raygen_ok || !miss_ok || !closest_ok)
             {
                 shader_compile_failed = true;
@@ -1189,12 +1267,10 @@ BuildResult LiveProject::build(uint64_t generation) const
             = output_directory / ("vertex-" + stem + ".spv");
         const fs::path fragment_output
             = output_directory / ("fragment-" + stem + ".spv");
-        const bool vertex_ok = compile_shader(compiler,
-            options_.project_path, pass.vertex_path, vertex_output,
-            pass.vertex_spirv, result.diagnostics);
-        const bool fragment_ok = compile_shader(compiler,
-            options_.project_path, pass.fragment_path, fragment_output,
-            pass.fragment_spirv, result.diagnostics);
+        const bool vertex_ok = compile(pass.vertex_path,
+            vertex_output, pass.vertex_spirv);
+        const bool fragment_ok = compile(pass.fragment_path,
+            fragment_output, pass.fragment_spirv);
         if (!vertex_ok || !fragment_ok)
         {
             shader_compile_failed = true;
@@ -1212,15 +1288,40 @@ BuildResult LiveProject::build(uint64_t generation) const
     }
     result.build = std::move(candidate);
     return result;
+    }
+    catch (const std::exception& exception)
+    {
+        result.diagnostic_path = options_.project_path / options_.scenegraph;
+        result.error = std::string("Rezonality project build failed: ")
+            + exception.what();
+        return result;
+    }
+    catch (...)
+    {
+        result.diagnostic_path = options_.project_path / options_.scenegraph;
+        result.error = "Rezonality project build failed with an unknown error";
+        return result;
+    }
 }
 
 void LiveProject::run(std::stop_token stop_token)
 {
+    const ProjectOptions& options = pipeline_.options();
     uint64_t generation = 0;
-    uint64_t observed_fingerprint = project_fingerprint();
+    uint64_t observed_fingerprint = 0;
+    std::string last_watch_error;
+    try
+    {
+        observed_fingerprint = pipeline_.fingerprint();
+    }
+    catch (const std::exception&)
+    {
+        // The watch loop publishes the next fingerprint failure as a normal
+        // build result and keeps polling for a repaired project directory.
+    }
     bool dirty = true;
     auto dirty_since = std::chrono::steady_clock::now()
-        - std::chrono::milliseconds(options_.compile_debounce_ms);
+        - std::chrono::milliseconds(options.compile_debounce_ms);
 
     while (!stop_token.stop_requested())
     {
@@ -1232,9 +1333,9 @@ void LiveProject::run(std::stop_token stop_token)
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (forced || (dirty && now - dirty_since >= std::chrono::milliseconds(options_.compile_debounce_ms)))
+        if (forced || (dirty && now - dirty_since >= std::chrono::milliseconds(options.compile_debounce_ms)))
         {
-            BuildResult next = build(++generation);
+            BuildResult next = pipeline_.build(++generation);
             {
                 std::lock_guard lock(mutex_);
                 result_ = std::move(next);
@@ -1251,9 +1352,33 @@ void LiveProject::run(std::stop_token stop_token)
         lock.unlock();
         if (stop_token.stop_requested())
             break;
-        if (options_.auto_reload)
+        if (options.auto_reload)
         {
-            const uint64_t fingerprint = project_fingerprint();
+            uint64_t fingerprint = observed_fingerprint;
+            try
+            {
+                fingerprint = pipeline_.fingerprint();
+            }
+            catch (const std::exception& exception)
+            {
+                const std::string watch_error = exception.what();
+                if (watch_error == last_watch_error)
+                    continue;
+                last_watch_error = watch_error;
+                BuildResult failed;
+                failed.generation = ++generation;
+                failed.diagnostic_path = options.project_path;
+                failed.error = std::string("Rezonality project watch failed: ")
+                    + watch_error;
+                {
+                    std::lock_guard result_lock(mutex_);
+                    result_ = std::move(failed);
+                }
+                if (wake_ && !stop_token.stop_requested())
+                    wake_();
+                continue;
+            }
+            last_watch_error.clear();
             if (fingerprint != observed_fingerprint)
             {
                 observed_fingerprint = fingerprint;

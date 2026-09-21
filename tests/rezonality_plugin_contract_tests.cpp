@@ -4,6 +4,7 @@
 
 #include "audio_analysis.h"
 #include "camera.h"
+#include "diagnostics.h"
 #include "image_loader.h"
 #include "model_loader.h"
 
@@ -196,6 +197,44 @@ private:
 
 } // namespace
 
+TEST_CASE("Rezonality diagnostics publish bounded valid UTF-8",
+    "[rezonality][diagnostics]")
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path()
+        / "draxul-rezonality-diagnostic-utf8";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    REQUIRE(fs::create_directories(root));
+
+    rezonality::DiagnosticsPublisher publisher(root,
+        fs::path("project"), "utf8-contract");
+    rezonality::DiagnosticState state;
+    state.project_path = "project";
+    state.scenegraph_path = "project/default.scenegraph";
+    state.stage = "compile";
+    state.severity = "error";
+    state.message = std::string(16u * 1024u - 1u, 'a') + "\xC3\xA9";
+    state.diagnostics.push_back({
+        .path = state.scenegraph_path,
+        .stage = "compile",
+        .severity = "error",
+        .message = "compiler\xFFoutput",
+    });
+
+    std::string error;
+    REQUIRE(publisher.publish(state, error));
+    const auto document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>()
+        == std::string(16u * 1024u - 1u, 'a'));
+    CHECK(document["diagnostics"][0]["message"].get<std::string>()
+        == "compiler\xEF\xBF\xBDoutput");
+
+    REQUIRE(publisher.remove(error));
+    fs::remove_all(root, ec);
+    CHECK_FALSE(ec);
+}
+
 TEST_CASE("Rezonality Metal model passes test and write depth",
     "[rezonality][metal][depth]")
 {
@@ -345,39 +384,6 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     api->destroy_instance(instance);
 }
 
-TEST_CASE("Rezonality synthetic audio produces a stable stereo analysis texture",
-    "[rezonality][audio]")
-{
-    rezonality::AudioOptions options;
-    options.source = rezonality::AudioOptions::Source::Synthetic;
-    rezonality::AudioAnalyzer analyzer(options);
-
-    const auto first = analyzer.frame();
-    const auto second = analyzer.frame();
-    REQUIRE(first.rgba.size()
-        == rezonality::AudioTextureFrame::width
-            * rezonality::AudioTextureFrame::height * 4);
-    CHECK(first.generation == 1);
-    CHECK(first.status == "audio synthetic fixture");
-    CHECK(first.rgba == second.rgba);
-    CHECK(std::any_of(first.rgba.begin(), first.rgba.end(),
-        [](float value) { return value > 0.1f && value < 0.99f; }));
-
-    analyzer.set_visible(false);
-    CHECK(analyzer.frame().rgba == first.rgba);
-    analyzer.set_visible(true);
-    CHECK(analyzer.frame().rgba == first.rgba);
-
-    options.source = rezonality::AudioOptions::Source::Silent;
-    rezonality::AudioAnalyzer silent(options);
-    const auto fallback = silent.frame();
-    CHECK(fallback.generation == 1);
-    CHECK(fallback.status.find("audio unavailable") != std::string::npos);
-    CHECK(fallback.rgba.size() == first.rgba.size());
-    CHECK(std::all_of(fallback.rgba.begin(), fallback.rgba.end(),
-        [](float value) { return value == 0.0f || value == 1.0f; }));
-}
-
 TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
     "[rezonality][integration][reload]")
 {
@@ -447,12 +453,23 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
         "void main() { fragColor = vec4(1,0,0,1); }\n");
     REQUIRE(wait_for_status(*api, instance, presentation, "ready g2"));
 
+    const fs::path scenegraph = fixture / "default.scenegraph";
+    const std::string scene = read_text(scenegraph);
+    write_text(scenegraph, scene
+        + "\ncamera: Incomplete { field_of_view: - }\n");
+    REQUIRE(wait_for_status(*api, instance, presentation,
+        "BUILD FAILED g3"));
+    CHECK(presentation_status(instance, presentation).find(
+        "default.scenegraph") != std::string::npos);
+    write_text(scenegraph, scene);
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g4"));
+
     write_text(fixture / "screen.frag",
         "#version 450\n"
         "layout(location=0) out vec4 fragColor;\n"
         "void main() { fragColor = vec4(; }\n");
     REQUIRE(wait_for_status(*api, instance, presentation,
-        "BUILD FAILED g3"));
+        "BUILD FAILED g5"));
     const std::string failed_status = presentation_status(instance, presentation);
     CHECK(failed_status.find("screen.frag") != std::string::npos);
 
@@ -460,8 +477,8 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
         "#version 450\n"
         "layout(location=0) out vec4 fragColor;\n"
         "void main() { fragColor = vec4(0,0,1,1); }\n");
-    REQUIRE(wait_for_status(*api, instance, presentation, "ready g4"));
-    CHECK(host_state.ticks.load() >= 4);
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g6"));
+    CHECK(host_state.ticks.load() >= 6);
 
     api->set_visible(instance, 0);
     DraxulPluginTickInfoV2 tick_info{};
