@@ -119,6 +119,7 @@ endif()
 add_library(draxul-rezonality-audio STATIC
     src/audio_analysis.cpp
     src/audio_analysis.h
+    src/audio_capture.h
     src/audio_types.h
     src/mic_permission.h
     ${_rezonality_permission_source})

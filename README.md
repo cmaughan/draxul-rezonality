@@ -182,6 +182,10 @@ activates it. A rejected parser, compiler, filesystem, image-storage, or GPU
 candidate leaves the active generation intact. `audio_types.h` contains the
 SDL-free audio option and frame values shared by the project and runtime paths;
 capture, permission, and device operations remain private to `AudioAnalyzer`.
+An explicit product-private capture registry owns exact-device sharing; its
+injectable native operations let the focused audio suite exercise permission,
+open, visibility, backlog, cancellation, and cleanup behavior without a
+physical microphone or renderer.
 The product-private `draxul-rezonality-project`,
 `draxul-rezonality-runtime`, and `draxul-rezonality-audio` libraries give the
 CPU pipeline, activation policy, and capture implementation one owner each and
