@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -378,14 +379,37 @@ float checked_float(std::string_view text, std::string_view field)
     return value;
 }
 
+bool has_numeric_field(const std::string& body, std::string_view key)
+{
+    return std::regex_search(body,
+        std::regex("\\b" + std::string(key) + R"(\s*:)"));
+}
+
+const std::string& numeric_token_capture()
+{
+    static const std::string capture = R"(([^\s,\)\}]+))";
+    return capture;
+}
+
+[[noreturn]] void throw_invalid_numeric_field(std::string_view key)
+{
+    throw std::runtime_error("invalid numeric value for '"
+        + std::string(key) + "'");
+}
+
 void parse_vec4(const std::string& body, std::string_view key,
     float (&value)[4], bool* found = nullptr)
 {
+    const auto& number = numeric_token_capture();
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+        + R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*,\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*\))");
     std::smatch match;
     if (!std::regex_search(body, match, expression))
     {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         if (found)
             *found = false;
         return;
@@ -399,11 +423,17 @@ void parse_vec4(const std::string& body, std::string_view key,
 bool parse_vec3(const std::string& body, std::string_view key,
     glm::vec3& value)
 {
+    const auto& number = numeric_token_capture();
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+        + R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*,\s*)" + number + R"(\s*\))");
     std::smatch match;
     if (!std::regex_search(body, match, expression))
+    {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         return false;
+    }
     value = { checked_float(match[1].str(), key),
         checked_float(match[2].str(), key),
         checked_float(match[3].str(), key) };
@@ -413,11 +443,17 @@ bool parse_vec3(const std::string& body, std::string_view key,
 bool parse_vec2(const std::string& body, std::string_view key,
     glm::vec2& value)
 {
+    const auto& number = numeric_token_capture();
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+        + R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*\))");
     std::smatch match;
     if (!std::regex_search(body, match, expression))
+    {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         return false;
+    }
     value = { checked_float(match[1].str(), key),
         checked_float(match[2].str(), key) };
     return true;
@@ -427,12 +463,54 @@ bool parse_scalar(const std::string& body, std::string_view key,
     float& value)
 {
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*([-+.0-9]+))");
+        + R"(\s*:\s*)" + numeric_token_capture());
     const auto matched = first_match(body, expression);
     if (!matched)
+    {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         return false;
+    }
     value = checked_float(*matched, key);
     return true;
+}
+
+bool parse_surface_scale(const std::string& body, float& scale_x,
+    float& scale_y)
+{
+    const auto& number = numeric_token_capture();
+    const std::regex expression("\\bscale"
+        R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + "(?:\\s*,\\s*" + number + ")?"
+        + R"(\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+    {
+        if (has_numeric_field(body, "scale"))
+            throw_invalid_numeric_field("scale");
+        return false;
+    }
+    scale_x = checked_float(match[1].str(), "scale");
+    scale_y = checked_float(match[2].str(), "scale");
+    return true;
+}
+
+void parse_surface_format(const std::string& body,
+    ShaderBuild::Surface& surface)
+{
+    const auto format = first_match(body,
+        std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))"));
+    if (!format)
+        return;
+    surface.format_explicit = true;
+    if (*format == "rgba16f")
+        surface.format = ShaderBuild::SurfaceFormat::Color16Float;
+    else if (*format == "rgba32f")
+        surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+    else if (format->find("depth") != std::string::npos)
+        surface.format = ShaderBuild::SurfaceFormat::Depth32;
+    else
+        surface.format = ShaderBuild::SurfaceFormat::Color8;
 }
 
 bool parse_uv_origin(const std::string& body, std::string_view owner,
@@ -571,25 +649,8 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         if (const auto path = first_match(body,
                 std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
             surface.path = options.project_path / fs::u8path(*path);
-        if (const auto format = first_match(body,
-                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))")))
-        {
-            surface.format_explicit = true;
-            if (*format == "rgba16f")
-                surface.format = ShaderBuild::SurfaceFormat::Color16Float;
-            else if (*format == "rgba32f")
-                surface.format = ShaderBuild::SurfaceFormat::Color32Float;
-            else if (format->find("depth") != std::string::npos)
-                surface.format = ShaderBuild::SurfaceFormat::Depth32;
-        }
-        const std::regex scale_expression(
-            R"(\bscale\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+))");
-        std::smatch scale;
-        if (std::regex_search(body, scale, scale_expression))
-        {
-            surface.scale_x = checked_float(scale[1].str(), "scale");
-            surface.scale_y = checked_float(scale[2].str(), "scale");
-        }
+        parse_surface_format(body, surface);
+        parse_surface_scale(body, surface.scale_x, surface.scale_y);
         parse_vec4(body, "clear", surface.clear);
         description.surfaces.push_back(std::move(surface));
     }
@@ -600,10 +661,7 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         if (const auto path = first_match(body,
                 std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
             surface.path = options.project_path / fs::u8path(*path);
-        if (const auto format = first_match(body,
-                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))"));
-            format && *format == "rgba32f")
-            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+        parse_surface_format(body, surface);
         description.surfaces.push_back(std::move(surface));
     }
 
@@ -1030,9 +1088,41 @@ ProjectPipeline::ProjectPipeline(fs::path plugin_directory,
 {
 }
 
+bool validate_surface_upload_storage(
+    const ShaderBuild::Surface& surface, std::string& error)
+{
+    const bool byte_storage = !surface.image_pixels.empty();
+    const bool float_storage = !surface.image_float_pixels.empty();
+    if (!byte_storage && !float_storage)
+        return true;
+    if (surface.image_width == 0 || surface.image_height == 0
+        || byte_storage == float_storage
+        || surface.image_width > std::numeric_limits<size_t>::max()
+                / surface.image_height / 4)
+    {
+        error = "Rezonality image surface '" + surface.name
+            + "' has invalid upload storage";
+        return false;
+    }
+    const size_t expected = static_cast<size_t>(surface.image_width)
+        * surface.image_height * 4;
+    const bool valid = byte_storage
+        ? surface.format == ShaderBuild::SurfaceFormat::Color8
+            && surface.image_pixels.size() == expected
+        : surface.format == ShaderBuild::SurfaceFormat::Color32Float
+            && surface.image_float_pixels.size() == expected;
+    if (valid)
+        return true;
+    error = "Rezonality image surface '" + surface.name
+        + "' has invalid upload storage";
+    return false;
+}
+
 LiveProject::LiveProject(fs::path plugin_directory,
-    ProjectOptions options, WakeCallback wake)
-    : pipeline_(std::move(plugin_directory), std::move(options))
+    ProjectOptions options, WakeCallback wake,
+    ProjectPipeline::CompileShader compile_shader)
+    : pipeline_(std::move(plugin_directory), std::move(options),
+          std::move(compile_shader))
     , wake_(std::move(wake))
 {
 }
@@ -1378,8 +1468,11 @@ void LiveProject::run(std::stop_token stop_token)
                     wake_();
                 continue;
             }
+            const bool recovered_from_watch_error
+                = !last_watch_error.empty();
             last_watch_error.clear();
-            if (fingerprint != observed_fingerprint)
+            if (recovered_from_watch_error
+                || fingerprint != observed_fingerprint)
             {
                 observed_fingerprint = fingerprint;
                 dirty = true;

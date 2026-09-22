@@ -30,7 +30,6 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
-#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -60,38 +59,6 @@ constexpr const char* kPluginId = "dev.draxul.rezonality";
 constexpr const char* kPluginVersion = "0.7.0";
 constexpr size_t kCommonUniformFloatCount = 192;
 using CommonUniformBlock = std::array<float, kCommonUniformFloatCount>;
-
-bool valid_uploaded_surface(const ShaderBuild::Surface& source,
-    std::string& error)
-{
-    const bool byte_storage = !source.image_pixels.empty();
-    const bool float_storage = !source.image_float_pixels.empty();
-    if (!byte_storage && !float_storage)
-        return true;
-    if (source.image_width == 0 || source.image_height == 0
-        || byte_storage == float_storage
-        || source.image_width > std::numeric_limits<size_t>::max()
-                / source.image_height / 4)
-    {
-        error = "Rezonality image surface '" + source.name
-            + "' has invalid upload storage";
-        return false;
-    }
-    const size_t expected = static_cast<size_t>(source.image_width)
-        * source.image_height * 4;
-    const bool valid = byte_storage
-        ? source.format == ShaderBuild::SurfaceFormat::Color8
-            && source.image_pixels.size() == expected
-        : source.format == ShaderBuild::SurfaceFormat::Color32Float
-            && source.image_float_pixels.size() == expected;
-    if (!valid)
-    {
-        error = "Rezonality image surface '" + source.name
-            + "' has invalid upload storage";
-        return false;
-    }
-    return true;
-}
 
 size_t align_up(size_t value, size_t alignment)
 {
@@ -585,7 +552,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                                                   : std::max<NSUInteger>(1, static_cast<NSUInteger>(generation.height * std::max(0.01f, source.scale_y)));
         const bool has_image = !source.image_pixels.empty()
             || !source.image_float_pixels.empty();
-        if (has_image && !valid_uploaded_surface(source, error))
+        if (has_image
+            && !rezonality::validate_surface_upload_storage(source, error))
             return std::nullopt;
         texture.storageMode = !has_image
             ? MTLStorageModePrivate
@@ -1145,7 +1113,7 @@ bool create_surface(VulkanGeneration& generation,
     const ShaderBuild::Surface& source, uint32_t pane_width,
     uint32_t pane_height, std::string& error)
 {
-    if (!valid_uploaded_surface(source, error))
+    if (!rezonality::validate_surface_upload_storage(source, error))
         return false;
     VulkanSurfaceResource surface;
     surface.name = source.name;

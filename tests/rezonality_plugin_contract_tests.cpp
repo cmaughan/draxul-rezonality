@@ -214,7 +214,9 @@ TEST_CASE("Rezonality diagnostics publish bounded valid UTF-8",
     state.scenegraph_path = "project/default.scenegraph";
     state.stage = "compile";
     state.severity = "error";
-    state.message = std::string(16u * 1024u - 1u, 'a') + "\xC3\xA9";
+    constexpr size_t maximum_message_bytes = 16u * 1024u;
+    state.message = std::string(maximum_message_bytes - 1u, 'a')
+        + "\xC3\xA9";
     state.diagnostics.push_back({
         .path = state.scenegraph_path,
         .stage = "compile",
@@ -224,11 +226,75 @@ TEST_CASE("Rezonality diagnostics publish bounded valid UTF-8",
 
     std::string error;
     REQUIRE(publisher.publish(state, error));
-    const auto document = read_json(publisher.path());
+    auto document = read_json(publisher.path());
     CHECK(document["message"].get<std::string>()
-        == std::string(16u * 1024u - 1u, 'a'));
+        == std::string(maximum_message_bytes - 1u, 'a'));
     CHECK(document["diagnostics"][0]["message"].get<std::string>()
         == "compiler\xEF\xBF\xBDoutput");
+
+    state.message = std::string(maximum_message_bytes - 2u, 'b')
+        + "\xE2\x82\xAC";
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>()
+        == std::string(maximum_message_bytes - 2u, 'b'));
+
+    state.message = std::string(maximum_message_bytes - 3u, 'c')
+        + "\xF0\x9F\x9A\x80";
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>()
+        == std::string(maximum_message_bytes - 3u, 'c'));
+
+    state.message = std::string(maximum_message_bytes - 2u, 'd')
+        + "\xC3\xA9";
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>() == state.message);
+
+    state.message = std::string("invalid ")
+        + std::string("\xF0\x28\x8C\x28", 4);
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>().find("\xEF\xBF\xBD")
+        != std::string::npos);
+    CHECK_NOTHROW(document.dump());
+
+    state.message = "recovered diagnostic";
+    state.diagnostics.clear();
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"] == "recovered diagnostic");
+    CHECK(document["diagnostics"].empty());
+
+    REQUIRE(publisher.remove(error));
+    fs::remove_all(root, ec);
+    CHECK_FALSE(ec);
+}
+
+TEST_CASE("Rezonality diagnostics recover after publication failure",
+    "[rezonality][diagnostics]")
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path()
+        / "draxul-rezonality-diagnostic-recovery";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    write_text(root, "blocks diagnostics directory creation");
+
+    rezonality::DiagnosticsPublisher publisher(root,
+        fs::path("project"), "recovery-contract");
+    rezonality::DiagnosticState state;
+    state.message = "still alive";
+    std::string error;
+    CHECK_FALSE(publisher.publish(state, error));
+    CHECK_FALSE(error.empty());
+
+    REQUIRE(fs::remove(root, ec));
+    REQUIRE_FALSE(ec);
+    error.clear();
+    REQUIRE(publisher.publish(state, error));
+    CHECK(read_json(publisher.path())["message"] == "still alive");
 
     REQUIRE(publisher.remove(error));
     fs::remove_all(root, ec);

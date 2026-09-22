@@ -95,6 +95,9 @@ struct ShaderBuild
     std::vector<Pass> passes;
 };
 
+[[nodiscard]] bool validate_surface_upload_storage(
+    const ShaderBuild::Surface& surface, std::string& error);
+
 struct BuildResult
 {
     uint64_t generation = 0;
@@ -137,7 +140,8 @@ public:
     using WakeCallback = std::function<void()>;
 
     LiveProject(std::filesystem::path plugin_directory,
-        ProjectOptions options, WakeCallback wake);
+        ProjectOptions options, WakeCallback wake,
+        ProjectPipeline::CompileShader compile_shader = {});
     ~LiveProject();
 
     LiveProject(const LiveProject&) = delete;
