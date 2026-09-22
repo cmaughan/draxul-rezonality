@@ -83,9 +83,44 @@ RuntimeTransition RuntimeController::reject_prepared(std::string_view error)
     return transition();
 }
 
+RuntimePrepareResult RuntimeController::prepare_frame(
+    RuntimeBackend& backend, uint32_t completed_frame_slot)
+{
+    backend.retire_completed_slot(completed_frame_slot);
+    const ShaderBuild* selected = desired(backend.active_compatible());
+    if (!selected)
+        return { .transition = transition() };
+
+    BackendPreparation prepared = backend.prepare(*selected);
+    if (!prepared.ready)
+    {
+        RuntimePrepareResult result;
+        result.disposition = RuntimePrepareDisposition::Rejected;
+        result.error = std::move(prepared.error);
+        result.transition = reject_prepared(result.error);
+        return result;
+    }
+
+    backend.activate_prepared();
+    return {
+        .disposition = RuntimePrepareDisposition::Activated,
+        .transition = activate_prepared(),
+    };
+}
+
 void RuntimeController::begin_reload()
 {
     status_ = "building g" + std::to_string(attempted_generation_ + 1);
+}
+
+void RuntimeController::set_visible(bool visible)
+{
+    visible_ = visible;
+}
+
+void RuntimeController::set_quiesced(bool quiesced)
+{
+    quiesced_ = quiesced;
 }
 
 const std::optional<ShaderBuild>& RuntimeController::active_build() const
@@ -111,6 +146,21 @@ uint64_t RuntimeController::last_success_unix_ms() const
 const std::string& RuntimeController::status() const
 {
     return status_;
+}
+
+bool RuntimeController::visible() const
+{
+    return visible_;
+}
+
+bool RuntimeController::quiesced() const
+{
+    return quiesced_;
+}
+
+bool RuntimeController::should_render() const
+{
+    return visible_ && !quiesced_;
 }
 
 std::string RuntimeController::failure_status(uint64_t attempted_generation,

@@ -110,9 +110,11 @@ target_link_libraries(draxul-rezonality-runtime PUBLIC glm::glm)
 
 if(APPLE)
     set(_rezonality_permission_source src/mic_permission.mm)
+    set(_rezonality_native_backend_source src/native_backend_metal.mm)
     set(DRAXUL_REZONALITY_SDL_TARGET SDL3::Headers)
 else()
     set(_rezonality_permission_source src/mic_permission_stub.cpp)
+    set(_rezonality_native_backend_source src/native_backend_vulkan.cpp)
     set(DRAXUL_REZONALITY_SDL_TARGET SDL3::SDL3)
 endif()
 
@@ -130,7 +132,11 @@ target_include_directories(draxul-rezonality-audio
 target_link_libraries(draxul-rezonality-audio PRIVATE
     ${DRAXUL_REZONALITY_SDL_TARGET})
 
-add_library(draxul-rezonality-plugin MODULE src/rezonality_plugin.cpp)
+add_library(draxul-rezonality-plugin MODULE
+    src/native_backend.h
+    src/native_backend_helpers.h
+    ${_rezonality_native_backend_source}
+    src/rezonality_plugin.cpp)
 target_link_libraries(draxul-rezonality-plugin PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
@@ -141,8 +147,6 @@ target_compile_definitions(draxul-rezonality-plugin PRIVATE
     GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_include_directories(draxul-rezonality-plugin PRIVATE ${stb_SOURCE_DIR})
 if(APPLE)
-    set_source_files_properties(src/rezonality_plugin.cpp
-        PROPERTIES LANGUAGE OBJCXX)
     set_source_files_properties(src/mic_permission.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     find_library(REZONALITY_AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)

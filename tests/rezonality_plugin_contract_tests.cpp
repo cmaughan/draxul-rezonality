@@ -407,7 +407,7 @@ TEST_CASE("Rezonality Metal model passes test and write depth",
     "[rezonality][metal][depth]")
 {
     const std::string source
-        = read_text(plugin_root() / "src" / "rezonality_plugin.cpp");
+        = read_text(plugin_root() / "src" / "native_backend_metal.mm");
     CHECK(source.find("depthCompareFunction = MTLCompareFunctionLessEqual")
         != std::string::npos);
     CHECK(source.find("depthWriteEnabled = YES") != std::string::npos);

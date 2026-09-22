@@ -192,6 +192,10 @@ The product-private `draxul-rezonality-project`,
 `draxul-rezonality-runtime`, and `draxul-rezonality-audio` libraries give the
 CPU pipeline, activation policy, and capture implementation one owner each and
 allow their focused tests to run without the native renderer or application.
+`rezonality_plugin.cpp` is the C ABI and controller adapter. CMake selects
+`native_backend_metal.mm` or `native_backend_vulkan.cpp`; the selected private
+backend owns generation preparation, command recording, and completed-frame
+retirement while the controller owns activation and failure policy.
 
 There is deliberately no embedded source editor, project menu, node-graph
 panel, standalone SDL window, or ImGui application shell in this port.

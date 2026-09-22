@@ -1,15 +1,16 @@
 set(_rezonality_root "${CMAKE_CURRENT_LIST_DIR}/..")
+if(APPLE)
+    set(_rezonality_test_native_backend_source
+        "${_rezonality_root}/src/native_backend_metal.mm")
+else()
+    set(_rezonality_test_native_backend_source
+        "${_rezonality_root}/src/native_backend_vulkan.cpp")
+endif()
 draxul_add_test_target(
     draxul-test-rezonality rezonality 1
     "${_rezonality_root}/tests/rezonality_plugin_contract_tests.cpp"
-    "${_rezonality_root}/src/rezonality_plugin.cpp")
-if(APPLE)
-    # The shared plugin entry point contains Metal and Foundation syntax, so
-    # compile it with the same Objective-C++ language used by the product.
-    set_source_files_properties(
-        "${_rezonality_root}/src/rezonality_plugin.cpp"
-        PROPERTIES LANGUAGE OBJCXX)
-endif()
+    "${_rezonality_root}/src/rezonality_plugin.cpp"
+    "${_rezonality_test_native_backend_source}")
 target_link_libraries(draxul-test-rezonality PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
