@@ -72,4 +72,13 @@ TEST_CASE("Rezonality runtime preserves last good state after failures",
     CHECK(runtime.desired(true) == nullptr);
     REQUIRE(runtime.active_build());
     CHECK(runtime.active_build()->generation == 4);
+
+    auto repaired = candidate(7, 2, 3);
+    CHECK(runtime.accept(repaired).status == "ready g7");
+    const auto activated_retry = runtime.activate_prepared();
+    CHECK(activated_retry.active_generation == 7);
+    CHECK(activated_retry.pass_count == 2);
+    CHECK(activated_retry.surface_count == 3);
+    REQUIRE(runtime.active_build());
+    CHECK(runtime.active_build()->generation == 7);
 }

@@ -5,20 +5,26 @@
 #include "audio_analysis.h"
 #include "camera.h"
 #include "diagnostics.h"
+#include "gpu_resource_transaction.h"
 #include "image_loader.h"
 #include "model_loader.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -28,6 +34,20 @@
 
 namespace
 {
+
+constexpr std::size_t gpu_stage_index(
+    rezonality::detail::GpuInitializationStage stage)
+{
+    return static_cast<std::size_t>(stage);
+}
+
+struct FakeGpuGeneration
+{
+    uint64_t generation = 0;
+    std::array<bool, gpu_stage_index(
+                         rezonality::detail::GpuInitializationStage::Count)>
+        resources{};
+};
 
 struct HostState
 {
@@ -196,6 +216,88 @@ private:
 };
 
 } // namespace
+
+TEST_CASE("Rezonality GPU initialization failures roll back and retry cleanly",
+    "[rezonality][gpu][rollback]")
+{
+    using Stage = rezonality::detail::GpuInitializationStage;
+    constexpr std::array stages{
+        Stage::VertexBuffer,
+        Stage::VertexMemory,
+        Stage::VertexMemoryBind,
+        Stage::VertexMemoryMap,
+        Stage::ModelTextureAttachment,
+        Stage::ModelTextureSampler,
+        Stage::ModelTextureUpload,
+    };
+    constexpr std::array failure_stages{
+        Stage::VertexMemory,
+        Stage::VertexMemoryBind,
+        Stage::VertexMemoryMap,
+        Stage::ModelTextureSampler,
+        Stage::ModelTextureUpload,
+    };
+
+    for (const Stage failure_stage : failure_stages)
+    {
+        CAPTURE(gpu_stage_index(failure_stage));
+        int live_resources = static_cast<int>(stages.size());
+        FakeGpuGeneration active;
+        active.generation = 4;
+        active.resources.fill(true);
+
+        const auto destroy = [&](FakeGpuGeneration& generation) {
+            for (bool& resource : generation.resources)
+            {
+                if (resource)
+                {
+                    resource = false;
+                    --live_resources;
+                }
+            }
+        };
+        const auto complete = [](const FakeGpuGeneration& generation) {
+            return std::ranges::all_of(
+                generation.resources, [](bool resource) { return resource; });
+        };
+        const auto attempt = [&](uint64_t candidate_generation,
+                                 std::optional<
+                                     rezonality::detail::GpuFailurePoint>
+                                     failure_point) {
+            return rezonality::detail::publish_gpu_resources_transactionally<
+                FakeGpuGeneration>(
+                [&](FakeGpuGeneration& candidate) {
+                    candidate.generation = candidate_generation;
+                    return rezonality::detail::initialize_gpu_resources(
+                        stages, failure_point, [&](Stage stage) {
+                            candidate.resources[gpu_stage_index(stage)] = true;
+                            ++live_resources;
+                            return true;
+                        });
+                },
+                complete,
+                destroy,
+                [&](FakeGpuGeneration&& candidate) {
+                    destroy(active);
+                    active = std::move(candidate);
+                });
+        };
+
+        REQUIRE_FALSE(attempt(
+            5, rezonality::detail::GpuFailurePoint{ failure_stage }));
+        CHECK(active.generation == 4);
+        CHECK(complete(active));
+        CHECK(live_resources == static_cast<int>(stages.size()));
+
+        REQUIRE(attempt(6, std::nullopt));
+        CHECK(active.generation == 6);
+        CHECK(complete(active));
+        CHECK(live_resources == static_cast<int>(stages.size()));
+
+        destroy(active);
+        CHECK(live_resources == 0);
+    }
+}
 
 TEST_CASE("Rezonality diagnostics publish bounded valid UTF-8",
     "[rezonality][diagnostics]")

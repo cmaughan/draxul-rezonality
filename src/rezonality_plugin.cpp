@@ -3,6 +3,7 @@
 #include "audio_analysis.h"
 #include "camera.h"
 #include "diagnostics.h"
+#include "gpu_resource_transaction.h"
 #include "model_loader.h"
 #include "runtime_controller.h"
 
@@ -886,6 +887,34 @@ struct BackendState
     std::vector<RetiredGeneration> retired;
 };
 
+struct VulkanVertexResources
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+};
+
+void destroy_vertex_resources(
+    VkDevice device, VulkanVertexResources& resources)
+{
+    if (resources.buffer)
+        vkDestroyBuffer(device, resources.buffer, nullptr);
+    if (resources.memory)
+        vkFreeMemory(device, resources.memory, nullptr);
+    resources = {};
+}
+
+void destroy_model_texture(
+    VulkanGeneration& generation, VulkanModelTextureResource& texture)
+{
+    draxul::vkresources::destroy_buffer(
+        generation.allocator, texture.upload_buffer);
+    if (texture.sampler)
+        vkDestroySampler(generation.device, texture.sampler, nullptr);
+    draxul::vkresources::destroy_attachment(
+        generation.device, generation.allocator, texture.attachment);
+    texture = {};
+}
+
 void destroy_generation(VulkanGeneration& generation)
 {
     for (auto& pass : generation.passes)
@@ -938,15 +967,7 @@ void destroy_generation(VulkanGeneration& generation)
                 generation.device, model.descriptor_layout, nullptr);
         for (auto& slots : model.textures)
             for (auto& texture : slots)
-            {
-                if (texture.sampler)
-                    vkDestroySampler(
-                        generation.device, texture.sampler, nullptr);
-                draxul::vkresources::destroy_attachment(generation.device,
-                    generation.allocator, texture.attachment);
-                draxul::vkresources::destroy_buffer(
-                    generation.allocator, texture.upload_buffer);
-            }
+                destroy_model_texture(generation, texture);
         draxul::vkresources::destroy_buffer(
             generation.allocator, model.vertex_buffer);
         draxul::vkresources::destroy_buffer(
@@ -1006,68 +1027,103 @@ bool ensure_vertex_buffer(BackendState& backend,
         return true;
     if (backend.device && backend.device != device)
         destroy_backend(backend);
-    VkBuffer vertex_buffer = VK_NULL_HANDLE;
-    VkDeviceMemory vertex_memory = VK_NULL_HANDLE;
-
-    VkBufferCreateInfo buffer_info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    buffer_info.size = sizeof(kScreenVertices);
-    buffer_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(device, &buffer_info, nullptr,
-            &vertex_buffer)
-        != VK_SUCCESS)
-    {
-        error = "Rezonality could not create its Vulkan screen rectangle";
-        return false;
-    }
+    constexpr std::array stages{
+        rezonality::detail::GpuInitializationStage::VertexBuffer,
+        rezonality::detail::GpuInitializationStage::VertexMemory,
+        rezonality::detail::GpuInitializationStage::VertexMemoryBind,
+        rezonality::detail::GpuInitializationStage::VertexMemoryMap,
+    };
     VkMemoryRequirements requirements{};
-    vkGetBufferMemoryRequirements(
-        device, vertex_buffer, &requirements);
-    const uint32_t memory_type = find_memory_type(physical,
-        requirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (memory_type == UINT32_MAX)
-    {
-        vkDestroyBuffer(device, vertex_buffer, nullptr);
-        error = "Rezonality could not find host-visible vertex memory";
-        return false;
-    }
-    VkMemoryAllocateInfo allocation{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = memory_type;
-    if (vkAllocateMemory(device, &allocation, nullptr, &vertex_memory)
-        != VK_SUCCESS)
-    {
-        vkDestroyBuffer(device, vertex_buffer, nullptr);
-        error = "Rezonality could not allocate vertex memory";
-        return false;
-    }
-    if (vkBindBufferMemory(device, vertex_buffer, vertex_memory, 0)
-        != VK_SUCCESS)
-    {
-        vkFreeMemory(device, vertex_memory, nullptr);
-        vkDestroyBuffer(device, vertex_buffer, nullptr);
-        error = "Rezonality could not bind vertex memory";
-        return false;
-    }
-    void* mapped = nullptr;
-    if (vkMapMemory(device, vertex_memory, 0,
-            sizeof(kScreenVertices), 0, &mapped)
-        != VK_SUCCESS)
-    {
-        vkFreeMemory(device, vertex_memory, nullptr);
-        vkDestroyBuffer(device, vertex_buffer, nullptr);
-        error = "Rezonality could not map vertex memory";
-        return false;
-    }
-    std::memcpy(mapped, kScreenVertices, sizeof(kScreenVertices));
-    vkUnmapMemory(device, vertex_memory);
-    backend.device = device;
-    backend.physical_device = physical;
-    backend.vertex_buffer = vertex_buffer;
-    backend.vertex_memory = vertex_memory;
-    return true;
+    uint32_t memory_type = UINT32_MAX;
+    return rezonality::detail::publish_gpu_resources_transactionally<
+        VulkanVertexResources>(
+        [&](VulkanVertexResources& candidate) {
+            return rezonality::detail::initialize_gpu_resources(
+                stages, std::nullopt,
+                [&](rezonality::detail::GpuInitializationStage stage) {
+                    switch (stage)
+                    {
+                    case rezonality::detail::GpuInitializationStage::VertexBuffer:
+                    {
+                        VkBufferCreateInfo buffer_info{
+                            VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+                        };
+                        buffer_info.size = sizeof(kScreenVertices);
+                        buffer_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+                        buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                        if (vkCreateBuffer(device, &buffer_info, nullptr,
+                                &candidate.buffer)
+                            == VK_SUCCESS)
+                        {
+                            vkGetBufferMemoryRequirements(
+                                device, candidate.buffer, &requirements);
+                            memory_type = find_memory_type(physical,
+                                requirements.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                            if (memory_type != UINT32_MAX)
+                                return true;
+                            error = "Rezonality could not find host-visible vertex memory";
+                            return false;
+                        }
+                        error = "Rezonality could not create its Vulkan screen rectangle";
+                        return false;
+                    }
+                    case rezonality::detail::GpuInitializationStage::VertexMemory:
+                    {
+                        VkMemoryAllocateInfo allocation{
+                            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+                        };
+                        allocation.allocationSize = requirements.size;
+                        allocation.memoryTypeIndex = memory_type;
+                        if (vkAllocateMemory(device, &allocation, nullptr,
+                                &candidate.memory)
+                            == VK_SUCCESS)
+                            return true;
+                        error = "Rezonality could not allocate vertex memory";
+                        return false;
+                    }
+                    case rezonality::detail::GpuInitializationStage::VertexMemoryBind:
+                        if (vkBindBufferMemory(
+                                device, candidate.buffer, candidate.memory, 0)
+                            == VK_SUCCESS)
+                            return true;
+                        error = "Rezonality could not bind vertex memory";
+                        return false;
+                    case rezonality::detail::GpuInitializationStage::VertexMemoryMap:
+                    {
+                        void* mapped = nullptr;
+                        if (vkMapMemory(device, candidate.memory, 0,
+                                sizeof(kScreenVertices), 0, &mapped)
+                            != VK_SUCCESS)
+                        {
+                            error = "Rezonality could not map vertex memory";
+                            return false;
+                        }
+                        std::memcpy(
+                            mapped, kScreenVertices, sizeof(kScreenVertices));
+                        vkUnmapMemory(device, candidate.memory);
+                        return true;
+                    }
+                    default:
+                        return false;
+                    }
+                });
+        },
+        [](const VulkanVertexResources& candidate) {
+            return candidate.buffer != VK_NULL_HANDLE
+                && candidate.memory != VK_NULL_HANDLE;
+        },
+        [&](VulkanVertexResources& candidate) {
+            destroy_vertex_resources(device, candidate);
+        },
+        [&](VulkanVertexResources&& candidate) {
+            backend.device = device;
+            backend.physical_device = physical;
+            backend.vertex_buffer = candidate.buffer;
+            backend.vertex_memory = candidate.memory;
+            candidate = {};
+        });
 }
 
 VkShaderModule create_shader(VkDevice device,
@@ -1238,59 +1294,98 @@ bool create_model_texture(VulkanGeneration& generation,
     const rezonality::ModelTexture& source,
     VulkanModelTextureResource& texture, std::string& error)
 {
-    texture.width = source.width;
-    texture.height = source.height;
-    const VkFormat format = source.srgb
-        ? VK_FORMAT_R8G8B8A8_SRGB
-        : VK_FORMAT_R8G8B8A8_UNORM;
-    const draxul::vkresources::AttachmentRequest request(
-        static_cast<int>(source.width), static_cast<int>(source.height),
-        format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        VK_IMAGE_ASPECT_COLOR_BIT, VK_SAMPLE_COUNT_1_BIT, 0,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        draxul::vkresources::LifetimeScope::Persistent,
-        "rezonality-model-texture");
-    if (!draxul::vkresources::create_attachment(generation.device,
-            generation.allocator, request, texture.attachment, error))
-        return false;
-    VkSamplerCreateInfo sampler{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.maxLod = 1.0f;
-    if (vkCreateSampler(generation.device, &sampler, nullptr,
-            &texture.sampler)
-        != VK_SUCCESS)
-    {
-        draxul::vkresources::destroy_attachment(generation.device,
-            generation.allocator, texture.attachment);
-        error = "Rezonality could not create a model texture sampler";
-        return false;
-    }
-    draxul::vkresources::ScopedBuffer upload;
-    const draxul::vkresources::BufferRequest upload_request(
-        source.pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        draxul::vkresources::MemoryPolicy::HostSequentialWrite,
-        "rezonality-model-texture-upload",
-        draxul::vkresources::LifetimeScope::Persistent);
-    if (!draxul::vkresources::create_buffer(generation.device,
-            generation.allocator, upload_request, upload, error))
-    {
-        vkDestroySampler(generation.device, texture.sampler, nullptr);
-        texture.sampler = VK_NULL_HANDLE;
-        draxul::vkresources::destroy_attachment(generation.device,
-            generation.allocator, texture.attachment);
-        return false;
-    }
-    texture.upload_buffer = upload.release();
-    std::memcpy(texture.upload_buffer.mapped,
-        source.pixels.data(), source.pixels.size());
-    vmaFlushAllocation(generation.allocator,
-        texture.upload_buffer.allocation, 0, source.pixels.size());
-    return true;
+    constexpr std::array stages{
+        rezonality::detail::GpuInitializationStage::ModelTextureAttachment,
+        rezonality::detail::GpuInitializationStage::ModelTextureSampler,
+        rezonality::detail::GpuInitializationStage::ModelTextureUpload,
+    };
+    return rezonality::detail::publish_gpu_resources_transactionally<
+        VulkanModelTextureResource>(
+        [&](VulkanModelTextureResource& candidate) {
+            candidate.width = source.width;
+            candidate.height = source.height;
+            return rezonality::detail::initialize_gpu_resources(
+                stages, std::nullopt,
+                [&](rezonality::detail::GpuInitializationStage stage) {
+                    switch (stage)
+                    {
+                    case rezonality::detail::GpuInitializationStage::ModelTextureAttachment:
+                    {
+                        const VkFormat format = source.srgb
+                            ? VK_FORMAT_R8G8B8A8_SRGB
+                            : VK_FORMAT_R8G8B8A8_UNORM;
+                        const draxul::vkresources::AttachmentRequest request(
+                            static_cast<int>(source.width),
+                            static_cast<int>(source.height), format,
+                            VK_IMAGE_USAGE_SAMPLED_BIT
+                                | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, VK_SAMPLE_COUNT_1_BIT,
+                            0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            draxul::vkresources::LifetimeScope::Persistent,
+                            "rezonality-model-texture");
+                        return draxul::vkresources::create_attachment(
+                            generation.device, generation.allocator, request,
+                            candidate.attachment, error);
+                    }
+                    case rezonality::detail::GpuInitializationStage::ModelTextureSampler:
+                    {
+                        VkSamplerCreateInfo sampler{
+                            VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+                        };
+                        sampler.magFilter = VK_FILTER_LINEAR;
+                        sampler.minFilter = VK_FILTER_LINEAR;
+                        sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+                        sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                        sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                        sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                        sampler.maxLod = 1.0f;
+                        if (vkCreateSampler(generation.device, &sampler,
+                                nullptr, &candidate.sampler)
+                            == VK_SUCCESS)
+                            return true;
+                        error = "Rezonality could not create a model texture sampler";
+                        return false;
+                    }
+                    case rezonality::detail::GpuInitializationStage::ModelTextureUpload:
+                    {
+                        draxul::vkresources::ScopedBuffer upload;
+                        const draxul::vkresources::BufferRequest upload_request(
+                            source.pixels.size(),
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                            draxul::vkresources::MemoryPolicy::HostSequentialWrite,
+                            "rezonality-model-texture-upload",
+                            draxul::vkresources::LifetimeScope::Persistent);
+                        if (!draxul::vkresources::create_buffer(
+                                generation.device, generation.allocator,
+                                upload_request, upload, error))
+                            return false;
+                        candidate.upload_buffer = upload.release();
+                        std::memcpy(candidate.upload_buffer.mapped,
+                            source.pixels.data(), source.pixels.size());
+                        vmaFlushAllocation(generation.allocator,
+                            candidate.upload_buffer.allocation, 0,
+                            source.pixels.size());
+                        return true;
+                    }
+                    default:
+                        return false;
+                    }
+                });
+        },
+        [](const VulkanModelTextureResource& candidate) {
+            return candidate.attachment.image != VK_NULL_HANDLE
+                && candidate.attachment.view != VK_NULL_HANDLE
+                && candidate.sampler != VK_NULL_HANDLE
+                && candidate.upload_buffer.buffer != VK_NULL_HANDLE
+                && candidate.upload_buffer.allocation != nullptr
+                && candidate.upload_buffer.mapped != nullptr;
+        },
+        [&](VulkanModelTextureResource& candidate) {
+            destroy_model_texture(generation, candidate);
+        },
+        [&](VulkanModelTextureResource&& candidate) {
+            texture = std::move(candidate);
+        });
 }
 
 VkDeviceAddress buffer_address(
