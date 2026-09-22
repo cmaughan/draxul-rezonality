@@ -308,14 +308,6 @@ ProcessResult run_process(const std::vector<fs::path>& arguments)
 
 #endif
 
-struct SceneDescription
-{
-    fs::path scenegraph;
-    std::vector<ShaderBuild::Surface> surfaces;
-    std::vector<ModelData> models;
-    std::vector<ShaderBuild::Pass> passes;
-};
-
 std::optional<std::string> first_match(const std::string& source,
     const std::regex& expression)
 {
@@ -550,21 +542,13 @@ std::vector<std::pair<std::string, std::string>> named_blocks(
     return blocks;
 }
 
-std::optional<SceneDescription> load_scene(const ProjectOptions& options,
-    fs::path& diagnostic_path, int& diagnostic_line, std::string& error)
+std::optional<SceneDescription> parse_scene_text_impl(
+    const ProjectOptions& options, const fs::path& scenegraph,
+    std::string_view source, fs::path& diagnostic_path,
+    int& diagnostic_line, std::string& error)
 {
-    fs::path scenegraph = options.scenegraph;
-    if (scenegraph.is_relative())
-        scenegraph = options.project_path / scenegraph;
     diagnostic_path = scenegraph;
-    const auto source = read_text(scenegraph);
-    if (!source)
-    {
-        error = "Scenegraph is missing: " + scenegraph.string();
-        return std::nullopt;
-    }
-
-    const std::string parsed = without_comments(*source);
+    const std::string parsed = without_comments(std::string(source));
     static const std::regex vertex_expression(
         R"(\bvs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
     static const std::regex fragment_expression(
@@ -620,17 +604,15 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
             diagnostic_line = 1;
             return std::nullopt;
         }
-        ModelData model;
         const fs::path model_path
             = options.project_path / fs::u8path(*path);
-        if (!load_model(model_path, scale, flip_texture_y, model, error))
-        {
-            diagnostic_path = model_path;
-            diagnostic_line = 1;
-            return std::nullopt;
-        }
         model_indices[name] = description.models.size();
-        description.models.push_back(std::move(model));
+        description.models.push_back({
+            .name = name,
+            .path = model_path,
+            .scale = scale,
+            .flip_texture_y = flip_texture_y,
+        });
     }
     for (const auto& [name, body] : named_blocks(parsed, "surface"))
     {
@@ -755,17 +737,15 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
                 diagnostic_line = 1;
                 return std::nullopt;
             }
-            ModelData model;
             const fs::path model_path
                 = options.project_path / fs::u8path(*geometry_path);
-            if (!load_model(model_path, scale, flip_texture_y, model, error))
-            {
-                diagnostic_path = model_path;
-                diagnostic_line = 1;
-                return std::nullopt;
-            }
             pass.model_index = description.models.size();
-            description.models.push_back(std::move(model));
+            description.models.push_back({
+                .name = name + ".geometry",
+                .path = model_path,
+                .scale = scale,
+                .flip_texture_y = flip_texture_y,
+            });
         }
         if (pass.ray_trace && !pass.model_index)
         {
@@ -966,6 +946,29 @@ fs::path compiler_path(const fs::path& plugin_directory)
 }
 
 } // namespace
+
+SceneParseResult parse_scene_text(const ProjectOptions& options,
+    const fs::path& scenegraph, std::string_view source)
+{
+    SceneParseResult result;
+    result.diagnostic_path = scenegraph;
+    try
+    {
+        result.scene = parse_scene_text_impl(options, scenegraph, source,
+            result.diagnostic_path, result.diagnostic_line, result.error);
+    }
+    catch (const std::exception& exception)
+    {
+        result.error = std::string("Rezonality project build failed: ")
+            + exception.what();
+    }
+    catch (...)
+    {
+        result.error
+            = "Rezonality project build failed with an unknown error";
+    }
+    return result;
+}
 
 std::optional<ProjectOptions> parse_project_options(
     const fs::path& plugin_directory, const char* config_json,
@@ -1213,35 +1216,25 @@ uint64_t ProjectPipeline::fingerprint() const
     return hash;
 }
 
-BuildResult ProjectPipeline::build(uint64_t generation) const
+BuildResult build_candidate(const fs::path& plugin_directory,
+    const ProjectOptions& options, SceneDescription scene,
+    uint64_t generation, const fs::path& output_directory,
+    CompileShaderOperation compile_shader_operation)
 {
     BuildResult result;
     result.generation = generation;
     try
     {
-    int line = -1;
-    fs::path diagnostic;
-    std::string error;
-    auto scene = load_scene(options_, diagnostic, line, error);
-    if (!scene)
-    {
-        result.diagnostic_path = std::move(diagnostic);
-        result.diagnostic_line = line;
-        result.error = std::move(error);
-        return result;
-    }
-
-    const fs::path compiler = compiler_path(plugin_directory_);
+    const fs::path compiler = compiler_path(plugin_directory);
     std::error_code compiler_error;
-    if (!fs::is_regular_file(compiler, compiler_error))
+    if (!compile_shader_operation
+        && !fs::is_regular_file(compiler, compiler_error))
     {
         result.diagnostic_path = compiler;
         result.error = "Bundled glslangValidator is missing";
         return result;
     }
 
-    const fs::path output_directory = fs::temp_directory_path()
-        / "draxul-rezonality" / std::to_string(reinterpret_cast<uintptr_t>(this));
     std::error_code ec;
     fs::create_directories(output_directory, ec);
     if (ec)
@@ -1253,22 +1246,36 @@ BuildResult ProjectPipeline::build(uint64_t generation) const
 
     ShaderBuild candidate;
     candidate.generation = generation;
-    candidate.project_path = options_.project_path;
-    candidate.scenegraph_path = scene->scenegraph;
-    candidate.surfaces = scene->surfaces;
-    candidate.models = std::move(scene->models);
-    candidate.passes = scene->passes;
+    candidate.project_path = options.project_path;
+    candidate.scenegraph_path = scene.scenegraph;
+    candidate.surfaces = std::move(scene.surfaces);
+    candidate.passes = std::move(scene.passes);
+    candidate.models.reserve(scene.models.size());
+    for (const SceneModelSource& source : scene.models)
+    {
+        ModelData model;
+        if (!load_model(source.path, source.scale, source.flip_texture_y,
+                model, result.error))
+        {
+            result.diagnostic_path = source.path;
+            result.diagnostic_line = 1;
+            return result;
+        }
+        candidate.models.push_back(std::move(model));
+    }
     bool shader_compile_failed = false;
-    const auto compile = [this, &compiler, &result](
+    const auto compile = [&compile_shader_operation, &compiler, &options,
+                             &result](
                              const fs::path& shader,
                              const fs::path& output,
                              std::vector<uint32_t>& spirv) {
-        if (!compile_shader_)
+        if (!compile_shader_operation)
         {
-            return compile_shader(compiler, options_.project_path,
+            return compile_shader(compiler, options.project_path,
                 shader, output, spirv, result.diagnostics);
         }
-        if (!compile_shader_(shader, spirv, result.diagnostics))
+        if (!compile_shader_operation(
+                shader, spirv, result.diagnostics))
             return false;
         if (!spirv.empty())
             return true;
@@ -1381,17 +1388,52 @@ BuildResult ProjectPipeline::build(uint64_t generation) const
     }
     catch (const std::exception& exception)
     {
-        result.diagnostic_path = options_.project_path / options_.scenegraph;
+        result.diagnostic_path = options.project_path / options.scenegraph;
         result.error = std::string("Rezonality project build failed: ")
             + exception.what();
         return result;
     }
     catch (...)
     {
-        result.diagnostic_path = options_.project_path / options_.scenegraph;
+        result.diagnostic_path = options.project_path / options.scenegraph;
         result.error = "Rezonality project build failed with an unknown error";
         return result;
     }
+}
+
+BuildResult ProjectPipeline::build(uint64_t generation) const
+{
+    fs::path scenegraph = options_.scenegraph;
+    if (scenegraph.is_relative())
+        scenegraph = options_.project_path / scenegraph;
+    const auto source = read_text(scenegraph);
+    if (!source)
+    {
+        BuildResult result;
+        result.generation = generation;
+        result.diagnostic_path = scenegraph;
+        result.error = "Scenegraph is missing: " + scenegraph.string();
+        return result;
+    }
+
+    SceneParseResult parsed = parse_scene_text(
+        options_, scenegraph, *source);
+    if (!parsed.scene)
+    {
+        BuildResult result;
+        result.generation = generation;
+        result.diagnostic_path = std::move(parsed.diagnostic_path);
+        result.diagnostic_line = parsed.diagnostic_line;
+        result.error = std::move(parsed.error);
+        return result;
+    }
+
+    const fs::path output_directory = fs::temp_directory_path()
+        / "draxul-rezonality"
+        / std::to_string(reinterpret_cast<uintptr_t>(this));
+    return build_candidate(plugin_directory_, options_,
+        std::move(*parsed.scene), generation, output_directory,
+        compile_shader_);
 }
 
 void LiveProject::run(std::stop_token stop_token)

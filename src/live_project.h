@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -108,15 +109,56 @@ struct BuildResult
     std::vector<DiagnosticEntry> diagnostics;
 };
 
+struct SceneModelSource
+{
+    std::string name;
+    std::filesystem::path path;
+    glm::vec3 scale{ 1.0f };
+    bool flip_texture_y = true;
+};
+
+// Syntax-only scene output. Asset bytes and compiler output are resolved later
+// while constructing an immutable ShaderBuild candidate.
+struct SceneDescription
+{
+    std::filesystem::path scenegraph;
+    std::vector<ShaderBuild::Surface> surfaces;
+    std::vector<SceneModelSource> models;
+    std::vector<ShaderBuild::Pass> passes;
+};
+
+struct SceneParseResult
+{
+    std::optional<SceneDescription> scene;
+    std::filesystem::path diagnostic_path;
+    int diagnostic_line = -1;
+    std::string error;
+};
+
+using CompileShaderOperation = std::function<bool(
+    const std::filesystem::path& shader,
+    std::vector<uint32_t>& spirv,
+    std::vector<DiagnosticEntry>& diagnostics)>;
+
+[[nodiscard]] SceneParseResult parse_scene_text(
+    const ProjectOptions& options,
+    const std::filesystem::path& scenegraph,
+    std::string_view source);
+
+[[nodiscard]] BuildResult build_candidate(
+    const std::filesystem::path& plugin_directory,
+    const ProjectOptions& options,
+    SceneDescription scene,
+    uint64_t generation,
+    const std::filesystem::path& output_directory,
+    CompileShaderOperation compile_shader = {});
+
 // Synchronous, CPU-only project construction seam. The live watcher owns one
 // pipeline and only schedules/publishes its immutable results.
 class ProjectPipeline
 {
 public:
-    using CompileShader = std::function<bool(
-        const std::filesystem::path& shader,
-        std::vector<uint32_t>& spirv,
-        std::vector<DiagnosticEntry>& diagnostics)>;
+    using CompileShader = CompileShaderOperation;
 
     ProjectPipeline(std::filesystem::path plugin_directory,
         ProjectOptions options, CompileShader compile_shader = {});

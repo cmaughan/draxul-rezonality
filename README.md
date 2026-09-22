@@ -179,8 +179,10 @@ submission, presentation, plugin discovery, and command palette.
 Within the product, the worker turns project files into an immutable
 `ShaderBuild`; the render callback prepares a backend generation and only then
 activates it. A rejected parser, compiler, filesystem, image-storage, or GPU
-candidate leaves the active generation intact. `audio_types.h` contains the
-SDL-free audio option and frame values shared by the project and runtime paths;
+candidate leaves the active generation intact. Scene text is parsed into an
+ordered, asset-free description before `build_candidate` resolves models,
+images, and injected or production compiler results. `audio_types.h` contains
+the SDL-free audio option and frame values shared by the project and runtime paths;
 capture, permission, and device operations remain private to `AudioAnalyzer`.
 An explicit product-private capture registry owns exact-device sharing; its
 injectable native operations let the focused audio suite exercise permission,

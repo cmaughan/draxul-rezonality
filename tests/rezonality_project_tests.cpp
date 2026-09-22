@@ -337,3 +337,184 @@ TEST_CASE("Rezonality project pipeline reports injected compiler failures",
     CHECK(failed.diagnostic_line == 12);
     CHECK(failed.error == "injected compiler diagnostic");
 }
+
+TEST_CASE("Rezonality parses scene text before resolving assets",
+    "[rezonality][project][pipeline]")
+{
+    rezonality::ProjectOptions configured;
+    configured.project_path = fs::path("virtual-project");
+    const fs::path scenegraph
+        = configured.project_path / "ordered.scenegraph";
+    const std::string source = R"scene(
+model: First {
+    path: models/first.obj
+    scale: (1, 2, 3)
+}
+model: Second {
+    path: models/second.obj
+    uv_origin: upper_left
+}
+surface: Color { path: textures/color.png }
+pass: UseSecond {
+    vs: shaders/second.vert
+    fs: shaders/second.frag
+    geometry: Mesh { model: Second }
+}
+pass: UseFirst {
+    vs: shaders/first.vert
+    fs: shaders/first.frag
+    geometry: Mesh { model: First }
+}
+)scene";
+
+    auto parsed = rezonality::parse_scene_text(
+        configured, scenegraph, source);
+    REQUIRE(parsed.scene);
+    REQUIRE(parsed.scene->models.size() == 2);
+    CHECK(parsed.scene->models[0].name == "First");
+    CHECK(parsed.scene->models[0].path
+        == configured.project_path / "models/first.obj");
+    CHECK(parsed.scene->models[0].scale.x == 1.0f);
+    CHECK(parsed.scene->models[0].scale.y == 2.0f);
+    CHECK(parsed.scene->models[0].scale.z == 3.0f);
+    CHECK(parsed.scene->models[0].flip_texture_y);
+    CHECK(parsed.scene->models[1].name == "Second");
+    CHECK_FALSE(parsed.scene->models[1].flip_texture_y);
+    REQUIRE(parsed.scene->surfaces.size() == 1);
+    CHECK(parsed.scene->surfaces[0].path
+        == configured.project_path / "textures/color.png");
+    REQUIRE(parsed.scene->passes.size() == 2);
+    REQUIRE(parsed.scene->passes[0].model_index);
+    REQUIRE(parsed.scene->passes[1].model_index);
+    CHECK(*parsed.scene->passes[0].model_index == 1);
+    CHECK(*parsed.scene->passes[1].model_index == 0);
+
+    const auto malformed = rezonality::parse_scene_text(configured,
+        scenegraph, "pass: Broken { geometry: Screen { path: screen_rect }");
+    CHECK_FALSE(malformed.scene);
+    CHECK(malformed.diagnostic_path == scenegraph);
+    CHECK(malformed.error.find("at least one enabled pass")
+        != std::string::npos);
+}
+
+TEST_CASE("Rezonality candidate resolution reports missing assets",
+    "[rezonality][project][pipeline]")
+{
+    rezonality::ProjectOptions configured;
+    configured.project_path = fs::temp_directory_path()
+        / "draxul-rezonality-missing-candidate";
+    const fs::path scenegraph
+        = configured.project_path / "missing.scenegraph";
+    const fs::path output = configured.project_path / "output";
+    std::error_code ec;
+    fs::remove_all(configured.project_path, ec);
+
+    const auto missing_model = rezonality::parse_scene_text(configured,
+        scenegraph, R"scene(
+model: Missing { path: models/missing.obj }
+pass: Main {
+    vs: main.vert
+    fs: main.frag
+    geometry: Mesh { model: Missing }
+}
+)scene");
+    REQUIRE(missing_model.scene);
+    const auto model_result = rezonality::build_candidate(plugin_root(),
+        configured, *missing_model.scene, 21, output, accept_shader);
+    CHECK_FALSE(model_result.build);
+    CHECK(model_result.generation == 21);
+    CHECK(model_result.diagnostic_path
+        == configured.project_path / "models/missing.obj");
+    CHECK(model_result.error.find("Could not load model")
+        != std::string::npos);
+
+    const auto missing_image = rezonality::parse_scene_text(configured,
+        scenegraph, R"scene(
+surface: Missing { path: textures/missing.png }
+pass: Main {
+    vs: main.vert
+    fs: main.frag
+    geometry: Screen { path: screen_rect }
+}
+)scene");
+    REQUIRE(missing_image.scene);
+    const auto image_result = rezonality::build_candidate(plugin_root(),
+        configured, *missing_image.scene, 22, output, accept_shader);
+    CHECK_FALSE(image_result.build);
+    CHECK(image_result.diagnostic_path
+        == configured.project_path / "textures/missing.png");
+    CHECK(image_result.error.find("Could not load texture")
+        != std::string::npos);
+    fs::remove_all(configured.project_path, ec);
+}
+
+TEST_CASE("Rezonality candidate seam owns compiler output and diagnostics",
+    "[rezonality][project][pipeline]")
+{
+    rezonality::ProjectOptions configured;
+    configured.project_path = fs::path("virtual-project");
+    const fs::path scenegraph
+        = configured.project_path / "compiler.scenegraph";
+    const auto parsed = rezonality::parse_scene_text(configured, scenegraph,
+        R"scene(
+pass: Main {
+    vs: shaders/main.vert
+    fs: shaders/main.frag
+    geometry: Screen { path: screen_rect }
+}
+)scene");
+    REQUIRE(parsed.scene);
+    const fs::path output = fs::temp_directory_path()
+        / "draxul-rezonality-candidate-seam";
+
+    auto owned_scene = *parsed.scene;
+    const auto built = rezonality::build_candidate(plugin_root(), configured,
+        owned_scene, 31, output,
+        [](const fs::path& shader, std::vector<uint32_t>& spirv,
+            std::vector<rezonality::DiagnosticEntry>&) {
+            spirv = { 0x07230203u,
+                shader.extension() == ".vert" ? 1u : 2u };
+            return true;
+        });
+    REQUIRE(built.build);
+    CHECK(built.build->generation == 31);
+    CHECK(built.build->scenegraph_path == scenegraph);
+    REQUIRE(built.build->passes.size() == 1);
+    const std::vector<uint32_t> expected_vertex{ 0x07230203u, 1u };
+    const std::vector<uint32_t> expected_fragment{ 0x07230203u, 2u };
+    CHECK(built.build->passes[0].vertex_spirv
+        == expected_vertex);
+    CHECK(built.build->passes[0].fragment_spirv
+        == expected_fragment);
+    owned_scene.passes[0].name = "mutated after build";
+    CHECK(built.build->passes[0].name == "Main");
+
+    const auto empty = rezonality::build_candidate(plugin_root(), configured,
+        *parsed.scene, 32, output,
+        [](const fs::path&, std::vector<uint32_t>&,
+            std::vector<rezonality::DiagnosticEntry>&) { return true; });
+    CHECK_FALSE(empty.build);
+    CHECK(empty.error.find("produced no SPIR-V") != std::string::npos);
+
+    const auto failed = rezonality::build_candidate(plugin_root(), configured,
+        *parsed.scene, 33, output,
+        [](const fs::path& shader, std::vector<uint32_t>&,
+            std::vector<rezonality::DiagnosticEntry>& diagnostics) {
+            diagnostics.push_back({
+                .path = shader,
+                .stage = "compile",
+                .severity = "error",
+                .line = 17,
+                .message = "injected seam diagnostic",
+            });
+            return false;
+        });
+    CHECK_FALSE(failed.build);
+    CHECK(failed.diagnostic_path
+        == configured.project_path / "shaders/main.vert");
+    CHECK(failed.diagnostic_line == 17);
+    CHECK(failed.error == "injected seam diagnostic");
+
+    std::error_code ec;
+    fs::remove_all(output, ec);
+}
