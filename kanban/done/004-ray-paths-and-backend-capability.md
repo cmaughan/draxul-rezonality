@@ -16,7 +16,7 @@
 - [x] Add a conditional Windows Vulkan Cornell-box render snapshot.
 - [x] Build and bless the corresponding macOS Metal render snapshot.
 - [x] Perform the break/repair and resize manual check on supported Metal hardware.
-- [ ] Perform the break/repair and resize manual check on supported Vulkan hardware.
+- [x] Perform the break/repair and resize manual check on supported Vulkan hardware.
 
 ## macOS validation evidence
 
@@ -35,3 +35,13 @@
   while six split ratios were exercised. After restoring the shader, generation
   3 activated while five more ratios were exercised and the UI stayed attached.
   This completes the Metal gate; supported Vulkan hardware remains open.
+
+## Windows Vulkan validation evidence
+
+- The registered Vulkan Cornell-box comparison passed in the 38-test Debug
+  aggregate, establishing that this device exposes the required ray features.
+- In an isolated live session, an invalid token in `rt_gen.rgen` produced a
+  generation-2 compile error at line 5 while generation 1 remained active.
+  Six split ratios were exercised without losing the pane or last good image.
+- Repairing the shader promoted generation 3, cleared the diagnostic to
+  `active generation ready`, and restored the visible ray-traced Cornell box.

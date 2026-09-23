@@ -17,7 +17,7 @@
 - [x] Build and bless the corresponding Metal snapshots on macOS.
 - [x] Perform the two-pane edit/continuous-resize manual check on macOS.
 - [x] Perform the two-pane orbit check on macOS.
-- [ ] Perform the two-pane orbit/edit/continuous-resize manual check on Windows.
+- [x] Perform the two-pane orbit/edit/continuous-resize manual check on Windows.
 
 ## macOS validation evidence
 
@@ -40,3 +40,13 @@
   view to a strong side/top view; the second moved only the right robot while
   preserving the left camera. Captured Metal frames verified both pane-local
   camera changes. This completes the macOS gate; Windows remains open.
+
+## Windows validation evidence
+
+- An isolated Debug Draxul session opened two real Vulkan PBR robot panes from
+  one copied project. Left-dragging each pane separately produced visibly
+  different pane-local camera positions without changing the other pane.
+- A valid `pbr.frag` edit advanced both diagnostic records from generation 1
+  to generation 2 while repeated split ratios from 0.20 through 0.80 remained
+  stable. Captured frames confirmed both the independent cameras and the live
+  PBR render after resizing.

@@ -2,5 +2,5 @@ version = 1
 columns = ["ice-box", "pending", "done"]
 [cards]
 ice-box = []
-pending = ["005-audio-reactive-project.md", "002-scenegraph-surfaces-and-multipass.md", "003-models-cameras-and-pbr.md", "004-ray-paths-and-backend-capability.md"]
-done = ["001-fault-tolerant-single-pass-live-shader.md", "006-complete-example-and-agent-workflow.md"]
+pending = []
+done = ["001-fault-tolerant-single-pass-live-shader.md", "006-complete-example-and-agent-workflow.md", "007-preserve-latest-live-diagnostic.md", "002-scenegraph-surfaces-and-multipass.md", "003-models-cameras-and-pbr.md", "004-ray-paths-and-backend-capability.md", "005-audio-reactive-project.md"]
