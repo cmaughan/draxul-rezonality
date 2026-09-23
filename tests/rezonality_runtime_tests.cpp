@@ -134,6 +134,37 @@ TEST_CASE("Rezonality runtime rejects fake backend failure and retries",
     CHECK(backend.activated_generations.back() == 6);
 }
 
+TEST_CASE("Rezonality runtime identifies activation older than latest attempt",
+    "[rezonality][runtime][backend]")
+{
+    rezonality::RuntimeController runtime;
+    FakeBackend backend;
+
+    auto first = candidate(1);
+    runtime.accept(first);
+
+    rezonality::BuildResult broken;
+    broken.generation = 2;
+    broken.error = "compile failed";
+    runtime.accept(broken);
+
+    const auto late_activation = runtime.prepare_frame(backend, 0);
+    REQUIRE(late_activation.disposition
+        == rezonality::RuntimePrepareDisposition::Activated);
+    CHECK(late_activation.transition.active_generation == 1);
+    CHECK(late_activation.transition.attempted_generation == 2);
+    CHECK_FALSE(late_activation.activated_latest_attempt());
+
+    auto repaired = candidate(3);
+    runtime.accept(repaired);
+    const auto current_activation = runtime.prepare_frame(backend, 1);
+    REQUIRE(current_activation.disposition
+        == rezonality::RuntimePrepareDisposition::Activated);
+    CHECK(current_activation.transition.active_generation == 3);
+    CHECK(current_activation.transition.attempted_generation == 3);
+    CHECK(current_activation.activated_latest_attempt());
+}
+
 TEST_CASE("Rezonality runtime owns hidden and quiesced policy",
     "[rezonality][runtime][lifecycle]")
 {

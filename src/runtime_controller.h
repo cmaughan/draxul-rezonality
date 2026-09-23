@@ -51,6 +51,13 @@ struct RuntimePrepareResult
         = RuntimePrepareDisposition::Unchanged;
     RuntimeTransition transition;
     std::string error;
+
+    [[nodiscard]] bool activated_latest_attempt() const
+    {
+        return disposition == RuntimePrepareDisposition::Activated
+            && transition.active_generation
+                == transition.attempted_generation;
+    }
 };
 
 // Owns candidate selection and activation policy independently of Metal,

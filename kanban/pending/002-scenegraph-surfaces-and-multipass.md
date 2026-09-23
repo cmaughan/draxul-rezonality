@@ -12,7 +12,8 @@
 - [x] Stage adapted Slice 2 projects plus preserved original VkLive material.
 - [x] Add dynamic-module compilation coverage and four Windows render snapshots.
 - [x] Validate and bless the four Metal snapshots on macOS.
-- [ ] Perform the manual continuous split-resize/edit check on Windows and macOS.
+- [x] Perform the manual continuous split-resize/edit check on macOS.
+- [ ] Perform the manual continuous split-resize/edit check on Windows.
 
 ## macOS validation evidence
 
@@ -22,13 +23,14 @@
 - The Release Rezonality aggregate passed all 37 selected tests, including the
   four registered Metal comparisons, and the same-cache Release smoke passed.
 - Automated resize, edit, rollback, and recovery coverage passed. The continuous
-  hands-on split-resize/edit observation remains open on both platforms.
+  hands-on split-resize/edit observation remains open on Windows.
 
 ## 2026-09-23 pending-lane verification
 
 - The Debug Rezonality aggregate passed the module, project/runtime/audio,
   agent-layout, Neovim, and registered Metal render checks for this slice.
-- An isolated live session created a real Rezonality tab with two split panes
-  from a copied project. The detached desktop process exited before a sustained
-  resize/edit observation could be recorded, so the manual cross-platform gate
-  remains open.
+- A later isolated live session created two real deferred-shading panes from a
+  copied project, exercised eleven split ratios from 0.20 through 0.80 while
+  making a valid fragment-shader edit, and observed both panes advance from
+  generation 1 to generation 2. The UI remained attached and returned to a
+  0.50 split. This completes the macOS gate; Windows remains open.

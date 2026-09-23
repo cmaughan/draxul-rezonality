@@ -15,8 +15,9 @@
 - [x] Add model/texture immutability coverage and deterministic Windows Vulkan
       snapshots for the sphere and PBR robot.
 - [x] Build and bless the corresponding Metal snapshots on macOS.
-- [ ] Perform the two-pane orbit/edit/continuous-resize manual check on both
-      platforms.
+- [x] Perform the two-pane edit/continuous-resize manual check on macOS.
+- [ ] Perform the two-pane orbit check on macOS.
+- [ ] Perform the two-pane orbit/edit/continuous-resize manual check on Windows.
 
 ## macOS validation evidence
 
@@ -30,6 +31,8 @@
 
 - The Debug aggregate passed the PBR robot and sphere-bearing Metal comparisons
   together with the automated project/runtime coverage.
-- The isolated live session established the required two-pane project topology,
-  but the desktop process did not remain attached long enough to observe orbit,
-  edit, and continuous resize together. That cross-platform gate remains open.
+- A later isolated live session created two real PBR panes from a copied project,
+  exercised seven split ratios while making a valid fragment-shader edit, and
+  observed both panes advance from generation 1 to generation 2. The UI remained
+  attached and returned to a 0.50 split. Orbit remains open because the isolated
+  process did not have macOS Accessibility input permission; Windows remains open.

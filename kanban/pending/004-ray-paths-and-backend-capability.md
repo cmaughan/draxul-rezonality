@@ -15,8 +15,8 @@
       after repair through the real dynamically loaded module.
 - [x] Add a conditional Windows Vulkan Cornell-box render snapshot.
 - [x] Build and bless the corresponding macOS Metal render snapshot.
-- [ ] Perform the break/repair and resize manual check on supported Vulkan and
-      Metal hardware.
+- [x] Perform the break/repair and resize manual check on supported Metal hardware.
+- [ ] Perform the break/repair and resize manual check on supported Vulkan hardware.
 
 ## macOS validation evidence
 
@@ -30,5 +30,8 @@
 
 - The Debug aggregate passed the Cornell-box Metal comparison and the dynamic
   invalid-shader/missing-geometry rollback and repair coverage.
-- The remaining gate requires a sustained hands-on break, repair, and resize
-  observation on both supported Vulkan and Metal hardware.
+- A later isolated live session loaded the real Metal ray project, introduced an
+  invalid Metal shader at generation 2, and observed generation 1 remain active
+  while six split ratios were exercised. After restoring the shader, generation
+  3 activated while five more ratios were exercised and the UI stayed attached.
+  This completes the Metal gate; supported Vulkan hardware remains open.

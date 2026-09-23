@@ -403,8 +403,15 @@ void report_preparation(RezonalityInstance* instance,
         == rezonality::RuntimePrepareDisposition::Activated)
     {
         configure_audio(instance, *instance->runtime.active_build());
-        publish_diagnostics(instance, "render", "info", {}, -1,
-            "active generation ready");
+        // A newer build can fail while an older, already-published candidate
+        // is still waiting for its first render-thread activation. Keep that
+        // newer failure authoritative until an equally new successful
+        // generation activates.
+        if (prepared.activated_latest_attempt())
+        {
+            publish_diagnostics(instance, "render", "info", {}, -1,
+                "active generation ready");
+        }
         notify_presentation(instance);
     }
     else if (prepared.disposition
