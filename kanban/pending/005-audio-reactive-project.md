@@ -23,3 +23,11 @@
 - Focused tests passed for injected permission outcomes, exact-device stream
   sharing, hidden-pane pause/clear/resume, and deterministic FFT data. Physical
   microphone permission, live capture, and shared-device behavior remain manual.
+
+## 2026-09-23 pending-lane verification
+
+- The Debug aggregate passed the deterministic audio shard and synthetic-audio
+  Metal render comparison.
+- Physical microphone permission and live two-pane capture cannot be established
+  by the deterministic test input; the Windows and macOS manual gate remains
+  open.

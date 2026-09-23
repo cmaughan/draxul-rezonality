@@ -25,3 +25,10 @@
 - The same aggregate passed dynamic invalid-shader and missing-geometry rollback
   and repair coverage. The hands-on break/repair/resize observation remains open
   on supported Vulkan and Metal hardware.
+
+## 2026-09-23 pending-lane verification
+
+- The Debug aggregate passed the Cornell-box Metal comparison and the dynamic
+  invalid-shader/missing-geometry rollback and repair coverage.
+- The remaining gate requires a sustained hands-on break, repair, and resize
+  observation on both supported Vulkan and Metal hardware.

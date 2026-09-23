@@ -25,3 +25,11 @@
 - The Release aggregate passed their registered comparisons together with the
   pane-local camera/resize, dynamic PBR edit, and missing-asset rollback tests.
 - The two-pane continuous orbit/edit/resize observation remains a manual gate.
+
+## 2026-09-23 pending-lane verification
+
+- The Debug aggregate passed the PBR robot and sphere-bearing Metal comparisons
+  together with the automated project/runtime coverage.
+- The isolated live session established the required two-pane project topology,
+  but the desktop process did not remain attached long enough to observe orbit,
+  edit, and continuous resize together. That cross-platform gate remains open.

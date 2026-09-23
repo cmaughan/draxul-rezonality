@@ -23,3 +23,12 @@
   four registered Metal comparisons, and the same-cache Release smoke passed.
 - Automated resize, edit, rollback, and recovery coverage passed. The continuous
   hands-on split-resize/edit observation remains open on both platforms.
+
+## 2026-09-23 pending-lane verification
+
+- The Debug Rezonality aggregate passed the module, project/runtime/audio,
+  agent-layout, Neovim, and registered Metal render checks for this slice.
+- An isolated live session created a real Rezonality tab with two split panes
+  from a copied project. The detached desktop process exited before a sustained
+  resize/edit observation could be recorded, so the manual cross-platform gate
+  remains open.
