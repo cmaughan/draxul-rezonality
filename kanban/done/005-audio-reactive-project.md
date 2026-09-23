@@ -12,6 +12,14 @@
 - [x] Stage the VkLive audio spectrum visualizer as a live-editable project.
 - [x] Prove deterministic FFT data, visibility behavior, and fallback status.
 - [x] Add a conditional Windows Vulkan synthetic-audio render snapshot.
-- [ ] Build and bless the corresponding macOS Metal render snapshot.
+- [x] Build and bless the corresponding macOS Metal render snapshot.
 - [ ] Manually verify microphone permission, live response, shared two-pane
       capture, all-hidden suspension, and clean resume on Windows and macOS.
+
+## macOS validation evidence
+
+- 2026-09-23: blessed and visually inspected the deterministic synthetic-audio
+  Metal reference on Apple M5; its registered Release comparison passed.
+- Focused tests passed for injected permission outcomes, exact-device stream
+  sharing, hidden-pane pause/clear/resume, and deterministic FFT data. Physical
+  microphone permission, live capture, and shared-device behavior remain manual.

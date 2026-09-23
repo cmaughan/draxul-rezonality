@@ -11,5 +11,15 @@
 - [x] Retire resized/reloaded Vulkan generations by completed frame slot.
 - [x] Stage adapted Slice 2 projects plus preserved original VkLive material.
 - [x] Add dynamic-module compilation coverage and four Windows render snapshots.
-- [ ] Validate and bless the four Metal snapshots on macOS.
+- [x] Validate and bless the four Metal snapshots on macOS.
 - [ ] Perform the manual continuous split-resize/edit check on Windows and macOS.
+
+## macOS validation evidence
+
+- 2026-09-23: blessed and visually inspected the `rezonality-plugin`,
+  `rezonality-blend-waves`, `rezonality-deferred-shading`, and
+  `rezonality-protoplanetary-disc` Metal references on Apple M5.
+- The Release Rezonality aggregate passed all 37 selected tests, including the
+  four registered Metal comparisons, and the same-cache Release smoke passed.
+- Automated resize, edit, rollback, and recovery coverage passed. The continuous
+  hands-on split-resize/edit observation remains open on both platforms.

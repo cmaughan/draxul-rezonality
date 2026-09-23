@@ -14,6 +14,14 @@
 - [x] Prove invalid ray shaders and missing geometry roll back, then recover
       after repair through the real dynamically loaded module.
 - [x] Add a conditional Windows Vulkan Cornell-box render snapshot.
-- [ ] Build and bless the corresponding macOS Metal render snapshot.
+- [x] Build and bless the corresponding macOS Metal render snapshot.
 - [ ] Perform the break/repair and resize manual check on supported Vulkan and
       Metal hardware.
+
+## macOS validation evidence
+
+- 2026-09-23: blessed and visually inspected the Cornell-box Metal reference on
+  Apple M5; its registered Release comparison passed.
+- The same aggregate passed dynamic invalid-shader and missing-geometry rollback
+  and repair coverage. The hands-on break/repair/resize observation remains open
+  on supported Vulkan and Metal hardware.
