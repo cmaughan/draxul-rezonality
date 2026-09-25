@@ -2,6 +2,7 @@
 
 #include "gpu_resource_transaction.h"
 #include "native_backend_helpers.h"
+#include "surface_dimensions.h"
 
 #include <draxul/plugin_adapter.h>
 
@@ -439,8 +440,20 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
         error = "Rezonality could not create its Metal model depth state";
         return std::nullopt;
     }
+    // Metal exposes texture limits by GPU family rather than a direct
+    // max-dimension property. Older families are capped at 8192.
+    const uint32_t max_surface_dimension
+        = [device supportsFamily:MTLGPUFamilyApple3]
+            || [device supportsFamily:MTLGPUFamilyMac2]
+        ? 16384u
+        : 8192u;
     for (const auto& source : build.surfaces)
     {
+        rezonality::SurfaceDimensions dimensions;
+        if (!rezonality::checked_surface_dimensions(source,
+                generation.width, generation.height,
+                max_surface_dimension, dimensions, error))
+            return std::nullopt;
         MetalGeneration::Surface surface;
         surface.name = source.name;
         surface.depth = source.format == ShaderBuild::SurfaceFormat::Depth32;
@@ -450,10 +463,8 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                 || !source.image_float_pixels.empty());
         MTLTextureDescriptor* texture = [[MTLTextureDescriptor alloc] init];
         texture.textureType = MTLTextureType2D;
-        texture.width = source.image_width != 0 ? source.image_width
-                                                : std::max<NSUInteger>(1, static_cast<NSUInteger>(generation.width * std::max(0.01f, source.scale_x)));
-        texture.height = source.image_height != 0 ? source.image_height
-                                                  : std::max<NSUInteger>(1, static_cast<NSUInteger>(generation.height * std::max(0.01f, source.scale_y)));
+        texture.width = dimensions.width;
+        texture.height = dimensions.height;
         const bool has_image = !source.image_pixels.empty()
             || !source.image_float_pixels.empty();
         if (has_image

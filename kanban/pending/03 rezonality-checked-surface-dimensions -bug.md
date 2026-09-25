@@ -6,15 +6,31 @@ A procedural surface with `scale: (1e30, 1)` passes parsing and causes an out-of
 
 **Investigation**
 
-- [ ] Trace procedural dimension calculation during activation and pane resize, including device limits.
+- [x] Trace procedural dimension calculation during activation and pane resize, including device limits.
 
 **Fix strategy**
 
-- [ ] Compute and validate dimensions before casting or allocating on Vulkan and Metal.
-- [ ] Return actionable diagnostics while retaining the last valid generation.
+- [x] Compute and validate dimensions before casting or allocating on Vulkan and Metal.
+- [x] Return actionable diagnostics while retaining the last valid generation.
 
 **Acceptance criteria**
 
-- [ ] Huge scales and overflow products fail safely; valid scales and resizing remain supported.
-- [ ] Run the Rezonality aggregate, relevant render checks, and same-cache smoke; record both-platform evidence.
-- [ ] Keep this scope distinct from `kanban/pending/42 rezonality-image-storage-format -bug.md`.
+- [x] Huge scales and overflow products fail safely; valid scales and resizing remain supported.
+- [x] Run the Rezonality aggregate, relevant render checks, and same-cache smoke.
+- [ ] Confirm the Metal path on macOS (build and render/reload smoke).
+- [x] Keep this scope distinct from `kanban/pending/42 rezonality-image-storage-format -bug.md`.
+
+**Progress (Windows):** Both native backends call the shared checked-dimension
+calculation before integer conversion or allocation. Vulkan uses
+`maxImageDimension2D` (also bounded by the attachment API's signed-int width);
+Metal uses a conservative family-based 2D texture limit. Backend preparation
+rejects an oversized candidate and the runtime retains the prior generation.
+The focused project suite passed 11 cases/178 assertions, including huge scales,
+oversized fixed images, valid scales, and pane-size calculations. Vulkan plugin
+and native contract targets compiled. The Debug all-products aggregate passed
+49/49 CTest entries, including the exact `scale: (1e30, 1)` scene repro and
+Rezonality render snapshots. Same-cache Debug startup passed via
+`py do.py run debug --console -- --smoke-test` (~48 s); the standard 30 s
+`smoke --skip-build` wrapper timed out on the existing nine-pane Session, so
+that timeout is not counted as a pass. macOS Metal execution remains open.
+Image storage validation is unchanged.

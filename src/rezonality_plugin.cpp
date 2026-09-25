@@ -1,6 +1,7 @@
 #include "live_project.h"
 
 #include "audio_analysis.h"
+#include "animation_clock.h"
 #include "camera.h"
 #include "diagnostics.h"
 #include "native_backend.h"
@@ -56,9 +57,7 @@ struct RezonalityInstance
     rezonality::RuntimeController runtime;
     rezonality::NativeBackend backend;
     bool focused = false;
-    bool paused = false;
-    double animation_elapsed_seconds = 0.0;
-    double last_animation_seconds = -1.0;
+    rezonality::AnimationClock animation;
     rezonality::Camera camera;
     bool camera_initialized = false;
     std::string presentation_status;
@@ -189,19 +188,6 @@ void notify_presentation(RezonalityInstance* instance)
             instance->host->host_context);
 }
 
-double advance_animation(RezonalityInstance* instance,
-    double monotonic_seconds)
-{
-    if (instance->last_animation_seconds >= 0.0
-        && !instance->paused)
-    {
-        instance->animation_elapsed_seconds += std::max(
-            0.0, monotonic_seconds - instance->last_animation_seconds);
-    }
-    instance->last_animation_seconds = monotonic_seconds;
-    return instance->animation_elapsed_seconds;
-}
-
 void* create_instance(const DraxulPluginCreateInfoV2* info)
 {
     if (!info || info->struct_size < sizeof(DraxulPluginCreateInfoV2)
@@ -237,7 +223,7 @@ void* create_instance(const DraxulPluginCreateInfoV2* info)
             request_tick(raw);
         });
     instance->audio_options = options->audio;
-    instance->paused = instance->project->options().paused;
+    instance->animation.set_paused(instance->project->options().paused);
     instance->project->start();
     publish_diagnostics(instance.get(), "watch", "info", {}, -1,
         "building generation 1");
@@ -307,8 +293,8 @@ int32_t handle_input(void* opaque, const DraxulPluginInputEventV2* event)
     if (event->kind == DRAXUL_PLUGIN_INPUT_KEY
         && event->pressed && event->logical_key == 32)
     {
-        instance->paused = !instance->paused;
-        if (!instance->paused)
+        instance->animation.set_paused(!instance->animation.paused);
+        if (!instance->animation.paused)
             request_redraw(instance);
         notify_presentation(instance);
         return 1;
@@ -447,8 +433,8 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
     if (frame->viewport.width <= 0 || frame->viewport.height <= 0)
         return render_result(true, DRAXUL_PLUGIN_NO_DEADLINE);
 
-    const double animation_seconds = advance_animation(
-        instance, frame->monotonic_seconds);
+    const double animation_seconds = instance->animation.advance(
+        frame->monotonic_seconds);
     instance->backend.bind_frame(
         *frame, animation_seconds, instance->camera);
     BoundRuntimeBackend backend(*instance);
@@ -462,7 +448,7 @@ DraxulPluginRenderResultV2 render_metal(void* opaque,
         instance->audio_status = audio->status;
     }
     return instance->backend.record(
-        *frame, audio ? &*audio : nullptr, instance->paused);
+        *frame, audio ? &*audio : nullptr, instance->animation.paused);
 }
 
 #else
@@ -483,8 +469,8 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
     if (frame->viewport.width <= 0 || frame->viewport.height <= 0)
         return render_result(true, DRAXUL_PLUGIN_NO_DEADLINE);
 
-    const double animation_seconds = advance_animation(
-        instance, frame->monotonic_seconds);
+    const double animation_seconds = instance->animation.advance(
+        frame->monotonic_seconds);
     instance->backend.bind_frame(
         *frame, animation_seconds, instance->camera);
     BoundRuntimeBackend backend(*instance);
@@ -498,7 +484,7 @@ DraxulPluginRenderResultV2 render_vulkan(void* opaque,
         instance->audio_status = audio->status;
     }
     return instance->backend.record(
-        *frame, audio ? &*audio : nullptr, instance->paused);
+        *frame, audio ? &*audio : nullptr, instance->animation.paused);
 }
 
 #endif
@@ -515,7 +501,7 @@ int32_t get_presentation_state(void* opaque,
         + " | " + instance->runtime.status();
     if (!instance->audio_status.empty())
         instance->presentation_status += " | " + instance->audio_status;
-    if (instance->paused)
+    if (instance->animation.paused)
         instance->presentation_status += " | paused";
     if (!instance->runtime.visible())
         instance->presentation_status += " | hidden";
@@ -565,8 +551,8 @@ int32_t export_reload_json(void* opaque, char* buffer,
     const std::string value = nlohmann::json{
         { "project_path", instance->options.project_path.generic_string() },
         { "scenegraph", instance->options.scenegraph.generic_string() },
-        { "time_seconds", instance->animation_elapsed_seconds },
-        { "paused", instance->paused },
+        { "time_seconds", instance->animation.elapsed_seconds },
+        { "paused", instance->animation.paused },
         { "camera_position", {
             instance->camera.position.x,
             instance->camera.position.y,
@@ -636,9 +622,10 @@ int32_t import_reload_json(void* opaque, const char* json,
         if (!std::isfinite(time) || time < 0.0 || time > 1e12
             || !position || !focal_point)
             return 0;
-        instance->animation_elapsed_seconds = time;
-        instance->last_animation_seconds = -1.0;
-        instance->paused = state.value("paused", instance->paused);
+        instance->animation.elapsed_seconds = time;
+        instance->animation.last_seconds = -1.0;
+        instance->animation.set_paused(state.value("paused",
+            instance->animation.paused));
         rezonality::camera_set_pos_lookat(
             instance->camera, *position, *focal_point);
         instance->camera_initialized = true;

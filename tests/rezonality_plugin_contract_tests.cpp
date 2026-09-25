@@ -10,11 +10,13 @@
 #include "model_loader.h"
 
 #include <nlohmann/json.hpp>
+#include <glm/geometric.hpp>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -575,6 +577,9 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
         "#version 450\n"
         "layout(location=0) out vec4 fragColor;\n"
         "void main() { fragColor = vec4(1,1,1,1); }\n");
+    write_text(fixture / "first.inc", "#include \"nested.inc\"\n");
+    write_text(fixture / "nested.inc",
+        "vec4 included_color() { return vec4(0,1,0,1); }\n");
 
     HostState host_state;
     DraxulPluginHostApiV2 host{};
@@ -646,7 +651,25 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
         "layout(location=0) out vec4 fragColor;\n"
         "void main() { fragColor = vec4(0,0,1,1); }\n");
     REQUIRE(wait_for_status(*api, instance, presentation, "ready g6"));
-    CHECK(host_state.ticks.load() >= 6);
+    write_text(fixture / "screen.frag",
+        "#version 450\n"
+        "#extension GL_GOOGLE_include_directive : require\n"
+        "#include \"first.inc\"\n"
+        "layout(location=0) out vec4 fragColor;\n"
+        "void main() { fragColor = included_color(); }\n");
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g7"));
+    write_text(fixture / "nested.inc",
+        "vec4 included_color() { return vec4(1,0,1,1); }\n");
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g8"));
+    write_text(fixture / "nested.inc", "this is not valid GLSL\n");
+    REQUIRE(wait_for_status(*api, instance, presentation,
+        "BUILD FAILED g9"));
+    CHECK(presentation_status(instance, presentation).find("nested.inc")
+        != std::string::npos);
+    write_text(fixture / "nested.inc",
+        "vec4 included_color() { return vec4(0,1,0,1); }\n");
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g10"));
+    CHECK(host_state.ticks.load() >= 10);
 
     api->set_visible(instance, 0);
     DraxulPluginTickInfoV2 tick_info{};
@@ -818,6 +841,57 @@ TEST_CASE("Rezonality model assets load immutably and fail as a candidate",
     CHECK(rejected.vertices.empty());
     CHECK(first.materials.back().base_color.pixels == first_pixels);
     fs::remove_all(fixture, ec);
+}
+
+TEST_CASE("Rezonality bakes nonuniform and mirrored model shading bases",
+    "[rezonality][integration][model]")
+{
+    namespace fs = std::filesystem;
+    const fs::path fixture = fs::temp_directory_path()
+        / "draxul-rezonality-model-basis";
+    std::error_code ec;
+    fs::remove_all(fixture, ec);
+    REQUIRE(fs::create_directories(fixture));
+    write_text(fixture / "sloped.obj",
+        "o slope\n"
+        "v 0 0 0\n"
+        "v 1 0 0\n"
+        "v 0 1 1\n"
+        "vt 0 0\n"
+        "vt 1 0\n"
+        "vt 0 1\n"
+        "vn 0 -0.70710678 0.70710678\n"
+        "f 1/1/1 2/2/1 3/3/1\n");
+    rezonality::ModelData scaled;
+    std::string error;
+    REQUIRE(rezonality::load_model(fixture / "sloped.obj",
+        { 1.0f, 2.0f, 3.0f }, false, scaled, error));
+    REQUIRE(scaled.vertices.size() == 3);
+    const auto& vertex = scaled.vertices.front();
+    const glm::vec3 expected = glm::normalize(glm::vec3{
+        0.0f, -0.5f, 1.0f / 3.0f });
+    CHECK(glm::dot(vertex.normal, expected) > 0.999f);
+    CHECK(std::abs(glm::dot(vertex.normal, vertex.tangent)) < 1e-5f);
+    CHECK(std::abs(glm::dot(vertex.normal, vertex.bitangent)) < 1e-5f);
+    const float handedness = glm::dot(glm::cross(vertex.normal,
+        vertex.tangent), vertex.bitangent);
+    CHECK(std::abs(handedness) > 0.999f);
+
+    rezonality::ModelData mirrored;
+    REQUIRE(rezonality::load_model(fixture / "sloped.obj",
+        { -1.0f, 2.0f, 3.0f }, false, mirrored, error));
+    REQUIRE(mirrored.vertices.size() == 3);
+    const auto& reflected = mirrored.vertices.front();
+    CHECK(glm::dot(glm::cross(reflected.normal, reflected.tangent),
+        reflected.bitangent) * handedness < -0.999f);
+    rezonality::ModelData singular;
+    CHECK_FALSE(rezonality::load_model(fixture / "sloped.obj",
+        { 1.0f, 0.0f, 3.0f }, false, singular, error));
+    CHECK(error.find("singular scale") != std::string::npos);
+    CHECK_FALSE(rezonality::load_model(fixture / "sloped.obj",
+        { 1.0f, 1e-30f, 3.0f }, false, singular, error));
+    fs::remove_all(fixture, ec);
+    CHECK_FALSE(ec);
 }
 
 TEST_CASE("Rezonality camera orbit, dolly, and resize stay pane-local",

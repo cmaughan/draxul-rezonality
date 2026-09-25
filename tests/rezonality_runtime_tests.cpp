@@ -1,11 +1,33 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "runtime_controller.h"
+#include "animation_clock.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+TEST_CASE("Rezonality animation excludes idle and rendered paused intervals",
+    "[rezonality][runtime][clock]")
+{
+    rezonality::AnimationClock clock;
+    CHECK(clock.advance(10.0) == 0.0);
+    CHECK(clock.advance(11.0) == 1.0);
+    clock.set_paused(true);
+    CHECK(clock.advance(100.0) == 1.0);
+    CHECK(clock.advance(200.0) == 1.0);
+    clock.set_paused(false);
+    CHECK(clock.advance(500.0) == 1.0);
+    CHECK(clock.advance(500.5) == 1.5);
+    clock.set_paused(true);
+    clock.set_paused(false);
+    CHECK(clock.advance(900.0) == 1.5);
+    CHECK(clock.advance(901.0) == 2.5);
+    clock.elapsed_seconds = 12.5;
+    clock.last_seconds = -1.0;
+    CHECK(clock.advance(1200.0) == 12.5);
+}
 
 namespace
 {

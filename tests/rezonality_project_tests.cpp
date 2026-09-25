@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "live_project.h"
+#include "surface_dimensions.h"
 
 #include <algorithm>
 #include <chrono>
@@ -101,6 +102,57 @@ rezonality::ProjectOptions options(const fs::path& path)
 }
 
 } // namespace
+
+TEST_CASE("Rezonality checks scaled surface dimensions before GPU conversion",
+    "[rezonality][project][surface]")
+{
+    rezonality::ShaderBuild::Surface surface;
+    surface.name = "History";
+    rezonality::SurfaceDimensions dimensions;
+    std::string error;
+    surface.scale_x = 0.5f;
+    surface.scale_y = 2.0f;
+    REQUIRE(rezonality::checked_surface_dimensions(surface,
+        800, 600, 4096, dimensions, error));
+    CHECK(dimensions.width == 400);
+    CHECK(dimensions.height == 1200);
+    surface.scale_x = 1e30f;
+    CHECK_FALSE(rezonality::checked_surface_dimensions(surface,
+        800, 600, 4096, dimensions, error));
+    CHECK(error.find("History") != std::string::npos);
+    CHECK(error.find("width") != std::string::npos);
+    surface.scale_x = 1.0f;
+    surface.scale_y = 1e30f;
+    CHECK_FALSE(rezonality::checked_surface_dimensions(surface,
+        800, 600, 4096, dimensions, error));
+    CHECK(error.find("height") != std::string::npos);
+    surface.scale_y = 1.0f;
+    surface.image_width = 5000;
+    CHECK_FALSE(rezonality::checked_surface_dimensions(surface,
+        800, 600, 4096, dimensions, error));
+    surface.image_width = 64;
+    REQUIRE(rezonality::checked_surface_dimensions(surface,
+        800, 600, 4096, dimensions, error));
+    CHECK(dimensions.width == 64);
+    CHECK(dimensions.height == 600);
+
+    ProjectFixture fixture("simple");
+    const fs::path scenegraph = fixture.path / "default.scenegraph";
+    write(scenegraph, read(scenegraph)
+        + "\nsurface: Huge { scale: (1e30, 1) }\n");
+    rezonality::ProjectPipeline pipeline(plugin_root(),
+        options(fixture.path), accept_shader);
+    const auto candidate = pipeline.build(1);
+    REQUIRE(candidate.build);
+    const auto huge = std::find_if(candidate.build->surfaces.begin(),
+        candidate.build->surfaces.end(), [](const auto& item) {
+            return item.name == "Huge";
+        });
+    REQUIRE(huge != candidate.build->surfaces.end());
+    CHECK_FALSE(rezonality::checked_surface_dimensions(*huge,
+        800, 600, 4096, dimensions, error));
+    CHECK(error.find("Huge") != std::string::npos);
+}
 
 TEST_CASE("Rezonality project pipeline contains malformed numeric input",
     "[rezonality][project]")
@@ -302,6 +354,60 @@ TEST_CASE("Rezonality live watch reports filesystem failure and recovers",
     REQUIRE(recovered);
     REQUIRE(recovered->build);
     CHECK(recovered->generation > failed->generation);
+    live.stop();
+}
+
+TEST_CASE("Rezonality live watch tracks extensionless nested shader includes",
+    "[rezonality][project][watch]")
+{
+    ProjectFixture fixture("simple");
+    const fs::path shader = fixture.path / "screen.frag";
+    const fs::path first = fixture.path / "first.inc";
+    const fs::path nested = fixture.path / "nested.inc";
+    write(first, "#include \"nested.inc\"\n");
+    write(nested, "// initial include\n");
+    write(shader, read(shader) + "\n#include \"first.inc\"\n");
+    auto configured = options(fixture.path);
+    configured.compile_debounce_ms = 0;
+    rezonality::LiveProject live(plugin_root(), configured, [] {},
+        [&nested](const fs::path&, std::vector<uint32_t>& spirv,
+            std::vector<rezonality::DiagnosticEntry>& diagnostics) {
+            const std::string contents = read(nested);
+            if (contents.find("broken") != std::string::npos)
+            {
+                diagnostics.push_back({
+                    .path = nested,
+                    .stage = "compile",
+                    .severity = "error",
+                    .line = 1,
+                    .message = "broken nested include",
+                });
+                return false;
+            }
+            spirv = { 0x07230203u };
+            return true;
+        });
+    live.start();
+    const auto initial = wait_for_result(live);
+    REQUIRE(initial);
+    REQUIRE(initial->build);
+    write(nested, "// changed include\n");
+    const auto edited = wait_for_result(live);
+    REQUIRE(edited);
+    REQUIRE(edited->build);
+    CHECK(edited->generation > initial->generation);
+    write(nested, "broken\n");
+    const auto broken = wait_for_result(live);
+    REQUIRE(broken);
+    CHECK_FALSE(broken->build);
+    CHECK(broken->generation > edited->generation);
+    CHECK(broken->diagnostic_path == nested);
+    CHECK(broken->error == "broken nested include");
+    write(nested, "// repaired include\n");
+    const auto repaired = wait_for_result(live);
+    REQUIRE(repaired);
+    REQUIRE(repaired->build);
+    CHECK(repaired->generation > broken->generation);
     live.stop();
 }
 

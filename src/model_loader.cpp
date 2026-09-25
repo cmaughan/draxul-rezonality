@@ -7,9 +7,12 @@
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 
+#include <glm/geometric.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cmath>
 
 namespace rezonality
 {
@@ -119,11 +122,55 @@ glm::vec3 converted(const aiVector3D& value)
     return { value.x, value.y, value.z };
 }
 
+glm::vec3 normalized_or(const glm::vec3& value,
+    const glm::vec3& fallback)
+{
+    const float length_squared = glm::dot(value, value);
+    return std::isfinite(length_squared) && length_squared > 1e-12f
+        ? value / std::sqrt(length_squared)
+        : fallback;
+}
+
+void bake_basis(ModelVertex& vertex, const glm::vec3& scale)
+{
+    const glm::vec3 original_normal = vertex.normal;
+    const glm::vec3 original_tangent = vertex.tangent;
+    const glm::vec3 original_bitangent = vertex.bitangent;
+    vertex.normal = normalized_or(original_normal / scale,
+        { 0.0f, 0.0f, 1.0f });
+    glm::vec3 tangent = original_tangent * scale;
+    tangent -= vertex.normal * glm::dot(vertex.normal, tangent);
+    const glm::vec3 fallback_axis = std::abs(vertex.normal.z) < 0.9f
+        ? glm::vec3{ 0.0f, 0.0f, 1.0f }
+        : glm::vec3{ 0.0f, 1.0f, 0.0f };
+    vertex.tangent = normalized_or(tangent,
+        normalized_or(glm::cross(fallback_axis, vertex.normal),
+            { 1.0f, 0.0f, 0.0f }));
+    const bool original_left_handed = glm::dot(glm::cross(
+        original_normal, original_tangent), original_bitangent) < 0.0f;
+    const bool mirrored = (scale.x < 0.0f) != (scale.y < 0.0f)
+        != (scale.z < 0.0f);
+    const float handedness = original_left_handed != mirrored
+        ? -1.0f : 1.0f;
+    vertex.bitangent = glm::cross(vertex.normal, vertex.tangent)
+        * handedness;
+}
+
 } // namespace
 
 bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
     bool flip_texture_y, ModelData& model, std::string& error)
 {
+    if (!std::isfinite(scale.x) || !std::isfinite(scale.y)
+        || !std::isfinite(scale.z)
+        || std::abs(scale.x) < 1e-8f
+        || std::abs(scale.y) < 1e-8f
+        || std::abs(scale.z) < 1e-8f)
+    {
+        error = "Model '" + path.string()
+            + "' has a non-finite or singular scale";
+        return false;
+    }
     Assimp::Importer importer;
     constexpr unsigned flags = aiProcess_Triangulate
         | aiProcess_PreTransformVertices
@@ -221,6 +268,7 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
                 vertex.bitangent
                     = converted(mesh.mBitangents[vertex_index]);
             }
+            bake_basis(vertex, scale);
             if (mesh.HasVertexColors(0))
             {
                 const aiColor4D& color = mesh.mColors[0][vertex_index];

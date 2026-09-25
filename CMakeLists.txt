@@ -133,8 +133,10 @@ target_link_libraries(draxul-rezonality-audio PRIVATE
     ${DRAXUL_REZONALITY_SDL_TARGET})
 
 add_library(draxul-rezonality-plugin MODULE
+    src/animation_clock.h
     src/native_backend.h
     src/native_backend_helpers.h
+    src/surface_dimensions.h
     ${_rezonality_native_backend_source}
     src/rezonality_plugin.cpp)
 target_link_libraries(draxul-rezonality-plugin PRIVATE

@@ -16,6 +16,12 @@ Vulkan ray shader groups or the native Metal ray kernel. Saving any scenegraph,
 shader, include, model, or texture dependency triggers a debounced rebuild. A
 bad edit, missing asset, or unsupported ray capability is reported while the
 complete last-known-good generation keeps rendering.
+The watcher includes shader dependencies with arbitrary filenames, including
+nested `.inc` files. Procedural surface dimensions are checked against GPU
+texture limits before allocation; an oversized candidate reports a preparation
+error without replacing the last valid generation. Imported model normals and
+tangent bases are transformed with baked nonuniform or mirrored scale; singular
+model scales are rejected as candidate errors.
 
 The `audio_spectrum_analysis` project adds a product-owned stereo waveform and
 FFT texture. Live instances share one SDL recording stream per selected input
@@ -82,8 +88,9 @@ composite shaders directly. Its active live-edit sources are
 top-level approximation shaders have been removed. Other original VkLive
 source remains under each project's `vklive-original/` directory. Animated
 shaders receive frame-safe camera/model/view/projection uniforms at
-approximately 60 Hz while visible. Space pauses/resumes animation, left-drag
-orbits the active camera, and the mouse wheel dollies. Use the pane action
+approximately 60 Hz while visible. Space pauses/resumes animation without
+counting the paused interval, even if no frames render during the pause.
+Left-drag orbits the active camera, and the mouse wheel dollies. Use the pane action
 **Reload Rezonality Project** to bypass the debounce and force a rebuild. The
 status progresses through `building`, `ready`, and `live`. A failed candidate
 is surfaced in the pane-local status pill as `BUILD FAILED gN`; when a prior

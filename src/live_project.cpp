@@ -1251,22 +1251,16 @@ uint64_t ProjectPipeline::fingerprint() const
             throw std::runtime_error("could not scan Rezonality project: "
                 + ec.message());
         const auto& entry = *iterator;
+        // Shader includes have no required suffix. Ignore only repository
+        // metadata, not unrecognized files that a shader may include.
+        if (entry.is_directory() && entry.path().filename() == ".git")
+        {
+            iterator.disable_recursion_pending();
+            continue;
+        }
         std::error_code entry_error;
         if (entry.is_regular_file(entry_error))
-        {
-            const auto extension = entry.path().extension().string();
-            if (extension == ".toml" || extension == ".scenegraph"
-                || extension == ".vert" || extension == ".frag"
-                || extension == ".glsl" || extension == ".h"
-                || extension == ".rgen" || extension == ".rmiss"
-                || extension == ".rchit" || extension == ".metal"
-                || extension == ".png" || extension == ".jpg"
-                || extension == ".jpeg" || extension == ".bmp"
-                || extension == ".hdr" || extension == ".gltf"
-                || extension == ".glb" || extension == ".obj"
-                || extension == ".mtl" || extension == ".bin")
-                files.push_back(entry.path());
-        }
+            files.push_back(entry.path());
         else if (entry_error)
             throw std::runtime_error("could not inspect Rezonality project file: "
                 + entry_error.message());

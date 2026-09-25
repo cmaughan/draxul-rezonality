@@ -2,6 +2,7 @@
 
 #include "gpu_resource_transaction.h"
 #include "native_backend_helpers.h"
+#include "surface_dimensions.h"
 
 #include <draxul/plugin_adapter.h>
 #include <draxul/vulkan/vk_plugin_allocator.h>
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -130,6 +132,7 @@ struct VulkanGeneration
     std::vector<VulkanPassResource> passes;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t max_surface_dimension = 0;
     uint64_t target_generation = 0;
     uint64_t source_generation = 0;
     uint64_t used_slots = 0;
@@ -444,10 +447,13 @@ bool create_surface(VulkanGeneration& generation,
     surface.aspect = source.format == ShaderBuild::SurfaceFormat::Depth32
         ? VK_IMAGE_ASPECT_DEPTH_BIT
         : VK_IMAGE_ASPECT_COLOR_BIT;
-    surface.width = source.image_width != 0 ? source.image_width
-                                            : std::max(1u, static_cast<uint32_t>(pane_width * std::max(0.01f, source.scale_x)));
-    surface.height = source.image_height != 0 ? source.image_height
-                                              : std::max(1u, static_cast<uint32_t>(pane_height * std::max(0.01f, source.scale_y)));
+    rezonality::SurfaceDimensions dimensions;
+    if (!rezonality::checked_surface_dimensions(source, pane_width,
+            pane_height, generation.max_surface_dimension,
+            dimensions, error))
+        return false;
+    surface.width = dimensions.width;
+    surface.height = dimensions.height;
     const bool depth = surface.aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
     const VkImageUsageFlags usage = depth
         ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
@@ -1612,6 +1618,13 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
     generation.height = static_cast<uint32_t>(std::max(1, frame.viewport.height));
     generation.buffered_frame_count
         = std::max(1u, frame.buffered_frame_count);
+    VkPhysicalDeviceProperties device_properties{};
+    vkGetPhysicalDeviceProperties(
+        static_cast<VkPhysicalDevice>(frame.physical_device),
+        &device_properties);
+    generation.max_surface_dimension = std::min<uint32_t>(
+        device_properties.limits.maxImageDimension2D,
+        static_cast<uint32_t>(std::numeric_limits<int>::max()));
     if (generation.ray_project
         && !load_ray_functions(generation,
             static_cast<VkPhysicalDevice>(frame.physical_device), error))
@@ -1631,10 +1644,6 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
             destroy_generation(generation);
             return std::nullopt;
         }
-    VkPhysicalDeviceProperties device_properties{};
-    vkGetPhysicalDeviceProperties(
-        static_cast<VkPhysicalDevice>(frame.physical_device),
-        &device_properties);
     generation.uniform_stride = align_up(sizeof(CommonUniformBlock),
         static_cast<size_t>(device_properties.limits
                                 .minUniformBufferOffsetAlignment));
