@@ -5,12 +5,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #if defined(_WIN32)
@@ -371,14 +376,6 @@ ProcessResult run_process(const std::vector<fs::path>& arguments)
 
 #endif
 
-struct SceneDescription
-{
-    fs::path scenegraph;
-    std::vector<ShaderBuild::Surface> surfaces;
-    std::vector<ModelData> models;
-    std::vector<ShaderBuild::Pass> passes;
-};
-
 std::optional<std::string> first_match(const std::string& source,
     const std::regex& expression)
 {
@@ -427,20 +424,58 @@ std::vector<std::string> parse_list(
     return values;
 }
 
+float checked_float(std::string_view text, std::string_view field)
+{
+    std::string owned(text);
+    char* end = nullptr;
+    errno = 0;
+    const float value = std::strtof(owned.c_str(), &end);
+    if (end != owned.data() + owned.size() || errno == ERANGE
+        || !std::isfinite(value))
+    {
+        throw std::runtime_error("invalid finite number for '"
+            + std::string(field) + "': " + owned);
+    }
+    return value;
+}
+
+bool has_numeric_field(const std::string& body, std::string_view key)
+{
+    return std::regex_search(body,
+        std::regex("\\b" + std::string(key) + R"(\s*:)"));
+}
+
+const std::string& numeric_token_capture()
+{
+    static const std::string capture = R"(([^\s,\)\}]+))";
+    return capture;
+}
+
+[[noreturn]] void throw_invalid_numeric_field(std::string_view key)
+{
+    throw std::runtime_error("invalid numeric value for '"
+        + std::string(key) + "'");
+}
+
 void parse_vec4(const std::string& body, std::string_view key,
     float (&value)[4], bool* found = nullptr)
 {
+    const auto& number = numeric_token_capture();
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+        + R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*,\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*\))");
     std::smatch match;
     if (!std::regex_search(body, match, expression))
     {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         if (found)
             *found = false;
         return;
     }
     for (size_t index = 0; index < 4; ++index)
-        value[index] = std::stof(match[index + 1].str());
+        value[index] = checked_float(match[index + 1].str(), key);
     if (found)
         *found = true;
 }
@@ -448,25 +483,39 @@ void parse_vec4(const std::string& body, std::string_view key,
 bool parse_vec3(const std::string& body, std::string_view key,
     glm::vec3& value)
 {
+    const auto& number = numeric_token_capture();
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+        + R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*,\s*)" + number + R"(\s*\))");
     std::smatch match;
     if (!std::regex_search(body, match, expression))
+    {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         return false;
-    value = { std::stof(match[1].str()), std::stof(match[2].str()),
-        std::stof(match[3].str()) };
+    }
+    value = { checked_float(match[1].str(), key),
+        checked_float(match[2].str(), key),
+        checked_float(match[3].str(), key) };
     return true;
 }
 
 bool parse_vec2(const std::string& body, std::string_view key,
     glm::vec2& value)
 {
+    const auto& number = numeric_token_capture();
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+)\s*\))");
+        + R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + R"(\s*\))");
     std::smatch match;
     if (!std::regex_search(body, match, expression))
+    {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         return false;
-    value = { std::stof(match[1].str()), std::stof(match[2].str()) };
+    }
+    value = { checked_float(match[1].str(), key),
+        checked_float(match[2].str(), key) };
     return true;
 }
 
@@ -474,12 +523,54 @@ bool parse_scalar(const std::string& body, std::string_view key,
     float& value)
 {
     const std::regex expression("\\b" + std::string(key)
-        + R"(\s*:\s*([-+.0-9]+))");
+        + R"(\s*:\s*)" + numeric_token_capture());
     const auto matched = first_match(body, expression);
     if (!matched)
+    {
+        if (has_numeric_field(body, key))
+            throw_invalid_numeric_field(key);
         return false;
-    value = std::stof(*matched);
+    }
+    value = checked_float(*matched, key);
     return true;
+}
+
+bool parse_surface_scale(const std::string& body, float& scale_x,
+    float& scale_y)
+{
+    const auto& number = numeric_token_capture();
+    const std::regex expression("\\bscale"
+        R"(\s*:\s*\(\s*)" + number + R"(\s*,\s*)" + number
+        + "(?:\\s*,\\s*" + number + ")?"
+        + R"(\s*\))");
+    std::smatch match;
+    if (!std::regex_search(body, match, expression))
+    {
+        if (has_numeric_field(body, "scale"))
+            throw_invalid_numeric_field("scale");
+        return false;
+    }
+    scale_x = checked_float(match[1].str(), "scale");
+    scale_y = checked_float(match[2].str(), "scale");
+    return true;
+}
+
+void parse_surface_format(const std::string& body,
+    ShaderBuild::Surface& surface)
+{
+    const auto format = first_match(body,
+        std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))"));
+    if (!format)
+        return;
+    surface.format_explicit = true;
+    if (*format == "rgba16f")
+        surface.format = ShaderBuild::SurfaceFormat::Color16Float;
+    else if (*format == "rgba32f")
+        surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+    else if (format->find("depth") != std::string::npos)
+        surface.format = ShaderBuild::SurfaceFormat::Depth32;
+    else
+        surface.format = ShaderBuild::SurfaceFormat::Color8;
 }
 
 bool parse_uv_origin(const std::string& body, std::string_view owner,
@@ -519,21 +610,13 @@ std::vector<std::pair<std::string, std::string>> named_blocks(
     return blocks;
 }
 
-std::optional<SceneDescription> load_scene(const ProjectOptions& options,
-    fs::path& diagnostic_path, int& diagnostic_line, std::string& error)
+std::optional<SceneDescription> parse_scene_text_impl(
+    const ProjectOptions& options, const fs::path& scenegraph,
+    std::string_view source, fs::path& diagnostic_path,
+    int& diagnostic_line, std::string& error)
 {
-    fs::path scenegraph = options.scenegraph;
-    if (scenegraph.is_relative())
-        scenegraph = options.project_path / scenegraph;
     diagnostic_path = scenegraph;
-    const auto source = read_text(scenegraph);
-    if (!source)
-    {
-        error = "Scenegraph is missing: " + scenegraph.string();
-        return std::nullopt;
-    }
-
-    const std::string parsed = without_comments(*source);
+    const std::string parsed = without_comments(std::string(source));
     static const std::regex vertex_expression(
         R"(\bvs\s*:\s*([a-zA-Z_\-][a-zA-Z0-9_\-\/.]*))");
     static const std::regex fragment_expression(
@@ -589,17 +672,15 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
             diagnostic_line = 1;
             return std::nullopt;
         }
-        ModelData model;
         const fs::path model_path
             = options.project_path / fs::u8path(*path);
-        if (!load_model(model_path, scale, flip_texture_y, model, error))
-        {
-            diagnostic_path = model_path;
-            diagnostic_line = 1;
-            return std::nullopt;
-        }
         model_indices[name] = description.models.size();
-        description.models.push_back(std::move(model));
+        description.models.push_back({
+            .name = name,
+            .path = model_path,
+            .scale = scale,
+            .flip_texture_y = flip_texture_y,
+        });
     }
     for (const auto& [name, body] : named_blocks(parsed, "surface"))
     {
@@ -618,24 +699,8 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         if (const auto path = first_match(body,
                 std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
             surface.path = options.project_path / fs::u8path(*path);
-        if (const auto format = first_match(body,
-                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))")))
-        {
-            if (*format == "rgba16f")
-                surface.format = ShaderBuild::SurfaceFormat::Color16Float;
-            else if (*format == "rgba32f")
-                surface.format = ShaderBuild::SurfaceFormat::Color32Float;
-            else if (format->find("depth") != std::string::npos)
-                surface.format = ShaderBuild::SurfaceFormat::Depth32;
-        }
-        const std::regex scale_expression(
-            R"(\bscale\s*:\s*\(\s*([-+.0-9]+)\s*,\s*([-+.0-9]+))");
-        std::smatch scale;
-        if (std::regex_search(body, scale, scale_expression))
-        {
-            surface.scale_x = std::stof(scale[1].str());
-            surface.scale_y = std::stof(scale[2].str());
-        }
+        parse_surface_format(body, surface);
+        parse_surface_scale(body, surface.scale_x, surface.scale_y);
         parse_vec4(body, "clear", surface.clear);
         description.surfaces.push_back(std::move(surface));
     }
@@ -646,10 +711,7 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
         if (const auto path = first_match(body,
                 std::regex(R"(\bpath\s*:\s*([A-Za-z0-9_\-\/.]+))")))
             surface.path = options.project_path / fs::u8path(*path);
-        if (const auto format = first_match(body,
-                std::regex(R"(\bformat\s*:\s*([A-Za-z0-9_]+))"));
-            format && *format == "rgba32f")
-            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+        parse_surface_format(body, surface);
         description.surfaces.push_back(std::move(surface));
     }
 
@@ -743,17 +805,15 @@ std::optional<SceneDescription> load_scene(const ProjectOptions& options,
                 diagnostic_line = 1;
                 return std::nullopt;
             }
-            ModelData model;
             const fs::path model_path
                 = options.project_path / fs::u8path(*geometry_path);
-            if (!load_model(model_path, scale, flip_texture_y, model, error))
-            {
-                diagnostic_path = model_path;
-                diagnostic_line = 1;
-                return std::nullopt;
-            }
             pass.model_index = description.models.size();
-            description.models.push_back(std::move(model));
+            description.models.push_back({
+                .name = name + ".geometry",
+                .path = model_path,
+                .scale = scale,
+                .flip_texture_y = flip_texture_y,
+            });
         }
         if (pass.ray_trace && !pass.model_index)
         {
@@ -955,6 +1015,29 @@ fs::path compiler_path(const fs::path& plugin_directory)
 
 } // namespace
 
+SceneParseResult parse_scene_text(const ProjectOptions& options,
+    const fs::path& scenegraph, std::string_view source)
+{
+    SceneParseResult result;
+    result.diagnostic_path = scenegraph;
+    try
+    {
+        result.scene = parse_scene_text_impl(options, scenegraph, source,
+            result.diagnostic_path, result.diagnostic_line, result.error);
+    }
+    catch (const std::exception& exception)
+    {
+        result.error = std::string("Rezonality project build failed: ")
+            + exception.what();
+    }
+    catch (...)
+    {
+        result.error
+            = "Rezonality project build failed with an unknown error";
+    }
+    return result;
+}
+
 std::optional<ProjectOptions> parse_project_options(
     const fs::path& plugin_directory, const char* config_json,
     size_t config_json_length, std::string& error)
@@ -1068,10 +1151,49 @@ std::optional<ProjectOptions> parse_project_options(
     return options;
 }
 
-LiveProject::LiveProject(fs::path plugin_directory,
-    ProjectOptions options, WakeCallback wake)
+ProjectPipeline::ProjectPipeline(fs::path plugin_directory,
+    ProjectOptions options, CompileShader compile_shader)
     : plugin_directory_(std::move(plugin_directory))
     , options_(std::move(options))
+    , compile_shader_(std::move(compile_shader))
+{
+}
+
+bool validate_surface_upload_storage(
+    const ShaderBuild::Surface& surface, std::string& error)
+{
+    const bool byte_storage = !surface.image_pixels.empty();
+    const bool float_storage = !surface.image_float_pixels.empty();
+    if (!byte_storage && !float_storage)
+        return true;
+    if (surface.image_width == 0 || surface.image_height == 0
+        || byte_storage == float_storage
+        || surface.image_width > std::numeric_limits<size_t>::max()
+                / surface.image_height / 4)
+    {
+        error = "Rezonality image surface '" + surface.name
+            + "' has invalid upload storage";
+        return false;
+    }
+    const size_t expected = static_cast<size_t>(surface.image_width)
+        * surface.image_height * 4;
+    const bool valid = byte_storage
+        ? surface.format == ShaderBuild::SurfaceFormat::Color8
+            && surface.image_pixels.size() == expected
+        : surface.format == ShaderBuild::SurfaceFormat::Color32Float
+            && surface.image_float_pixels.size() == expected;
+    if (valid)
+        return true;
+    error = "Rezonality image surface '" + surface.name
+        + "' has invalid upload storage";
+    return false;
+}
+
+LiveProject::LiveProject(fs::path plugin_directory,
+    ProjectOptions options, WakeCallback wake,
+    ProjectPipeline::CompileShader compile_shader)
+    : pipeline_(std::move(plugin_directory), std::move(options),
+          std::move(compile_shader))
     , wake_(std::move(wake))
 {
 }
@@ -1113,16 +1235,24 @@ std::optional<BuildResult> LiveProject::take_result()
     return result;
 }
 
-uint64_t LiveProject::project_fingerprint() const
+uint64_t ProjectPipeline::fingerprint() const
 {
     uint64_t hash = kFnvOffset;
     std::error_code ec;
     fs::recursive_directory_iterator iterator(options_.project_path,
         fs::directory_options::skip_permission_denied, ec);
+    if (ec)
+        throw std::runtime_error("could not scan Rezonality project: "
+            + ec.message());
     std::vector<fs::path> files;
-    for (const auto& entry : iterator)
+    for (; iterator != fs::recursive_directory_iterator(); iterator.increment(ec))
     {
-        if (entry.is_regular_file(ec))
+        if (ec)
+            throw std::runtime_error("could not scan Rezonality project: "
+                + ec.message());
+        const auto& entry = *iterator;
+        std::error_code entry_error;
+        if (entry.is_regular_file(entry_error))
         {
             const auto extension = entry.path().extension().string();
             if (extension == ".toml" || extension == ".scenegraph"
@@ -1137,7 +1267,13 @@ uint64_t LiveProject::project_fingerprint() const
                 || extension == ".mtl" || extension == ".bin")
                 files.push_back(entry.path());
         }
+        else if (entry_error)
+            throw std::runtime_error("could not inspect Rezonality project file: "
+                + entry_error.message());
     }
+    if (ec)
+        throw std::runtime_error("could not scan Rezonality project: "
+            + ec.message());
     std::sort(files.begin(), files.end());
     for (const auto& file : files)
     {
@@ -1148,32 +1284,25 @@ uint64_t LiveProject::project_fingerprint() const
     return hash;
 }
 
-BuildResult LiveProject::build(uint64_t generation) const
+BuildResult build_candidate(const fs::path& plugin_directory,
+    const ProjectOptions& options, SceneDescription scene,
+    uint64_t generation, const fs::path& output_directory,
+    CompileShaderOperation compile_shader_operation)
 {
     BuildResult result;
     result.generation = generation;
-    int line = -1;
-    fs::path diagnostic;
-    std::string error;
-    auto scene = load_scene(options_, diagnostic, line, error);
-    if (!scene)
+    try
     {
-        result.diagnostic_path = std::move(diagnostic);
-        result.diagnostic_line = line;
-        result.error = std::move(error);
-        return result;
-    }
-
-    const fs::path compiler = compiler_path(plugin_directory_);
-    if (!fs::is_regular_file(compiler))
+    const fs::path compiler = compiler_path(plugin_directory);
+    std::error_code compiler_error;
+    if (!compile_shader_operation
+        && !fs::is_regular_file(compiler, compiler_error))
     {
         result.diagnostic_path = compiler;
         result.error = "Bundled glslangValidator is missing";
         return result;
     }
 
-    const fs::path output_directory = fs::temp_directory_path()
-        / "draxul-rezonality" / std::to_string(reinterpret_cast<uintptr_t>(this));
     std::error_code ec;
     fs::create_directories(output_directory, ec);
     if (ec)
@@ -1185,13 +1314,52 @@ BuildResult LiveProject::build(uint64_t generation) const
 
     ShaderBuild candidate;
     candidate.generation = generation;
-    candidate.project_path = options_.project_path;
-    candidate.scenegraph_path = scene->scenegraph;
-    candidate.surfaces = scene->surfaces;
-    candidate.models = std::move(scene->models);
-    candidate.passes = scene->passes;
+    candidate.project_path = options.project_path;
+    candidate.scenegraph_path = scene.scenegraph;
+    candidate.surfaces = std::move(scene.surfaces);
+    candidate.passes = std::move(scene.passes);
+    candidate.models.reserve(scene.models.size());
+    for (const SceneModelSource& source : scene.models)
+    {
+        ModelData model;
+        if (!load_model(source.path, source.scale, source.flip_texture_y,
+                model, result.error))
+        {
+            result.diagnostic_path = source.path;
+            result.diagnostic_line = 1;
+            return result;
+        }
+        candidate.models.push_back(std::move(model));
+    }
     collect_active_sources(candidate);
     bool shader_compile_failed = false;
+    const auto compile = [&compile_shader_operation, &compiler, &options,
+                             &result](
+                             const fs::path& shader,
+                             const fs::path& output,
+                             std::vector<uint32_t>& spirv) {
+        if (!compile_shader_operation)
+        {
+            return compile_shader(compiler, options.project_path,
+                shader, output, spirv, result.diagnostics);
+        }
+        if (!compile_shader_operation(
+                shader, spirv, result.diagnostics))
+            return false;
+        if (!spirv.empty())
+            return true;
+        if (result.diagnostics.size() < kMaximumBuildDiagnostics)
+        {
+            result.diagnostics.push_back({
+                .path = shader,
+                .stage = "compile",
+                .severity = "error",
+                .message = "injected compiler produced no SPIR-V for "
+                    + shader.filename().string(),
+            });
+        }
+        return false;
+    };
     for (auto& surface : candidate.surfaces)
     {
         if (surface.path.empty())
@@ -1208,8 +1376,18 @@ BuildResult LiveProject::build(uint64_t generation) const
             result.diagnostic_path = surface.path;
             return result;
         }
-        if (hdr)
-            surface.format = ShaderBuild::SurfaceFormat::Color32Float;
+        const auto storage_format = hdr
+            ? ShaderBuild::SurfaceFormat::Color32Float
+            : ShaderBuild::SurfaceFormat::Color8;
+        if (surface.format_explicit && surface.format != storage_format)
+        {
+            result.diagnostic_path = surface.path;
+            result.error = "Image surface '" + surface.name
+                + "' has a format that is incompatible with decoded "
+                  "pixel storage";
+            return result;
+        }
+        surface.format = storage_format;
     }
     for (size_t index = 0; index < candidate.passes.size(); ++index)
     {
@@ -1224,15 +1402,12 @@ BuildResult LiveProject::build(uint64_t generation) const
                 = output_directory / ("miss-" + stem + ".spv");
             const fs::path closest_output
                 = output_directory / ("closest-" + stem + ".spv");
-            const bool raygen_ok = compile_shader(compiler,
-                options_.project_path, pass.raygen_path, raygen_output,
-                pass.raygen_spirv, result.diagnostics);
-            const bool miss_ok = compile_shader(compiler,
-                options_.project_path, pass.miss_path, miss_output,
-                pass.miss_spirv, result.diagnostics);
-            const bool closest_ok = compile_shader(compiler,
-                options_.project_path, pass.closest_hit_path, closest_output,
-                pass.closest_hit_spirv, result.diagnostics);
+            const bool raygen_ok = compile(pass.raygen_path,
+                raygen_output, pass.raygen_spirv);
+            const bool miss_ok = compile(pass.miss_path,
+                miss_output, pass.miss_spirv);
+            const bool closest_ok = compile(pass.closest_hit_path,
+                closest_output, pass.closest_hit_spirv);
             if (!raygen_ok || !miss_ok || !closest_ok)
             {
                 shader_compile_failed = true;
@@ -1258,12 +1433,10 @@ BuildResult LiveProject::build(uint64_t generation) const
             = output_directory / ("vertex-" + stem + ".spv");
         const fs::path fragment_output
             = output_directory / ("fragment-" + stem + ".spv");
-        const bool vertex_ok = compile_shader(compiler,
-            options_.project_path, pass.vertex_path, vertex_output,
-            pass.vertex_spirv, result.diagnostics);
-        const bool fragment_ok = compile_shader(compiler,
-            options_.project_path, pass.fragment_path, fragment_output,
-            pass.fragment_spirv, result.diagnostics);
+        const bool vertex_ok = compile(pass.vertex_path,
+            vertex_output, pass.vertex_spirv);
+        const bool fragment_ok = compile(pass.fragment_path,
+            fragment_output, pass.fragment_spirv);
         if (!vertex_ok || !fragment_ok)
         {
             shader_compile_failed = true;
@@ -1281,15 +1454,75 @@ BuildResult LiveProject::build(uint64_t generation) const
     }
     result.build = std::move(candidate);
     return result;
+    }
+    catch (const std::exception& exception)
+    {
+        result.diagnostic_path = options.project_path / options.scenegraph;
+        result.error = std::string("Rezonality project build failed: ")
+            + exception.what();
+        return result;
+    }
+    catch (...)
+    {
+        result.diagnostic_path = options.project_path / options.scenegraph;
+        result.error = "Rezonality project build failed with an unknown error";
+        return result;
+    }
+}
+
+BuildResult ProjectPipeline::build(uint64_t generation) const
+{
+    fs::path scenegraph = options_.scenegraph;
+    if (scenegraph.is_relative())
+        scenegraph = options_.project_path / scenegraph;
+    const auto source = read_text(scenegraph);
+    if (!source)
+    {
+        BuildResult result;
+        result.generation = generation;
+        result.diagnostic_path = scenegraph;
+        result.error = "Scenegraph is missing: " + scenegraph.string();
+        return result;
+    }
+
+    SceneParseResult parsed = parse_scene_text(
+        options_, scenegraph, *source);
+    if (!parsed.scene)
+    {
+        BuildResult result;
+        result.generation = generation;
+        result.diagnostic_path = std::move(parsed.diagnostic_path);
+        result.diagnostic_line = parsed.diagnostic_line;
+        result.error = std::move(parsed.error);
+        return result;
+    }
+
+    const fs::path output_directory = fs::temp_directory_path()
+        / "draxul-rezonality"
+        / std::to_string(reinterpret_cast<uintptr_t>(this));
+    return build_candidate(plugin_directory_, options_,
+        std::move(*parsed.scene), generation, output_directory,
+        compile_shader_);
 }
 
 void LiveProject::run(std::stop_token stop_token)
 {
+    const ProjectOptions& options = pipeline_.options();
     uint64_t generation = 0;
-    uint64_t observed_fingerprint = project_fingerprint();
+    uint64_t observed_fingerprint = 0;
+    std::string last_watch_error;
+    try
+    {
+        observed_fingerprint = pipeline_.fingerprint();
+    }
+    catch (const std::exception&)
+    {
+        // The watch loop publishes the next fingerprint failure as a normal
+        // build result and keeps polling for a repaired project directory.
+    }
     bool dirty = true;
     auto dirty_since = std::chrono::steady_clock::now()
-        - std::chrono::milliseconds(options_.compile_debounce_ms);
+        - std::chrono::milliseconds(options.compile_debounce_ms);
 
     while (!stop_token.stop_requested())
     {
@@ -1301,9 +1534,9 @@ void LiveProject::run(std::stop_token stop_token)
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (forced || (dirty && now - dirty_since >= std::chrono::milliseconds(options_.compile_debounce_ms)))
+        if (forced || (dirty && now - dirty_since >= std::chrono::milliseconds(options.compile_debounce_ms)))
         {
-            BuildResult next = build(++generation);
+            BuildResult next = pipeline_.build(++generation);
             {
                 std::lock_guard lock(mutex_);
                 result_ = std::move(next);
@@ -1320,10 +1553,37 @@ void LiveProject::run(std::stop_token stop_token)
         lock.unlock();
         if (stop_token.stop_requested())
             break;
-        if (options_.auto_reload)
+        if (options.auto_reload)
         {
-            const uint64_t fingerprint = project_fingerprint();
-            if (fingerprint != observed_fingerprint)
+            uint64_t fingerprint = observed_fingerprint;
+            try
+            {
+                fingerprint = pipeline_.fingerprint();
+            }
+            catch (const std::exception& exception)
+            {
+                const std::string watch_error = exception.what();
+                if (watch_error == last_watch_error)
+                    continue;
+                last_watch_error = watch_error;
+                BuildResult failed;
+                failed.generation = ++generation;
+                failed.diagnostic_path = options.project_path;
+                failed.error = std::string("Rezonality project watch failed: ")
+                    + watch_error;
+                {
+                    std::lock_guard result_lock(mutex_);
+                    result_ = std::move(failed);
+                }
+                if (wake_ && !stop_token.stop_requested())
+                    wake_();
+                continue;
+            }
+            const bool recovered_from_watch_error
+                = !last_watch_error.empty();
+            last_watch_error.clear();
+            if (recovered_from_watch_error
+                || fingerprint != observed_fingerprint)
             {
                 observed_fingerprint = fingerprint;
                 dirty = true;

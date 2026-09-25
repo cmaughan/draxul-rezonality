@@ -1,5 +1,6 @@
 #include "audio_analysis.h"
 
+#include "audio_capture.h"
 #include "mic_permission.h"
 
 #include <SDL3/SDL.h>
@@ -9,11 +10,13 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <numbers>
 #include <thread>
+#include <utility>
 
 namespace rezonality
 {
@@ -161,77 +164,37 @@ AudioTextureFrame synthetic_frame()
     return make_texture(left, right, 1, "audio synthetic fixture");
 }
 
-class CaptureService final
+} // namespace
+
+namespace detail
 {
-public:
-    explicit CaptureService(std::string device_name)
-        : device_name_(std::move(device_name))
-        , frame_(make_texture(left_, right_, 0, "audio opening input"))
-        , opener_([this](std::stop_token stop) { open(stop); })
+
+struct AudioCaptureService::Impl
+{
+    Impl(std::string device_name,
+        std::shared_ptr<const AudioCaptureOperations> operations)
+        : device_name(std::move(device_name))
+        , operations(std::move(operations))
+        , frame(make_texture(left, right, 0, "audio opening input"))
+        , opener([this](std::stop_token stop) { open(stop); })
     {
     }
 
-    ~CaptureService()
+    ~Impl()
     {
-        opener_.request_stop();
-        if (opener_.joinable())
-            opener_.join();
-        std::lock_guard lock(mutex_);
-        if (stream_)
-            SDL_DestroyAudioStream(stream_);
-    }
+        opener.request_stop();
+        if (opener.joinable())
+            opener.join();
 
-    void add_visible()
-    {
-        std::lock_guard lock(mutex_);
-        ++visible_clients_;
-        if (stream_ && visible_clients_ == 1)
-            SDL_ResumeAudioStreamDevice(stream_);
-    }
-
-    void remove_visible()
-    {
-        std::lock_guard lock(mutex_);
-        if (visible_clients_ == 0)
-            return;
-        --visible_clients_;
-        if (stream_ && visible_clients_ == 0)
+        AudioStreamHandle owned_stream = nullptr;
         {
-            SDL_PauseAudioStreamDevice(stream_);
-            SDL_ClearAudioStream(stream_);
+            std::lock_guard lock(mutex);
+            owned_stream = std::exchange(stream, nullptr);
         }
+        if (owned_stream)
+            operations->destroy(owned_stream);
     }
 
-    AudioTextureFrame frame()
-    {
-        std::lock_guard lock(mutex_);
-        if (!stream_ || visible_clients_ == 0)
-            return frame_;
-
-        const int available = SDL_GetAudioStreamAvailable(stream_);
-        if (available <= 0)
-            return frame_;
-        if (available > 48000 * static_cast<int>(kChannels)
-                * static_cast<int>(sizeof(float)) * 3)
-        {
-            SDL_ClearAudioStream(stream_);
-            return frame_;
-        }
-
-        samples_.resize(static_cast<size_t>(available) / sizeof(float));
-        const int bytes = SDL_GetAudioStreamData(stream_, samples_.data(),
-            static_cast<int>(samples_.size() * sizeof(float)));
-        if (bytes <= 0)
-            return frame_;
-        const size_t frames = static_cast<size_t>(bytes)
-            / (sizeof(float) * kChannels);
-        append(left_, samples_, frames, 0);
-        append(right_, samples_, frames, 1);
-        frame_ = make_texture(left_, right_, ++generation_, status_);
-        return frame_;
-    }
-
-private:
     static void append(SampleWindow& window,
         const std::vector<float>& interleaved, size_t frames,
         uint32_t channel)
@@ -247,121 +210,287 @@ private:
                 = interleaved[(source_first + index) * kChannels + channel];
     }
 
-    void fail(std::string error)
+    std::string error() const
     {
-        std::lock_guard lock(mutex_);
-        status_ = "audio unavailable: " + std::move(error);
-        frame_.status = status_;
+        return operations->last_error ? operations->last_error()
+                                      : "unknown device error";
+    }
+
+    void fail(std::string message)
+    {
+        std::lock_guard lock(mutex);
+        status = "audio unavailable: " + std::move(message);
+        frame.status = status;
     }
 
     void open(std::stop_token stop)
     {
-        if (!SDL_WasInit(SDL_INIT_AUDIO)
-            && !SDL_InitSubSystem(SDL_INIT_AUDIO))
+        if (!operations->initialize())
         {
-            fail(std::string("SDL audio init failed: ") + SDL_GetError());
+            fail("SDL audio init failed: " + error());
             return;
         }
 
         while (!stop.stop_requested())
         {
-            const MicPermission permission = query_mic_permission();
-            if (permission == MicPermission::Granted)
+            const MicPermission current = operations->permission();
+            if (current == MicPermission::Granted)
                 break;
-            if (permission == MicPermission::Denied)
+            if (current == MicPermission::Denied)
             {
                 fail("microphone permission denied");
                 return;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            operations->wait(stop, std::chrono::milliseconds(100));
         }
         if (stop.stop_requested())
             return;
 
-        SDL_AudioDeviceID device = SDL_AUDIO_DEVICE_DEFAULT_RECORDING;
+        AudioDeviceHandle device = operations->default_recording_device;
         std::string resolved_name = "default input";
-        if (!device_name_.empty())
+        if (!device_name.empty())
         {
-            int count = 0;
-            SDL_AudioDeviceID* devices = SDL_GetAudioRecordingDevices(&count);
             device = 0;
-            for (int index = 0; devices && index < count; ++index)
+            for (const AudioInputDevice& candidate
+                : operations->recording_devices())
             {
-                const char* name = SDL_GetAudioDeviceName(devices[index]);
-                if (name && device_name_ == name)
+                if (candidate.name == device_name)
                 {
-                    device = devices[index];
-                    resolved_name = name;
+                    device = candidate.handle;
+                    resolved_name = candidate.name;
                     break;
                 }
             }
-            SDL_free(devices);
             if (device == 0)
             {
-                fail("recording device '" + device_name_ + "' was not found");
+                fail("recording device '" + device_name + "' was not found");
                 return;
             }
         }
 
+        AudioStreamHandle opened = operations->open(device, stop);
+        if (!opened)
+        {
+            if (!stop.stop_requested())
+                fail("could not open " + resolved_name + ": " + error());
+            return;
+        }
+
+        std::lock_guard lock(mutex);
+        if (stop.stop_requested())
+        {
+            operations->destroy(opened);
+            return;
+        }
+        stream = opened;
+        status = "audio live: " + resolved_name + " (shared capture)";
+        frame.status = status;
+        if (visible_clients > 0 && !operations->resume(stream))
+        {
+            status = "audio unavailable: resume failed: " + error();
+            frame.status = status;
+            operations->destroy(stream);
+            stream = nullptr;
+        }
+    }
+
+    std::string device_name;
+    std::shared_ptr<const AudioCaptureOperations> operations;
+    std::mutex mutex;
+    AudioStreamHandle stream = nullptr;
+    size_t visible_clients = 0;
+    SampleWindow left{};
+    SampleWindow right{};
+    std::vector<float> samples;
+    uint64_t generation = 0;
+    std::string status = "audio opening input";
+    AudioTextureFrame frame;
+    std::jthread opener;
+};
+
+AudioCaptureService::AudioCaptureService(std::string device_name,
+    std::shared_ptr<const AudioCaptureOperations> operations)
+    : impl_(std::make_unique<Impl>(
+          std::move(device_name), std::move(operations)))
+{
+}
+
+AudioCaptureService::~AudioCaptureService() = default;
+
+void AudioCaptureService::add_visible()
+{
+    std::lock_guard lock(impl_->mutex);
+    ++impl_->visible_clients;
+    if (impl_->stream && impl_->visible_clients == 1
+        && !impl_->operations->resume(impl_->stream))
+    {
+        impl_->status = "audio unavailable: resume failed: "
+            + impl_->error();
+        impl_->frame.status = impl_->status;
+        impl_->operations->destroy(impl_->stream);
+        impl_->stream = nullptr;
+    }
+}
+
+void AudioCaptureService::remove_visible()
+{
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->visible_clients == 0)
+        return;
+    --impl_->visible_clients;
+    if (impl_->stream && impl_->visible_clients == 0)
+    {
+        impl_->operations->pause(impl_->stream);
+        impl_->operations->clear(impl_->stream);
+    }
+}
+
+AudioTextureFrame AudioCaptureService::frame()
+{
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->stream || impl_->visible_clients == 0)
+        return impl_->frame;
+
+    const int available = impl_->operations->available(impl_->stream);
+    if (available <= 0)
+        return impl_->frame;
+    if (available > max_buffered_audio_bytes)
+    {
+        impl_->operations->clear(impl_->stream);
+        return impl_->frame;
+    }
+
+    impl_->samples.resize(static_cast<size_t>(available) / sizeof(float));
+    const int bytes = impl_->operations->read(impl_->stream,
+        impl_->samples.data(),
+        static_cast<int>(impl_->samples.size() * sizeof(float)));
+    if (bytes <= 0)
+        return impl_->frame;
+    const size_t frames = static_cast<size_t>(bytes)
+        / (sizeof(float) * kChannels);
+    Impl::append(impl_->left, impl_->samples, frames, 0);
+    Impl::append(impl_->right, impl_->samples, frames, 1);
+    impl_->frame = make_texture(
+        impl_->left, impl_->right, ++impl_->generation, impl_->status);
+    return impl_->frame;
+}
+
+struct AudioCaptureRegistry::Impl
+{
+    explicit Impl(AudioCaptureOperations configured)
+        : operations(std::make_shared<AudioCaptureOperations>(
+              std::move(configured)))
+    {
+    }
+
+    std::shared_ptr<const AudioCaptureOperations> operations;
+    std::mutex mutex;
+    std::map<std::string, std::weak_ptr<AudioCaptureService>> services;
+};
+
+AudioCaptureRegistry::AudioCaptureRegistry(AudioCaptureOperations operations)
+    : impl_(std::make_unique<Impl>(std::move(operations)))
+{
+}
+
+AudioCaptureRegistry::~AudioCaptureRegistry() = default;
+
+std::shared_ptr<AudioCaptureService> AudioCaptureRegistry::capture(
+    const std::string& device_name)
+{
+    std::lock_guard lock(impl_->mutex);
+    auto& slot = impl_->services[device_name];
+    auto service = slot.lock();
+    if (!service)
+    {
+        service = std::shared_ptr<AudioCaptureService>(
+            new AudioCaptureService(device_name, impl_->operations));
+        slot = service;
+    }
+    return service;
+}
+
+} // namespace detail
+
+namespace
+{
+
+detail::AudioCaptureOperations production_capture_operations()
+{
+    detail::AudioCaptureOperations operations;
+    operations.default_recording_device
+        = static_cast<detail::AudioDeviceHandle>(
+            SDL_AUDIO_DEVICE_DEFAULT_RECORDING);
+    operations.initialize = [] {
+        return SDL_WasInit(SDL_INIT_AUDIO)
+            || SDL_InitSubSystem(SDL_INIT_AUDIO);
+    };
+    operations.permission = [] { return query_mic_permission(); };
+    operations.wait = [](std::stop_token stop,
+                          std::chrono::milliseconds duration) {
+        std::mutex mutex;
+        std::condition_variable_any wake;
+        std::unique_lock lock(mutex);
+        wake.wait_for(lock, stop, duration, [] { return false; });
+    };
+    operations.recording_devices = [] {
+        std::vector<detail::AudioInputDevice> result;
+        int count = 0;
+        SDL_AudioDeviceID* devices = SDL_GetAudioRecordingDevices(&count);
+        for (int index = 0; devices && index < count; ++index)
+        {
+            const char* name = SDL_GetAudioDeviceName(devices[index]);
+            if (name)
+            {
+                result.push_back({
+                    static_cast<detail::AudioDeviceHandle>(devices[index]),
+                    name,
+                });
+            }
+        }
+        SDL_free(devices);
+        return result;
+    };
+    operations.open = [](detail::AudioDeviceHandle device,
+                          std::stop_token) -> detail::AudioStreamHandle {
         SDL_AudioSpec spec{};
         spec.format = SDL_AUDIO_F32;
         spec.channels = kChannels;
         spec.freq = 48000;
-        SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(
-            device, &spec, nullptr, nullptr);
-        if (!stream)
-        {
-            fail(std::string("could not open ") + resolved_name + ": "
-                + SDL_GetError());
-            return;
-        }
+        return SDL_OpenAudioDeviceStream(
+            static_cast<SDL_AudioDeviceID>(device), &spec, nullptr, nullptr);
+    };
+    operations.resume = [](detail::AudioStreamHandle stream) {
+        return SDL_ResumeAudioStreamDevice(
+            static_cast<SDL_AudioStream*>(stream));
+    };
+    operations.pause = [](detail::AudioStreamHandle stream) {
+        SDL_PauseAudioStreamDevice(static_cast<SDL_AudioStream*>(stream));
+    };
+    operations.clear = [](detail::AudioStreamHandle stream) {
+        SDL_ClearAudioStream(static_cast<SDL_AudioStream*>(stream));
+    };
+    operations.available = [](detail::AudioStreamHandle stream) {
+        return SDL_GetAudioStreamAvailable(
+            static_cast<SDL_AudioStream*>(stream));
+    };
+    operations.read = [](detail::AudioStreamHandle stream, float* samples,
+                          int bytes) {
+        return SDL_GetAudioStreamData(
+            static_cast<SDL_AudioStream*>(stream), samples, bytes);
+    };
+    operations.destroy = [](detail::AudioStreamHandle stream) {
+        SDL_DestroyAudioStream(static_cast<SDL_AudioStream*>(stream));
+    };
+    operations.last_error = [] { return std::string(SDL_GetError()); };
+    return operations;
+}
 
-        std::lock_guard lock(mutex_);
-        if (stop.stop_requested())
-        {
-            SDL_DestroyAudioStream(stream);
-            return;
-        }
-        stream_ = stream;
-        status_ = "audio live: " + resolved_name + " (shared capture)";
-        frame_.status = status_;
-        if (visible_clients_ > 0
-            && !SDL_ResumeAudioStreamDevice(stream_))
-        {
-            status_ = std::string("audio unavailable: resume failed: ")
-                + SDL_GetError();
-            frame_.status = status_;
-            SDL_DestroyAudioStream(stream_);
-            stream_ = nullptr;
-        }
-    }
-
-    std::string device_name_;
-    std::mutex mutex_;
-    SDL_AudioStream* stream_ = nullptr;
-    size_t visible_clients_ = 0;
-    SampleWindow left_{};
-    SampleWindow right_{};
-    std::vector<float> samples_;
-    uint64_t generation_ = 0;
-    std::string status_ = "audio opening input";
-    AudioTextureFrame frame_;
-    std::jthread opener_;
-};
-
-std::shared_ptr<CaptureService> shared_capture(const std::string& device)
+detail::AudioCaptureRegistry& production_capture_registry()
 {
-    static std::mutex mutex;
-    static std::map<std::string, std::weak_ptr<CaptureService>> services;
-    std::lock_guard lock(mutex);
-    auto& slot = services[device];
-    auto service = slot.lock();
-    if (!service)
-    {
-        service = std::make_shared<CaptureService>(device);
-        slot = service;
-    }
-    return service;
+    static detail::AudioCaptureRegistry registry(
+        production_capture_operations());
+    return registry;
 }
 
 } // namespace
@@ -373,7 +502,8 @@ struct AudioAnalyzer::Impl
     {
         if (options.source == AudioOptions::Source::Input)
         {
-            capture = shared_capture(options.device_name);
+            capture = production_capture_registry().capture(
+                options.device_name);
             capture->add_visible();
         }
         else if (options.source == AudioOptions::Source::Synthetic)
@@ -393,7 +523,7 @@ struct AudioAnalyzer::Impl
     }
 
     AudioOptions options;
-    std::shared_ptr<CaptureService> capture;
+    std::shared_ptr<detail::AudioCaptureService> capture;
     AudioTextureFrame fixed;
     bool visible = true;
 };

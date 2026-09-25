@@ -74,9 +74,7 @@ elseif(NOT TARGET Vulkan::Vulkan)
     find_package(Vulkan REQUIRED)
 endif()
 
-set(_rezonality_sources
-    src/audio_analysis.cpp
-    src/audio_analysis.h
+set(_rezonality_project_sources
     src/camera.cpp
     src/camera.h
     src/diagnostics.cpp
@@ -86,39 +84,79 @@ set(_rezonality_sources
     src/live_project.cpp
     src/live_project.h
     src/model_loader.cpp
-    src/model_loader.h
-    src/rezonality_plugin.cpp)
+    src/model_loader.h)
+
+add_library(draxul-rezonality-project STATIC
+    ${_rezonality_project_sources})
+set_target_properties(draxul-rezonality-project PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+target_include_directories(draxul-rezonality-project
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    PRIVATE ${stb_SOURCE_DIR})
+target_link_libraries(draxul-rezonality-project
+    PUBLIC glm::glm
+    PRIVATE assimp::assimp nlohmann_json::nlohmann_json)
+target_compile_definitions(draxul-rezonality-project PRIVATE
+    GLM_FORCE_DEPTH_ZERO_TO_ONE)
+
+add_library(draxul-rezonality-runtime STATIC
+    src/runtime_controller.cpp
+    src/runtime_controller.h)
+set_target_properties(draxul-rezonality-runtime PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+target_include_directories(draxul-rezonality-runtime
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(draxul-rezonality-runtime PUBLIC glm::glm)
 
 if(APPLE)
-    list(APPEND _rezonality_sources src/mic_permission.mm)
+    set(_rezonality_permission_source src/mic_permission.mm)
+    set(_rezonality_native_backend_source src/native_backend_metal.mm)
     set(DRAXUL_REZONALITY_SDL_TARGET SDL3::Headers)
 else()
-    list(APPEND _rezonality_sources src/mic_permission_stub.cpp)
+    set(_rezonality_permission_source src/mic_permission_stub.cpp)
+    set(_rezonality_native_backend_source src/native_backend_vulkan.cpp)
     set(DRAXUL_REZONALITY_SDL_TARGET SDL3::SDL3)
 endif()
 
-add_library(draxul-rezonality-plugin MODULE ${_rezonality_sources})
+add_library(draxul-rezonality-audio STATIC
+    src/audio_analysis.cpp
+    src/audio_analysis.h
+    src/audio_capture.h
+    src/audio_types.h
+    src/mic_permission.h
+    ${_rezonality_permission_source})
+set_target_properties(draxul-rezonality-audio PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+target_include_directories(draxul-rezonality-audio
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(draxul-rezonality-audio PRIVATE
+    ${DRAXUL_REZONALITY_SDL_TARGET})
+
+add_library(draxul-rezonality-plugin MODULE
+    src/native_backend.h
+    src/native_backend_helpers.h
+    ${_rezonality_native_backend_source}
+    src/rezonality_plugin.cpp)
 target_link_libraries(draxul-rezonality-plugin PRIVATE
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
-    assimp::assimp
-    glm::glm
-    nlohmann_json::nlohmann_json
-    ${DRAXUL_REZONALITY_SDL_TARGET})
+    draxul-rezonality-project
+    draxul-rezonality-runtime
+    draxul-rezonality-audio)
 target_compile_definitions(draxul-rezonality-plugin PRIVATE
     GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_include_directories(draxul-rezonality-plugin PRIVATE ${stb_SOURCE_DIR})
 if(APPLE)
-    set_source_files_properties(src/rezonality_plugin.cpp
-        PROPERTIES LANGUAGE OBJCXX)
     set_source_files_properties(src/mic_permission.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     find_library(REZONALITY_AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
+    target_link_libraries(draxul-rezonality-audio PRIVATE
+        "-framework Foundation"
+        ${REZONALITY_AVFOUNDATION_FRAMEWORK})
     target_link_libraries(draxul-rezonality-plugin PRIVATE
         spirv-cross-msl
         "-framework Metal"
-        "-framework Foundation"
-        ${REZONALITY_AVFOUNDATION_FRAMEWORK})
+        "-framework Foundation")
     # The host already embeds SDL3. Resolve the module's SDL audio calls from
     # that copy instead of linking a second static SDL into the dylib.
     target_link_options(draxul-rezonality-plugin PRIVATE
@@ -133,12 +171,6 @@ set_target_properties(draxul-rezonality-plugin PROPERTIES
     PREFIX ""
     DEBUG_POSTFIX ""
     OUTPUT_NAME "draxul-rezonality")
-
-if(COMMAND draxul_apply_sanitizers)
-    draxul_apply_sanitizers(draxul-rezonality-plugin)
-    draxul_apply_coverage(draxul-rezonality-plugin)
-    draxul_apply_msvc_parallel_pdb_fix(draxul-rezonality-plugin)
-endif()
 
 file(GLOB _rezonality_test_sources CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/rezonality_*_tests.cpp")
@@ -162,6 +194,13 @@ draxul_register_bundled_plugin(
     COPY_FILES
         ${_rezonality_compiler_payload}
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/glslang-NOTICE.txt=>third_party/glslang-NOTICE.txt"
-    PRODUCT_TARGETS draxul-rezonality-plugin
+    PRODUCT_TARGETS
+        draxul-rezonality-project
+        draxul-rezonality-runtime
+        draxul-rezonality-audio
+        draxul-rezonality-plugin
     TEST_SOURCES ${_rezonality_test_sources}
     TEST_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Tests.cmake")
+
+draxul_configure_internal_targets_in_directory(
+    "${CMAKE_CURRENT_SOURCE_DIR}")

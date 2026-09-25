@@ -192,6 +192,27 @@ Vulkan/Metal scene renderers, examples, diagnostics, tests, and file watching.
 Draxul owns the window, pane layout, input routing, swapchain/drawable, command
 submission, presentation, plugin discovery, and command palette.
 
+Within the product, the worker turns project files into an immutable
+`ShaderBuild`; the render callback prepares a backend generation and only then
+activates it. A rejected parser, compiler, filesystem, image-storage, or GPU
+candidate leaves the active generation intact. Scene text is parsed into an
+ordered, asset-free description before `build_candidate` resolves models,
+images, and injected or production compiler results. `audio_types.h` contains
+the SDL-free audio option and frame values shared by the project and runtime paths;
+capture, permission, and device operations remain private to `AudioAnalyzer`.
+An explicit product-private capture registry owns exact-device sharing; its
+injectable native operations let the focused audio suite exercise permission,
+open, visibility, backlog, cancellation, and cleanup behavior without a
+physical microphone or renderer.
+The product-private `draxul-rezonality-project`,
+`draxul-rezonality-runtime`, and `draxul-rezonality-audio` libraries give the
+CPU pipeline, activation policy, and capture implementation one owner each and
+allow their focused tests to run without the native renderer or application.
+`rezonality_plugin.cpp` is the C ABI and controller adapter. CMake selects
+`native_backend_metal.mm` or `native_backend_vulkan.cpp`; the selected private
+backend owns generation preparation, command recording, and completed-frame
+retirement while the controller owns activation and failure policy.
+
 There is deliberately no embedded source editor, project menu, node-graph
 panel, standalone SDL window, or ImGui application shell in this port.
 
@@ -220,4 +241,3 @@ it renders every registered Rezonality scenario—default, waves, deferred,
 disc, robot, ray, and audio—and compares them with checked-in references. These checks are opt-in:
 core-only tests do not run them, and Draxul does not register the render cases
 when the Rezonality submodule/target is absent.
-

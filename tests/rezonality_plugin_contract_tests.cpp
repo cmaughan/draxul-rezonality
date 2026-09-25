@@ -4,20 +4,27 @@
 
 #include "audio_analysis.h"
 #include "camera.h"
+#include "diagnostics.h"
+#include "gpu_resource_transaction.h"
 #include "image_loader.h"
 #include "model_loader.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -27,6 +34,20 @@
 
 namespace
 {
+
+constexpr std::size_t gpu_stage_index(
+    rezonality::detail::GpuInitializationStage stage)
+{
+    return static_cast<std::size_t>(stage);
+}
+
+struct FakeGpuGeneration
+{
+    uint64_t generation = 0;
+    std::array<bool, gpu_stage_index(
+                         rezonality::detail::GpuInitializationStage::Count)>
+        resources{};
+};
 
 struct HostState
 {
@@ -196,11 +217,197 @@ private:
 
 } // namespace
 
+TEST_CASE("Rezonality GPU initialization failures roll back and retry cleanly",
+    "[rezonality][gpu][rollback]")
+{
+    using Stage = rezonality::detail::GpuInitializationStage;
+    constexpr std::array stages{
+        Stage::VertexBuffer,
+        Stage::VertexMemory,
+        Stage::VertexMemoryBind,
+        Stage::VertexMemoryMap,
+        Stage::ModelTextureAttachment,
+        Stage::ModelTextureSampler,
+        Stage::ModelTextureUpload,
+    };
+    constexpr std::array failure_stages{
+        Stage::VertexMemory,
+        Stage::VertexMemoryBind,
+        Stage::VertexMemoryMap,
+        Stage::ModelTextureSampler,
+        Stage::ModelTextureUpload,
+    };
+
+    for (const Stage failure_stage : failure_stages)
+    {
+        CAPTURE(gpu_stage_index(failure_stage));
+        int live_resources = static_cast<int>(stages.size());
+        FakeGpuGeneration active;
+        active.generation = 4;
+        active.resources.fill(true);
+
+        const auto destroy = [&](FakeGpuGeneration& generation) {
+            for (bool& resource : generation.resources)
+            {
+                if (resource)
+                {
+                    resource = false;
+                    --live_resources;
+                }
+            }
+        };
+        const auto complete = [](const FakeGpuGeneration& generation) {
+            return std::ranges::all_of(
+                generation.resources, [](bool resource) { return resource; });
+        };
+        const auto attempt = [&](uint64_t candidate_generation,
+                                 std::optional<
+                                     rezonality::detail::GpuFailurePoint>
+                                     failure_point) {
+            return rezonality::detail::publish_gpu_resources_transactionally<
+                FakeGpuGeneration>(
+                [&](FakeGpuGeneration& candidate) {
+                    candidate.generation = candidate_generation;
+                    return rezonality::detail::initialize_gpu_resources(
+                        stages, failure_point, [&](Stage stage) {
+                            candidate.resources[gpu_stage_index(stage)] = true;
+                            ++live_resources;
+                            return true;
+                        });
+                },
+                complete,
+                destroy,
+                [&](FakeGpuGeneration&& candidate) {
+                    destroy(active);
+                    active = std::move(candidate);
+                });
+        };
+
+        REQUIRE_FALSE(attempt(
+            5, rezonality::detail::GpuFailurePoint{ failure_stage }));
+        CHECK(active.generation == 4);
+        CHECK(complete(active));
+        CHECK(live_resources == static_cast<int>(stages.size()));
+
+        REQUIRE(attempt(6, std::nullopt));
+        CHECK(active.generation == 6);
+        CHECK(complete(active));
+        CHECK(live_resources == static_cast<int>(stages.size()));
+
+        destroy(active);
+        CHECK(live_resources == 0);
+    }
+}
+
+TEST_CASE("Rezonality diagnostics publish bounded valid UTF-8",
+    "[rezonality][diagnostics]")
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path()
+        / "draxul-rezonality-diagnostic-utf8";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    REQUIRE(fs::create_directories(root));
+
+    rezonality::DiagnosticsPublisher publisher(root,
+        fs::path("project"), "utf8-contract");
+    rezonality::DiagnosticState state;
+    state.project_path = "project";
+    state.scenegraph_path = "project/default.scenegraph";
+    state.stage = "compile";
+    state.severity = "error";
+    constexpr size_t maximum_message_bytes = 16u * 1024u;
+    state.message = std::string(maximum_message_bytes - 1u, 'a')
+        + "\xC3\xA9";
+    state.diagnostics.push_back({
+        .path = state.scenegraph_path,
+        .stage = "compile",
+        .severity = "error",
+        .message = "compiler\xFFoutput",
+    });
+
+    std::string error;
+    REQUIRE(publisher.publish(state, error));
+    auto document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>()
+        == std::string(maximum_message_bytes - 1u, 'a'));
+    CHECK(document["diagnostics"][0]["message"].get<std::string>()
+        == "compiler\xEF\xBF\xBDoutput");
+
+    state.message = std::string(maximum_message_bytes - 2u, 'b')
+        + "\xE2\x82\xAC";
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>()
+        == std::string(maximum_message_bytes - 2u, 'b'));
+
+    state.message = std::string(maximum_message_bytes - 3u, 'c')
+        + "\xF0\x9F\x9A\x80";
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>()
+        == std::string(maximum_message_bytes - 3u, 'c'));
+
+    state.message = std::string(maximum_message_bytes - 2u, 'd')
+        + "\xC3\xA9";
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>() == state.message);
+
+    state.message = std::string("invalid ")
+        + std::string("\xF0\x28\x8C\x28", 4);
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"].get<std::string>().find("\xEF\xBF\xBD")
+        != std::string::npos);
+    CHECK_NOTHROW(document.dump());
+
+    state.message = "recovered diagnostic";
+    state.diagnostics.clear();
+    REQUIRE(publisher.publish(state, error));
+    document = read_json(publisher.path());
+    CHECK(document["message"] == "recovered diagnostic");
+    CHECK(document["diagnostics"].empty());
+
+    REQUIRE(publisher.remove(error));
+    fs::remove_all(root, ec);
+    CHECK_FALSE(ec);
+}
+
+TEST_CASE("Rezonality diagnostics recover after publication failure",
+    "[rezonality][diagnostics]")
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path()
+        / "draxul-rezonality-diagnostic-recovery";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    write_text(root, "blocks diagnostics directory creation");
+
+    rezonality::DiagnosticsPublisher publisher(root,
+        fs::path("project"), "recovery-contract");
+    rezonality::DiagnosticState state;
+    state.message = "still alive";
+    std::string error;
+    CHECK_FALSE(publisher.publish(state, error));
+    CHECK_FALSE(error.empty());
+
+    REQUIRE(fs::remove(root, ec));
+    REQUIRE_FALSE(ec);
+    error.clear();
+    REQUIRE(publisher.publish(state, error));
+    CHECK(read_json(publisher.path())["message"] == "still alive");
+
+    REQUIRE(publisher.remove(error));
+    fs::remove_all(root, ec);
+    CHECK_FALSE(ec);
+}
+
 TEST_CASE("Rezonality Metal model passes test and write depth",
     "[rezonality][metal][depth]")
 {
     const std::string source
-        = read_text(plugin_root() / "src" / "rezonality_plugin.cpp");
+        = read_text(plugin_root() / "src" / "native_backend_metal.mm");
     CHECK(source.find("depthCompareFunction = MTLCompareFunctionLessEqual")
         != std::string::npos);
     CHECK(source.find("depthWriteEnabled = YES") != std::string::npos);
@@ -345,39 +552,6 @@ TEST_CASE("Rezonality exports a usable Draxul plugin contract",
     api->destroy_instance(instance);
 }
 
-TEST_CASE("Rezonality synthetic audio produces a stable stereo analysis texture",
-    "[rezonality][audio]")
-{
-    rezonality::AudioOptions options;
-    options.source = rezonality::AudioOptions::Source::Synthetic;
-    rezonality::AudioAnalyzer analyzer(options);
-
-    const auto first = analyzer.frame();
-    const auto second = analyzer.frame();
-    REQUIRE(first.rgba.size()
-        == rezonality::AudioTextureFrame::width
-            * rezonality::AudioTextureFrame::height * 4);
-    CHECK(first.generation == 1);
-    CHECK(first.status == "audio synthetic fixture");
-    CHECK(first.rgba == second.rgba);
-    CHECK(std::any_of(first.rgba.begin(), first.rgba.end(),
-        [](float value) { return value > 0.1f && value < 0.99f; }));
-
-    analyzer.set_visible(false);
-    CHECK(analyzer.frame().rgba == first.rgba);
-    analyzer.set_visible(true);
-    CHECK(analyzer.frame().rgba == first.rgba);
-
-    options.source = rezonality::AudioOptions::Source::Silent;
-    rezonality::AudioAnalyzer silent(options);
-    const auto fallback = silent.frame();
-    CHECK(fallback.generation == 1);
-    CHECK(fallback.status.find("audio unavailable") != std::string::npos);
-    CHECK(fallback.rgba.size() == first.rgba.size());
-    CHECK(std::all_of(fallback.rgba.begin(), fallback.rgba.end(),
-        [](float value) { return value == 0.0f || value == 1.0f; }));
-}
-
 TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
     "[rezonality][integration][reload]")
 {
@@ -447,12 +621,23 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
         "void main() { fragColor = vec4(1,0,0,1); }\n");
     REQUIRE(wait_for_status(*api, instance, presentation, "ready g2"));
 
+    const fs::path scenegraph = fixture / "default.scenegraph";
+    const std::string scene = read_text(scenegraph);
+    write_text(scenegraph, scene
+        + "\ncamera: Incomplete { field_of_view: - }\n");
+    REQUIRE(wait_for_status(*api, instance, presentation,
+        "BUILD FAILED g3"));
+    CHECK(presentation_status(instance, presentation).find(
+        "default.scenegraph") != std::string::npos);
+    write_text(scenegraph, scene);
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g4"));
+
     write_text(fixture / "screen.frag",
         "#version 450\n"
         "layout(location=0) out vec4 fragColor;\n"
         "void main() { fragColor = vec4(; }\n");
     REQUIRE(wait_for_status(*api, instance, presentation,
-        "BUILD FAILED g3"));
+        "BUILD FAILED g5"));
     const std::string failed_status = presentation_status(instance, presentation);
     CHECK(failed_status.find("screen.frag") != std::string::npos);
 
@@ -460,8 +645,8 @@ TEST_CASE("Rezonality watches valid, broken, and repaired shader edits",
         "#version 450\n"
         "layout(location=0) out vec4 fragColor;\n"
         "void main() { fragColor = vec4(0,0,1,1); }\n");
-    REQUIRE(wait_for_status(*api, instance, presentation, "ready g4"));
-    CHECK(host_state.ticks.load() >= 4);
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g6"));
+    CHECK(host_state.ticks.load() >= 6);
 
     api->set_visible(instance, 0);
     DraxulPluginTickInfoV2 tick_info{};

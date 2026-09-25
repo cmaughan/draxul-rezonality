@@ -1,6 +1,6 @@
 #pragma once
 
-#include "audio_analysis.h"
+#include "audio_types.h"
 #include "camera.h"
 #include "diagnostics.h"
 #include "model_loader.h"
@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -45,6 +46,7 @@ struct ShaderBuild
         std::string name;
         std::filesystem::path path;
         SurfaceFormat format = SurfaceFormat::Color8;
+        bool format_explicit = false;
         float scale_x = 1.0f;
         float scale_y = 1.0f;
         float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -95,6 +97,9 @@ struct ShaderBuild
     std::vector<Pass> passes;
 };
 
+[[nodiscard]] bool validate_surface_upload_storage(
+    const ShaderBuild::Surface& surface, std::string& error);
+
 struct BuildResult
 {
     uint64_t generation = 0;
@@ -105,13 +110,81 @@ struct BuildResult
     std::vector<DiagnosticEntry> diagnostics;
 };
 
+struct SceneModelSource
+{
+    std::string name;
+    std::filesystem::path path;
+    glm::vec3 scale{ 1.0f };
+    bool flip_texture_y = true;
+};
+
+// Syntax-only scene output. Asset bytes and compiler output are resolved later
+// while constructing an immutable ShaderBuild candidate.
+struct SceneDescription
+{
+    std::filesystem::path scenegraph;
+    std::vector<ShaderBuild::Surface> surfaces;
+    std::vector<SceneModelSource> models;
+    std::vector<ShaderBuild::Pass> passes;
+};
+
+struct SceneParseResult
+{
+    std::optional<SceneDescription> scene;
+    std::filesystem::path diagnostic_path;
+    int diagnostic_line = -1;
+    std::string error;
+};
+
+using CompileShaderOperation = std::function<bool(
+    const std::filesystem::path& shader,
+    std::vector<uint32_t>& spirv,
+    std::vector<DiagnosticEntry>& diagnostics)>;
+
+[[nodiscard]] SceneParseResult parse_scene_text(
+    const ProjectOptions& options,
+    const std::filesystem::path& scenegraph,
+    std::string_view source);
+
+[[nodiscard]] BuildResult build_candidate(
+    const std::filesystem::path& plugin_directory,
+    const ProjectOptions& options,
+    SceneDescription scene,
+    uint64_t generation,
+    const std::filesystem::path& output_directory,
+    CompileShaderOperation compile_shader = {});
+
+// Synchronous, CPU-only project construction seam. The live watcher owns one
+// pipeline and only schedules/publishes its immutable results.
+class ProjectPipeline
+{
+public:
+    using CompileShader = CompileShaderOperation;
+
+    ProjectPipeline(std::filesystem::path plugin_directory,
+        ProjectOptions options, CompileShader compile_shader = {});
+
+    [[nodiscard]] BuildResult build(uint64_t generation) const;
+    [[nodiscard]] uint64_t fingerprint() const;
+    [[nodiscard]] const ProjectOptions& options() const
+    {
+        return options_;
+    }
+
+private:
+    std::filesystem::path plugin_directory_;
+    ProjectOptions options_;
+    CompileShader compile_shader_;
+};
+
 class LiveProject
 {
 public:
     using WakeCallback = std::function<void()>;
 
     LiveProject(std::filesystem::path plugin_directory,
-        ProjectOptions options, WakeCallback wake);
+        ProjectOptions options, WakeCallback wake,
+        ProjectPipeline::CompileShader compile_shader = {});
     ~LiveProject();
 
     LiveProject(const LiveProject&) = delete;
@@ -124,16 +197,13 @@ public:
 
     const ProjectOptions& options() const
     {
-        return options_;
+        return pipeline_.options();
     }
 
 private:
     void run(std::stop_token stop_token);
-    BuildResult build(uint64_t generation) const;
-    uint64_t project_fingerprint() const;
 
-    std::filesystem::path plugin_directory_;
-    ProjectOptions options_;
+    ProjectPipeline pipeline_;
     WakeCallback wake_;
     std::jthread worker_;
     mutable std::mutex mutex_;
