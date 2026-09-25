@@ -137,10 +137,10 @@ void publish_diagnostics(RezonalityInstance* instance,
     state.project_path = instance->options.project_path;
     state.scenegraph_path
         = instance->options.project_path / instance->options.scenegraph;
-    if (instance->active_build)
-        state.active_source_files = instance->active_build->source_files;
-    if (instance->pending_build)
-        state.candidate_source_files = instance->pending_build->source_files;
+    if (const auto& active = instance->runtime.active_build())
+        state.active_source_files = active->source_files;
+    if (const auto& pending = instance->runtime.pending_build())
+        state.candidate_source_files = pending->source_files;
     state.path = path;
     state.attempted_generation = instance->runtime.attempted_generation();
     state.active_generation = instance->runtime.active_generation();

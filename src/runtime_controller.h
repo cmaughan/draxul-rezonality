@@ -81,6 +81,7 @@ public:
     void set_quiesced(bool quiesced);
 
     [[nodiscard]] const std::optional<ShaderBuild>& active_build() const;
+    [[nodiscard]] const std::optional<ShaderBuild>& pending_build() const;
     [[nodiscard]] uint64_t attempted_generation() const;
     [[nodiscard]] uint64_t active_generation() const;
     [[nodiscard]] uint64_t last_success_unix_ms() const;

@@ -128,6 +128,11 @@ const std::optional<ShaderBuild>& RuntimeController::active_build() const
     return active_build_;
 }
 
+const std::optional<ShaderBuild>& RuntimeController::pending_build() const
+{
+    return pending_build_;
+}
+
 uint64_t RuntimeController::attempted_generation() const
 {
     return attempted_generation_;
