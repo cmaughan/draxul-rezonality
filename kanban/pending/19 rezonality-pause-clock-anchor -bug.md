@@ -27,3 +27,9 @@ passed 49/49 CTest entries, including Rezonality render snapshots; same-cache
 Debug startup passed via `py do.py run debug --console -- --smoke-test`
 (~48 s). The fixed 30 s `smoke --skip-build` wrapper timed out on the
 existing nine-pane Session. macOS Metal resume/reload rendering remains open.
+
+**macOS partial gate (2026-09-26):** The Debug Metal plugin built, all seven
+Rezonality Metal render snapshots passed, and a live shader-project reload
+rejected an oversized candidate while retaining the last good frame before
+recovering to a changed shader. Native pause/resume input and elapsed-time
+continuity still need a direct Metal check, so the checkbox remains open.

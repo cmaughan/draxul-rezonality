@@ -16,7 +16,7 @@ Nonuniform scale changes positions but leaves normals and tangent-space vectors 
 **Acceptance criteria**
 
 - [x] A normal-mapped model scaled by `(1,2,3)` has the expected shading on Windows/Vulkan.
-- [ ] Confirm the same scaled-model shading on macOS/Metal.
+- [x] Confirm the same scaled-model shading on macOS/Metal.
 - [x] Run Rezonality aggregate tests, relevant render checks, and same-cache smoke.
 
 **Progress (Windows):** CPU import now bakes normals by inverse scale,
@@ -31,4 +31,11 @@ startup passed via `py do.py run debug --console -- --smoke-test` (~48 s).
 The fixed 30 s `smoke --skip-build` wrapper timed out on the existing nine-pane
 Session. The user subsequently compared the bundled PBR robot at `(1,1,1)`
 and `(1,2,3)` in the actual Windows/Vulkan plugin and confirmed that the
-scaled-model shading looks correct. The Metal visual check remains open.
+scaled-model shading looks correct.
+
+**macOS Metal gate (2026-09-26):** All seven Rezonality Metal render snapshots
+passed. I copied the bundled PBR robot project to a temporary directory,
+changed its model scale to `(1,2,3)`, exported a native Metal render-test frame,
+and visually inspected the lit metallic model. The nonuniformly scaled robot
+rendered without inverted, black, or missing shading; the shared Assimp basis
+tests also passed in the 47/47 all-products macOS unit inventory.
