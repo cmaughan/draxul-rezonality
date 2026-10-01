@@ -24,6 +24,10 @@ if(NOT TARGET assimp::assimp)
     set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
     set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+    # This embedded dependency ships through the plugin, not an Assimp SDK.
+    # Its install export also tries to export the host's fetched zlib targets,
+    # whose build-tree include paths are not relocatable install interfaces.
+    set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
     set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
     set(ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
     set(ASSIMP_BUILD_NO_EXPORT ON CACHE BOOL "" FORCE)
@@ -32,8 +36,8 @@ if(NOT TARGET assimp::assimp)
     set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
     # Assimp's bundled zlib treats modern macOS as classic Mac OS and replaces
     # fdopen with a macro that collides with the SDK declaration. Use the SDK's
-    # zlib on Apple platforms; keep the bundled dependency elsewhere.
-    if(APPLE)
+    # zlib on Apple platforms; reuse the host's PNG dependency when provided.
+    if(APPLE OR TARGET ZLIB::ZLIB)
         set(ASSIMP_BUILD_ZLIB OFF CACHE BOOL "" FORCE)
     else()
         set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
