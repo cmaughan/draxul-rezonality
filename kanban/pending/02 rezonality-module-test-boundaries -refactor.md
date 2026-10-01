@@ -1,5 +1,7 @@
 # Reuse module implementation and partition contract tests
 
+**Summary:** Reuse compiled Rezonality code and separate its test groups so tests avoid rebuilding the same implementation or depending on unrelated parts of the plugin.
+
 **Priority:** P2 — the contract target recompiles module/native sources and mixes test kinds.  
 **Source:** `plugins/rezonality/cmake/Tests.cmake`  
 **Proposed by:** Claude 45, narrowed. **Owner:** one Rezonality build/test agent.  

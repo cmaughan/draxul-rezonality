@@ -1,5 +1,7 @@
 # Avoid deep-copying Rezonality builds at activation
 
+**Summary:** Transfer a finished Rezonality build into use without copying all its assets so scene reloads and resize recovery use less temporary memory.
+
 **Source:** `plugins/rezonality/src/runtime_controller.cpp`  
 **Priority/evidence:** P2; static, high confidence. **Reported by:** Claude, Codex. Lines 47–62 copy `ShaderBuild`, including vectors of shaders, models, and pixels, before replacing active storage. The same copy also occurs for active-build resize recovery.
 

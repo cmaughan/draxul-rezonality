@@ -1,5 +1,7 @@
 # Isolate Rezonality compiler execution and diagnostics
 
+**Summary:** Separate running the shader compiler from interpreting its output so Rezonality's error messages and failure handling can be tested without launching a real compiler.
+
 **Priority:** P2 — production decoding is tied to real process execution.  
 **Source:** `plugins/rezonality/src/live_project.cpp`  
 **Proposed by:** Codex 6. **Owner:** one Rezonality project agent.  
