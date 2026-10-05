@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -93,6 +95,64 @@ std::optional<rezonality::BuildResult> wait_for_result(
     }
     return std::nullopt;
 }
+
+// Redirects the process temporary directory for the lifetime of the guard.
+// POSIX standard libraries consult TMPDIR; the MSVC library resolves the
+// temporary directory through GetTempPath2W, which consults TMP then TEMP.
+class TemporaryDirectoryOverride
+{
+public:
+    explicit TemporaryDirectoryOverride(const fs::path& directory)
+    {
+        for (const char* name : kVariables)
+        {
+            const char* value = std::getenv(name);
+            saved_.push_back(value ? std::optional<std::string>(value)
+                                   : std::nullopt);
+            set(name, directory.string().c_str());
+        }
+    }
+
+    ~TemporaryDirectoryOverride()
+    {
+        for (size_t index = 0; index < std::size(kVariables); ++index)
+        {
+            if (saved_[index])
+                set(kVariables[index], saved_[index]->c_str());
+            else
+                unset(kVariables[index]);
+        }
+    }
+
+    TemporaryDirectoryOverride(const TemporaryDirectoryOverride&) = delete;
+    TemporaryDirectoryOverride& operator=(
+        const TemporaryDirectoryOverride&)
+        = delete;
+
+private:
+#if defined(_WIN32)
+    static constexpr const char* kVariables[] = { "TMP", "TEMP" };
+    static void set(const char* name, const char* value)
+    {
+        _putenv_s(name, value);
+    }
+    static void unset(const char* name)
+    {
+        _putenv_s(name, "");
+    }
+#else
+    static constexpr const char* kVariables[] = { "TMPDIR" };
+    static void set(const char* name, const char* value)
+    {
+        setenv(name, value, 1);
+    }
+    static void unset(const char* name)
+    {
+        unsetenv(name);
+    }
+#endif
+    std::vector<std::optional<std::string>> saved_;
+};
 
 rezonality::ProjectOptions options(const fs::path& path)
 {
@@ -351,6 +411,41 @@ TEST_CASE("Rezonality live watch reports filesystem failure and recovers",
     fs::rename(unavailable, fixture.path, error);
     REQUIRE_FALSE(error);
     auto recovered = wait_for_result(live);
+    REQUIRE(recovered);
+    REQUIRE(recovered->build);
+    CHECK(recovered->generation > failed->generation);
+    live.stop();
+}
+
+TEST_CASE("Rezonality live rebuild reports unavailable temporary storage",
+    "[rezonality][project][watch][temporary]")
+{
+    ProjectFixture fixture("simple");
+    auto configured = options(fixture.path);
+    configured.auto_reload = false;
+    configured.compile_debounce_ms = 0;
+    rezonality::LiveProject live(plugin_root(), configured, [] {},
+        accept_shader);
+    live.start();
+
+    const auto initial = wait_for_result(live);
+    REQUIRE(initial);
+    REQUIRE(initial->build);
+
+    std::optional<rezonality::BuildResult> failed;
+    {
+        const TemporaryDirectoryOverride missing_temporary_storage(
+            fixture.path / "missing-temporary-storage");
+        live.force_reload();
+        failed = wait_for_result(live);
+    }
+    REQUIRE(failed);
+    CHECK_FALSE(failed->build);
+    CHECK(failed->generation > initial->generation);
+    CHECK(failed->error.find("Temporary storage") != std::string::npos);
+
+    live.force_reload();
+    const auto recovered = wait_for_result(live);
     REQUIRE(recovered);
     REQUIRE(recovered->build);
     CHECK(recovered->generation > failed->generation);

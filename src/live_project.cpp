@@ -1491,8 +1491,23 @@ BuildResult ProjectPipeline::build(uint64_t generation) const
         return result;
     }
 
-    const fs::path output_directory = fs::temp_directory_path()
-        / "draxul-rezonality"
+    // Temporary storage can disappear or be misconfigured (TMPDIR/TMP/TEMP)
+    // while the editor is running. Report it as an ordinary failed
+    // generation so the active scene is retained and a later rebuild can
+    // succeed once storage is available again.
+    std::error_code temp_error;
+    const fs::path temp_root = fs::temp_directory_path(temp_error);
+    if (temp_error || temp_root.empty())
+    {
+        BuildResult result;
+        result.generation = generation;
+        result.diagnostic_path = temp_root.empty() ? scenegraph : temp_root;
+        result.error = "Temporary storage for shader output is unavailable: "
+            + (temp_error ? temp_error.message()
+                          : std::string("empty temporary directory"));
+        return result;
+    }
+    const fs::path output_directory = temp_root / "draxul-rezonality"
         / std::to_string(reinterpret_cast<uintptr_t>(this));
     return build_candidate(plugin_directory_, options_,
         std::move(*parsed.scene), generation, output_directory,
@@ -1530,7 +1545,28 @@ void LiveProject::run(std::stop_token stop_token)
         const auto now = std::chrono::steady_clock::now();
         if (forced || (dirty && now - dirty_since >= std::chrono::milliseconds(options.compile_debounce_ms)))
         {
-            BuildResult next = pipeline_.build(++generation);
+            ++generation;
+            BuildResult next;
+            try
+            {
+                next = pipeline_.build(generation);
+            }
+            catch (const std::exception& exception)
+            {
+                next = BuildResult{};
+                next.generation = generation;
+                next.diagnostic_path = options.project_path;
+                next.error = std::string("Rezonality project build failed: ")
+                    + exception.what();
+            }
+            catch (...)
+            {
+                next = BuildResult{};
+                next.generation = generation;
+                next.diagnostic_path = options.project_path;
+                next.error
+                    = "Rezonality project build failed with an unknown error";
+            }
             {
                 std::lock_guard lock(mutex_);
                 result_ = std::move(next);
