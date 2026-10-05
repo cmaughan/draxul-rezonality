@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <string_view>
 
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -84,5 +86,25 @@ constexpr ScreenVertex kScreenVertices[] = {
     { { 1, 1, 0, 1 }, { 1, 0 }, { 1, 1, 1 }, { 0, 0, 1 } },
     { { -1, 1, 0, 1 }, { 0, 0 }, { 1, 1, 1 }, { 0, 0, 1 } },
 };
+
+// Metal guarantees eight render-target color attachments on every macOS GPU
+// family Draxul supports; MTLRenderPipelineColorAttachmentDescriptorArray and
+// MTLRenderPassColorAttachmentDescriptorArray raise on larger indices.
+constexpr uint32_t kMetalMaxColorAttachments = 8;
+
+// Rejects a raster pass whose color-target count exceeds the backend limit
+// before any native descriptor is indexed or created with that count.
+[[nodiscard]] inline bool validate_color_target_count(
+    std::string_view pass_name, size_t color_count, uint32_t limit,
+    std::string& error)
+{
+    if (color_count <= limit)
+        return true;
+    error = "Pass '" + std::string(pass_name) + "' declares "
+        + std::to_string(color_count)
+        + " color targets; this graphics backend supports at most "
+        + std::to_string(limit);
+    return false;
+}
 
 } // namespace rezonality::detail

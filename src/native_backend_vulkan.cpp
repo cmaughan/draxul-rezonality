@@ -133,6 +133,7 @@ struct VulkanGeneration
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t max_surface_dimension = 0;
+    uint32_t max_color_attachments = 0;
     uint64_t target_generation = 0;
     uint64_t source_generation = 0;
     uint64_t used_slots = 0;
@@ -1060,6 +1061,9 @@ bool create_pass_render_target(VulkanGeneration& generation,
         error = "Pass '" + source.name + "' has no color target";
         return false;
     }
+    if (!rezonality::detail::validate_color_target_count(source.name,
+            colors.size(), generation.max_color_attachments, error))
+        return false;
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = static_cast<uint32_t>(colors.size());
@@ -1625,6 +1629,11 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
     generation.max_surface_dimension = std::min<uint32_t>(
         device_properties.limits.maxImageDimension2D,
         static_cast<uint32_t>(std::numeric_limits<int>::max()));
+    // A subpass may not reference more color attachments than the device
+    // supports, and every one is a fragment output location.
+    generation.max_color_attachments = std::min(
+        device_properties.limits.maxColorAttachments,
+        device_properties.limits.maxFragmentOutputAttachments);
     if (generation.ray_project
         && !load_ray_functions(generation,
             static_cast<VkPhysicalDevice>(frame.physical_device), error))

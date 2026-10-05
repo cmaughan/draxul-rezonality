@@ -571,6 +571,18 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
             }
             pass.samplers.push_back(*surface);
         }
+        if (!source.ray_trace && !pass.direct)
+        {
+            const size_t color_count = static_cast<size_t>(std::count_if(
+                pass.targets.begin(), pass.targets.end(),
+                [&generation](size_t surface_index) {
+                    return !generation.surfaces[surface_index].depth;
+                }));
+            if (!rezonality::detail::validate_color_target_count(
+                    source.name, color_count,
+                    rezonality::detail::kMetalMaxColorAttachments, error))
+                return std::nullopt;
+        }
         if (source.ray_trace)
         {
             if (!source.model_index

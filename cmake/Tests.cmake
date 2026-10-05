@@ -54,6 +54,9 @@ if(APPLE)
     # Unlike the product module, this test is an executable and therefore owns
     # the SDL implementation that its audio-analysis cases call.
     target_link_libraries(draxul-test-rezonality PRIVATE SDL3::SDL3)
+    # Exercises real Metal preparation limits against a system device.
+    target_sources(draxul-test-rezonality PRIVATE
+        "${_rezonality_root}/tests/rezonality_metal_backend_tests.mm")
     target_link_libraries(draxul-test-rezonality PRIVATE
         spirv-cross-msl
         "-framework Metal"
