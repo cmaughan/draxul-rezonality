@@ -27,6 +27,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -1136,6 +1137,182 @@ TEST_CASE("The staged Rezonality module publishes agent diagnostics and hands of
 
     api->quiesce_instance(instance);
     api->destroy_instance(instance);
+    fs::remove_all(root, ec);
+    CHECK_FALSE(ec);
+}
+
+TEST_CASE("The staged Rezonality module opens and reloads international project paths",
+    "[rezonality][integration][dynamic][international]")
+{
+    namespace fs = std::filesystem;
+    // Text in this test is always UTF-8; on Windows, path::string() would use
+    // the active code page instead, which cannot represent these names.
+    const auto utf8 = [](const fs::path& path) {
+        const std::u8string text = path.generic_u8string();
+        return std::string(text.begin(), text.end());
+    };
+    DynamicPluginModule module(fs::path(DRAXUL_REZONALITY_MODULE_PATH));
+    const auto* api = module.api();
+    REQUIRE(api != nullptr);
+
+    const auto fixture_id = std::chrono::steady_clock::now()
+                                .time_since_epoch()
+                                .count();
+    const fs::path root = fs::temp_directory_path()
+        / ("draxul-rezonality-international-" + std::to_string(fixture_id));
+    for (const std::u8string_view name : {
+             std::u8string_view(u8"café-projèt"),
+             std::u8string_view(u8"日本語プロジェクト"),
+             std::u8string_view(u8"mixer-\U0001F39B\U0001F3B5"),
+         })
+    {
+        const fs::path fixture = root / fs::path(name);
+        const std::string name_utf8(name.begin(), name.end());
+        DYNAMIC_SECTION(name_utf8)
+        {
+            const fs::path cache = root / ("cache-" + std::to_string(
+                                               name_utf8.size()));
+            std::error_code ec;
+            REQUIRE(fs::create_directories(fixture));
+            const fs::path canonical_fixture = fs::weakly_canonical(fixture, ec);
+            REQUIRE_FALSE(ec);
+            fs::copy(plugin_root() / "examples" / "simple", fixture,
+                fs::copy_options::recursive
+                    | fs::copy_options::overwrite_existing,
+                ec);
+            REQUIRE_FALSE(ec);
+
+            HostState host_state;
+            host_state.cache_path = cache;
+            DraxulPluginHostApiV2 host{};
+            host.struct_size = sizeof(host);
+            host.abi_version = DRAXUL_PLUGIN_ABI_VERSION;
+            host.host_context = &host_state;
+            host.request_redraw = &request_redraw;
+            host.request_tick = &request_tick;
+            host.notify_presentation_changed = &request_noop;
+            host.log = &log_noop;
+            host.query_service = &query_path_service;
+
+            const std::string directory = utf8(plugin_root());
+            // No diagnostics_id: the default identity is derived from the
+            // international project name.
+            const std::string config = nlohmann::json{
+                { "project_path", utf8(fixture) },
+                { "auto_reload", false },
+                { "paused", true },
+                { "compile_debounce_ms", 25 },
+            }.dump();
+            DraxulPluginCreateInfoV2 create_info{};
+            create_info.struct_size = sizeof(create_info);
+            create_info.host = &host;
+            create_info.plugin_id = api->plugin_id;
+            create_info.plugin_directory_utf8 = directory.c_str();
+            create_info.config_json = config.data();
+            create_info.config_json_length = config.size();
+            create_info.initial_viewport = {
+                sizeof(DraxulPluginViewportV2), 0, 0, 640, 480, 1.0f, 96.0f
+            };
+
+            void* instance = api->create_instance(&create_info);
+            REQUIRE(instance != nullptr);
+            DraxulPluginPresentationExtensionV2 presentation{};
+            REQUIRE(api->query_extension(instance,
+                        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                        sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                        DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                        &presentation, sizeof(presentation))
+                != 0);
+            // Waits for generation N to settle as either a ready or a failed
+            // candidate; opening and reloading must never close the host.
+            const auto settle = [&](uint64_t generation) {
+                const std::string ready = "ready g" + std::to_string(generation);
+                const std::string failed
+                    = "BUILD FAILED g" + std::to_string(generation);
+                const auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::seconds(30);
+                DraxulPluginTickInfoV2 tick_info{};
+                tick_info.struct_size = sizeof(tick_info);
+                tick_info.visible = 1;
+                std::string current;
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    api->tick(instance, &tick_info);
+                    current = presentation_status(instance, presentation);
+                    if (current.find(ready) != std::string::npos
+                        || current.find(failed) != std::string::npos)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                INFO(current);
+#if defined(_WIN32)
+                // The bundled Windows glslangValidator receives arguments
+                // through the active code page, so names it cannot represent
+                // fail as an ordinary candidate diagnostic. See
+                // kanban/pending/14 windows-shader-compiler-unicode-paths -bug.md.
+                CHECK((current.find(ready) != std::string::npos
+                    || current.find(failed) != std::string::npos));
+#else
+                CHECK(current.find(ready) != std::string::npos);
+#endif
+                return current;
+            };
+            const std::string status = settle(1);
+            CHECK(status.rfind(name_utf8 + " | ", 0) == 0);
+            CHECK_NOTHROW(nlohmann::json(status).dump());
+
+            std::vector<fs::path> published;
+            for (const auto& entry :
+                fs::directory_iterator(cache / "diagnostics", ec))
+                published.push_back(entry.path());
+            REQUIRE_FALSE(ec);
+            REQUIRE(published.size() == 1);
+            const std::string identity = utf8(published.front().filename());
+            CHECK(std::all_of(identity.begin(), identity.end(),
+                [](unsigned char value) { return value < 0x80; }));
+            auto document = read_json(published.front());
+            CHECK(document["project_path"] == utf8(canonical_fixture));
+
+            DraxulPluginHotReloadExtensionV2 reload{};
+            REQUIRE(api->query_extension(instance,
+                        DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID,
+                        sizeof(DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID) - 1,
+                        DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_VERSION,
+                        &reload, sizeof(reload))
+                != 0);
+            size_t required = 0;
+            REQUIRE(reload.export_json(instance, nullptr, &required));
+            std::vector<char> state(required);
+            size_t capacity = state.size();
+            REQUIRE(reload.export_json(instance, state.data(), &capacity));
+            const auto exported = nlohmann::json::parse(
+                state.data(), state.data() + capacity - 1);
+            CHECK(exported["project_path"] == utf8(canonical_fixture));
+
+            REQUIRE(presentation.dispatch_action(instance,
+                        "rezonality_reload", sizeof("rezonality_reload") - 1)
+                != 0);
+            CHECK(settle(2).rfind(name_utf8 + " | ", 0) == 0);
+
+            api->quiesce_instance(instance);
+            api->destroy_instance(instance);
+            instance = api->create_instance(&create_info);
+            REQUIRE(instance != nullptr);
+            DraxulPluginHotReloadExtensionV2 replacement{};
+            REQUIRE(api->query_extension(instance,
+                        DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID,
+                        sizeof(DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_ID) - 1,
+                        DRAXUL_PLUGIN_HOT_RELOAD_EXTENSION_VERSION,
+                        &replacement, sizeof(replacement))
+                != 0);
+            CHECK(replacement.import_json(instance, state.data(), capacity - 1,
+                      reload.schema_id, reload.schema_version)
+                != 0);
+            api->quiesce_instance(instance);
+            api->destroy_instance(instance);
+        }
+    }
+    std::error_code ec;
     fs::remove_all(root, ec);
     CHECK_FALSE(ec);
 }

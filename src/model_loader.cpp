@@ -1,6 +1,7 @@
 #include "model_loader.h"
 
 #include "image_loader.h"
+#include "path_utf8.h"
 
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
@@ -107,12 +108,12 @@ bool load_texture(const aiScene& scene, const aiMaterial& material,
                 flip_texture_rows(result);
             return true;
         }
-        error = "Could not load model texture '" + texture_path.string()
+        error = "Could not load model texture '" + path_utf8(texture_path)
             + "': " + error;
         return false;
     }
     error = "Could not decode embedded model texture '"
-        + std::string(requested.C_Str()) + "' in '" + model_path.string()
+        + std::string(requested.C_Str()) + "' in '" + path_utf8(model_path)
         + "': " + error;
     return false;
 }
@@ -167,7 +168,7 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
         || std::abs(scale.y) < 1e-8f
         || std::abs(scale.z) < 1e-8f)
     {
-        error = "Model '" + path.string()
+        error = "Model '" + path_utf8(path)
             + "' has a non-finite or singular scale";
         return false;
     }
@@ -175,16 +176,16 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
     constexpr unsigned flags = aiProcess_Triangulate
         | aiProcess_PreTransformVertices
         | aiProcess_CalcTangentSpace | aiProcess_GenSmoothNormals;
-    const aiScene* scene = importer.ReadFile(path.string(), flags);
+    const aiScene* scene = importer.ReadFile(path_utf8(path), flags);
     if (!scene || !scene->HasMeshes())
     {
-        error = "Could not load model '" + path.string() + "': "
+        error = "Could not load model '" + path_utf8(path) + "': "
             + importer.GetErrorString();
         return false;
     }
     if (scene->mNumMaterials > kMaxModelMaterials)
     {
-        error = "Model '" + path.string() + "' has "
+        error = "Model '" + path_utf8(path) + "' has "
             + std::to_string(scene->mNumMaterials) + " materials; maximum is "
             + std::to_string(kMaxModelMaterials);
         return false;
@@ -299,7 +300,7 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
     }
     if (candidate.vertices.empty() || candidate.indices.empty())
     {
-        error = "Model '" + path.string() + "' contains no triangles";
+        error = "Model '" + path_utf8(path) + "' contains no triangles";
         return false;
     }
     model = std::move(candidate);

@@ -1,5 +1,6 @@
 #include "live_project.h"
 #include "image_loader.h"
+#include "path_utf8.h"
 
 #include <nlohmann/json.hpp>
 
@@ -93,7 +94,7 @@ void collect_shader_source(const fs::path& project_path,
     if (path.empty())
         return;
     const fs::path normalized = normalized_path(path);
-    if (!seen.insert(normalized.generic_string()).second)
+    if (!seen.insert(generic_path_utf8(normalized)).second)
         return;
     sources.push_back(normalized);
 
@@ -125,7 +126,7 @@ void collect_active_sources(ShaderBuild& build)
     if (!build.scenegraph_path.empty())
     {
         const fs::path scenegraph = normalized_path(build.scenegraph_path);
-        seen.insert(scenegraph.generic_string());
+        seen.insert(generic_path_utf8(scenegraph));
         build.source_files.push_back(scenegraph);
     }
     for (const auto& pass : build.passes)
@@ -924,7 +925,7 @@ bool compile_shader(const fs::path& compiler, const fs::path& project_path,
     std::vector<fs::path> arguments{
         compiler, "-V", "--target-env", "vulkan1.2", shader,
         "-o", output_path, "-l", "-g",
-        fs::path("-I" + project_path.string())
+        fs::path("-I").concat(project_path.native())
     };
 #if defined(__APPLE__)
     arguments.emplace_back("-DREZONALITY_METAL_SEPARATE_MODEL_SAMPLER=1");
@@ -958,7 +959,7 @@ bool compile_shader(const fs::path& compiler, const fs::path& project_path,
                 .stage = "compile",
                 .severity = "error",
                 .message = "glslangValidator produced no SPIR-V for "
-                    + shader.filename().string(),
+                    + path_utf8(shader.filename()),
             });
         }
         return false;
@@ -1133,7 +1134,7 @@ std::optional<ProjectOptions> parse_project_options(
     if (ec || !fs::is_directory(options.project_path))
     {
         error = "Rezonality project directory is missing: "
-            + options.project_path.string();
+            + display_path_utf8(options.project_path);
         return std::nullopt;
     }
     if (!scenegraph_explicit)
@@ -1271,7 +1272,7 @@ uint64_t ProjectPipeline::fingerprint() const
     std::sort(files.begin(), files.end());
     for (const auto& file : files)
     {
-        hash = hash_string(hash, file.generic_string());
+        hash = hash_string(hash, generic_path_utf8(file));
         if (const auto contents = read_text(file))
             hash = hash_string(hash, *contents);
     }
@@ -1349,7 +1350,7 @@ BuildResult build_candidate(const fs::path& plugin_directory,
                 .stage = "compile",
                 .severity = "error",
                 .message = "injected compiler produced no SPIR-V for "
-                    + shader.filename().string(),
+                    + path_utf8(shader.filename()),
             });
         }
         return false;
@@ -1475,7 +1476,7 @@ BuildResult ProjectPipeline::build(uint64_t generation) const
         BuildResult result;
         result.generation = generation;
         result.diagnostic_path = scenegraph;
-        result.error = "Scenegraph is missing: " + scenegraph.string();
+        result.error = "Scenegraph is missing: " + display_path_utf8(scenegraph);
         return result;
     }
 

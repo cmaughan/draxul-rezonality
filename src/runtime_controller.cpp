@@ -1,4 +1,5 @@
 #include "runtime_controller.h"
+#include "path_utf8.h"
 
 #include <chrono>
 #include <utility>
@@ -181,7 +182,7 @@ std::string RuntimeController::failure_status(uint64_t attempted_generation,
             + std::to_string(active_generation);
     if (!diagnostic_path.empty())
     {
-        status += " | " + diagnostic_path.filename().string();
+        status += " | " + display_path_utf8(diagnostic_path.filename());
         if (diagnostic_line > 0)
             status += ":" + std::to_string(diagnostic_line);
     }

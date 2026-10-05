@@ -5,6 +5,7 @@
 #include "camera.h"
 #include "diagnostics.h"
 #include "native_backend.h"
+#include "path_utf8.h"
 #include "runtime_controller.h"
 
 #include <draxul/plugin_adapter.h>
@@ -113,7 +114,8 @@ void log(RezonalityInstance* instance, uint32_t level,
 
 std::string diagnostic_stage(const BuildResult& result)
 {
-    const std::string extension = result.diagnostic_path.extension().string();
+    const std::string extension
+        = rezonality::display_path_utf8(result.diagnostic_path.extension());
     if (extension == ".scenegraph" || extension == ".toml")
         return "parse";
     if (extension == ".vert" || extension == ".frag"
@@ -188,14 +190,8 @@ void notify_presentation(RezonalityInstance* instance)
             instance->host->host_context);
 }
 
-void* create_instance(const DraxulPluginCreateInfoV2* info)
+void* create_instance_unchecked(const DraxulPluginCreateInfoV2* info)
 {
-    if (!info || info->struct_size < sizeof(DraxulPluginCreateInfoV2)
-        || !info->host
-        || info->host->struct_size < sizeof(DraxulPluginHostApiV2)
-        || info->host->abi_version != DRAXUL_PLUGIN_ABI_VERSION)
-        return nullptr;
-
     auto instance = std::make_unique<RezonalityInstance>();
     instance->host = info->host;
     instance->plugin_directory = info->plugin_directory_utf8
@@ -228,6 +224,36 @@ void* create_instance(const DraxulPluginCreateInfoV2* info)
     publish_diagnostics(instance.get(), "watch", "info", {}, -1,
         "building generation 1");
     return instance.release();
+}
+
+void* create_instance(const DraxulPluginCreateInfoV2* info)
+{
+    if (!info || info->struct_size < sizeof(DraxulPluginCreateInfoV2)
+        || !info->host
+        || info->host->struct_size < sizeof(DraxulPluginHostApiV2)
+        || info->host->abi_version != DRAXUL_PLUGIN_ABI_VERSION)
+        return nullptr;
+    // Exceptions must not cross the C ABI. A partially created instance is
+    // released (stopping its worker) by the unique_ptr during unwinding.
+    try
+    {
+        return create_instance_unchecked(info);
+    }
+    catch (const std::exception& exception)
+    {
+        if (info->host->log)
+        {
+            const std::string message
+                = std::string("Rezonality could not create an instance: ")
+                + exception.what();
+            info->host->log(info->host->host_context,
+                DRAXUL_PLUGIN_LOG_ERROR, message.data(), message.size());
+        }
+    }
+    catch (...)
+    {
+    }
+    return nullptr;
 }
 
 void quiesce_instance(void* opaque)
@@ -497,7 +523,8 @@ int32_t get_presentation_state(void* opaque,
         || state->struct_size < sizeof(DraxulPluginPresentationStateV2))
         return 0;
     instance->presentation_status
-        = instance->options.project_path.filename().string()
+        = rezonality::display_path_utf8(
+              instance->options.project_path.filename())
         + " | " + instance->runtime.status();
     if (!instance->audio_status.empty())
         instance->presentation_status += " | " + instance->audio_status;
@@ -548,9 +575,17 @@ int32_t export_reload_json(void* opaque, char* buffer,
     auto* instance = static_cast<RezonalityInstance*>(opaque);
     if (!instance || !in_out_size)
         return 0;
-    const std::string value = nlohmann::json{
-        { "project_path", instance->options.project_path.generic_string() },
-        { "scenegraph", instance->options.scenegraph.generic_string() },
+    // Paths are serialized as UTF-8 text, never through the Windows active
+    // code page. Exceptions (an unrepresentable native name) must not cross
+    // the C ABI; the host then keeps a cold reload without handoff state.
+    std::string value;
+    try
+    {
+    value = nlohmann::json{
+        { "project_path",
+            rezonality::generic_path_utf8(instance->options.project_path) },
+        { "scenegraph",
+            rezonality::generic_path_utf8(instance->options.scenegraph) },
         { "time_seconds", instance->animation.elapsed_seconds },
         { "paused", instance->animation.paused },
         { "camera_position", {
@@ -562,6 +597,11 @@ int32_t export_reload_json(void* opaque, char* buffer,
             instance->camera.focal_point.y,
             instance->camera.focal_point.z } },
     }.dump();
+    }
+    catch (...)
+    {
+        return 0;
+    }
     const size_t required = value.size() + 1;
     if (!buffer)
     {
@@ -612,9 +652,11 @@ int32_t import_reload_json(void* opaque, const char* json,
         const auto state = nlohmann::json::parse(json, json + json_length);
         if (!state.is_object()
             || state.value("project_path", std::string{})
-                != instance->options.project_path.generic_string()
+                != rezonality::generic_path_utf8(
+                    instance->options.project_path)
             || state.value("scenegraph", std::string{})
-                != instance->options.scenegraph.generic_string())
+                != rezonality::generic_path_utf8(
+                    instance->options.scenegraph))
             return 0;
         const double time = state.value("time_seconds", 0.0);
         const auto position = reload_vec3(state, "camera_position");

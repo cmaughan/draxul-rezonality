@@ -1,4 +1,5 @@
 #include "diagnostics.h"
+#include "path_utf8.h"
 
 #include <nlohmann/json.hpp>
 
@@ -108,7 +109,7 @@ std::string bounded(std::string value, size_t maximum)
 
 std::string path_string(const std::filesystem::path& path)
 {
-    return bounded(path.generic_string(), kMaximumPathBytes);
+    return bounded(generic_path_utf8(path), kMaximumPathBytes);
 }
 
 uint64_t unix_milliseconds()
@@ -123,7 +124,7 @@ std::string diagnostics_id(const std::filesystem::path& project,
 {
     if (!configured.empty())
         return configured;
-    std::string stem = project.filename().string();
+    std::string stem = path_utf8(project.filename());
     std::transform(stem.begin(), stem.end(), stem.begin(),
         [](unsigned char value) {
             if (std::isalnum(value))
@@ -136,7 +137,7 @@ std::string diagnostics_id(const std::filesystem::path& project,
         stem.resize(40);
 
     uint64_t hash = kFnvOffset;
-    const std::string key = project.generic_string();
+    const std::string key = generic_path_utf8(project);
     for (unsigned char value : key)
     {
         hash ^= value;
@@ -265,7 +266,8 @@ bool DiagnosticsPublisher::publish(
             + directory_error.message();
         return false;
     }
-    const std::filesystem::path temporary = path_.string() + ".tmp";
+    std::filesystem::path temporary = path_;
+    temporary += ".tmp";
     {
         std::ofstream output(temporary,
             std::ios::binary | std::ios::trunc);

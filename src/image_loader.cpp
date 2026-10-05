@@ -1,7 +1,10 @@
 #define STB_IMAGE_IMPLEMENTATION
+// Interpret filenames as UTF-8 on Windows instead of the active code page.
+#define STBI_WINDOWS_UTF8
 #include <stb_image.h>
 
 #include "image_loader.h"
+#include "path_utf8.h"
 
 namespace rezonality
 {
@@ -13,11 +16,11 @@ bool load_rgba8_image(const std::filesystem::path& path,
     int loaded_width = 0;
     int loaded_height = 0;
     int channels = 0;
-    stbi_uc* loaded = stbi_load(path.string().c_str(), &loaded_width,
+    stbi_uc* loaded = stbi_load(path_utf8(path).c_str(), &loaded_width,
         &loaded_height, &channels, STBI_rgb_alpha);
     if (!loaded || loaded_width <= 0 || loaded_height <= 0)
     {
-        error = "Could not load texture '" + path.string() + "': "
+        error = "Could not load texture '" + path_utf8(path) + "': "
             + (stbi_failure_reason() ? stbi_failure_reason() : "unknown error");
         if (loaded)
             stbi_image_free(loaded);
@@ -64,11 +67,11 @@ bool load_rgba32f_image(const std::filesystem::path& path,
     int loaded_width = 0;
     int loaded_height = 0;
     int channels = 0;
-    float* loaded = stbi_loadf(path.string().c_str(), &loaded_width,
+    float* loaded = stbi_loadf(path_utf8(path).c_str(), &loaded_width,
         &loaded_height, &channels, STBI_rgb_alpha);
     if (!loaded || loaded_width <= 0 || loaded_height <= 0)
     {
-        error = "Could not load HDR texture '" + path.string() + "': "
+        error = "Could not load HDR texture '" + path_utf8(path) + "': "
             + (stbi_failure_reason() ? stbi_failure_reason() : "unknown error");
         if (loaded)
             stbi_image_free(loaded);
