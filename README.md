@@ -80,6 +80,15 @@ dashboard. Launch it from the parent Draxul checkout with:
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File plugins/rezonality/examples/nyx_flight_deck/launch.ps1
 ```
 
+The `examples/starship_bridge` project is a 2-by-2 starship control panel:
+a generated OBJ cruiser over a tactical grid, a ringed ice giant, a volumetric
+warp core and a holographic terrain survey, all sharing an HDR bloom and HUD
+composite. Its cross-platform launcher creates the complete tab:
+
+```text
+python3 plugins/rezonality/examples/starship_bridge/launch.py
+```
+
 The
 protoplanetary demo now runs its preserved VkLive raymarch, sphere overlay, and
 composite shaders directly. Its active live-edit sources are

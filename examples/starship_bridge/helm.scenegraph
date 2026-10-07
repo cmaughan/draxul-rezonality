@@ -1,0 +1,84 @@
+# HELM // TACTICAL - generated Vanguard-class cruiser over a tactical grid.
+camera: default_camera {
+    position: (0.0, 1.0, 5.0)
+    look_at: (0.0, -0.1, 0.0)
+    field_of_view: 42.0
+    near_far: (0.05, 200.0)
+}
+
+surface: Scene {
+    scale: (1.0, 1.0, 1.0)
+    format: rgba16f
+}
+
+surface: Depth {
+    scale: (1.0, 1.0, 1.0)
+    format: default_depth
+}
+
+surface: BloomA {
+    scale: (0.25, 0.25, 1.0)
+    format: rgba16f
+}
+
+surface: BloomB {
+    scale: (0.125, 0.125, 1.0)
+    format: rgba16f
+}
+
+model: ship {
+    path: ship.obj
+    scale: (1.0, 1.0, 1.0)
+    uv_origin: upper_left
+}
+
+pass: Sky {
+    targets: (Scene, Depth)
+    clear: (0.0, 0.0, 0.0, 1.0)
+    camera: default_camera
+    geometry: backdrop {
+        path: screen_rect
+        vs: ray.vert
+        fs: helm_sky.frag
+    }
+}
+
+pass: Ship {
+    targets: (Scene, Depth)
+    camera: default_camera
+    geometry: hull {
+        model: ship
+        vs: ship.vert
+        fs: ship.frag
+    }
+}
+
+pass: BloomExtract {
+    samplers: (Scene)
+    targets: (BloomA)
+    geometry: extract {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_extract.frag
+    }
+}
+
+pass: BloomBlur {
+    samplers: (BloomA)
+    targets: (BloomB)
+    geometry: blur {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_blur.frag
+    }
+}
+
+pass: Composite {
+    samplers: (Scene, BloomA, BloomB)
+    targets: (default_color)
+    geometry: display {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: post_helm.frag
+    }
+}

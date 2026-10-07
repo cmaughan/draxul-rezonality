@@ -1,0 +1,63 @@
+# SENSORS - holographic long-range terrain survey with tracked contacts.
+camera: default_camera {
+    position: (0.0, 3.6, 6.0)
+    look_at: (0.0, -0.6, -4.0)
+    field_of_view: 55.0
+    near_far: (0.05, 200.0)
+}
+
+surface: Scene {
+    scale: (1.0, 1.0, 1.0)
+    format: rgba16f
+}
+
+surface: BloomA {
+    scale: (0.25, 0.25, 1.0)
+    format: rgba16f
+}
+
+surface: BloomB {
+    scale: (0.125, 0.125, 1.0)
+    format: rgba16f
+}
+
+pass: Survey {
+    targets: (Scene)
+    clear: (0.0, 0.0, 0.0, 1.0)
+    camera: default_camera
+    geometry: terrain {
+        path: screen_rect
+        vs: ray.vert
+        fs: sensor.frag
+    }
+}
+
+pass: BloomExtract {
+    samplers: (Scene)
+    targets: (BloomA)
+    geometry: extract {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_extract.frag
+    }
+}
+
+pass: BloomBlur {
+    samplers: (BloomA)
+    targets: (BloomB)
+    geometry: blur {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_blur.frag
+    }
+}
+
+pass: Composite {
+    samplers: (Scene, BloomA, BloomB)
+    targets: (default_color)
+    geometry: display {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: post_sensor.frag
+    }
+}
