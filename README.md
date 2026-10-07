@@ -89,6 +89,16 @@ composite. Its cross-platform launcher creates the complete tab:
 python3 plugins/rezonality/examples/starship_bridge/launch.py
 ```
 
+The `examples/seaside` project is a 2-by-2 nature scene of one coast across a
+day: raymarched dawn sea stacks, an underwater kelp forest with an animated
+fish school, a sailboat riding a Gerstner swell at sunset, and a lighthouse
+sweeping volumetric beams over bioluminescent surf. Its meshes are generated
+by `generate_models.py`, which the cross-platform launcher runs on first use:
+
+```text
+python3 plugins/rezonality/examples/seaside/launch.py
+```
+
 The
 protoplanetary demo now runs its preserved VkLive raymarch, sphere overlay, and
 composite shaders directly. Its active live-edit sources are

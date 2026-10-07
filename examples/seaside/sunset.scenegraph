@@ -1,0 +1,98 @@
+// SUNSET - a sloop on a broad reach across a golden swell.
+camera: default_camera {
+    position: (9.0, 3.1, 11.0)
+    look_at: (-2.0, 2.6, -3.0)
+    field_of_view: 50.0
+    near_far: (0.1, 3000.0)
+}
+
+surface: Scene {
+    scale: (1.0, 1.0, 1.0)
+    format: rgba16f
+}
+
+surface: Depth {
+    scale: (1.0, 1.0, 1.0)
+    format: default_depth
+}
+
+surface: BloomA {
+    scale: (0.25, 0.25, 1.0)
+    format: rgba16f
+}
+
+surface: BloomB {
+    scale: (0.125, 0.125, 1.0)
+    format: rgba16f
+}
+
+model: boat {
+    path: sailboat.obj
+    scale: (1.0, 1.0, 1.0)
+}
+
+model: sea {
+    path: ocean_grid.obj
+    scale: (1.0, 1.0, 1.0)
+}
+
+pass: Sky {
+    targets: (Scene, Depth)
+    clear: (0.0, 0.0, 0.0, 1.0)
+    camera: default_camera
+    geometry: backdrop {
+        path: screen_rect
+        vs: ray.vert
+        fs: sunset_backdrop.frag
+    }
+}
+
+pass: Boat {
+    targets: (Scene, Depth)
+    camera: default_camera
+    geometry: yacht {
+        model: boat
+        vs: boat.vert
+        fs: boat.frag
+    }
+}
+
+pass: Ocean {
+    targets: (Scene, Depth)
+    camera: default_camera
+    geometry: swell {
+        model: sea
+        vs: sunset_ocean.vert
+        fs: sunset_ocean.frag
+    }
+}
+
+pass: BloomExtract {
+    samplers: (Scene)
+    targets: (BloomA)
+    geometry: extract {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_extract.frag
+    }
+}
+
+pass: BloomBlur {
+    samplers: (BloomA)
+    targets: (BloomB)
+    geometry: blur {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_blur.frag
+    }
+}
+
+pass: Composite {
+    samplers: (Scene, BloomA, BloomB)
+    targets: (default_color)
+    geometry: display {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: post_sunset.frag
+    }
+}

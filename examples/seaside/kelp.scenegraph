@@ -1,0 +1,134 @@
+// MIDDAY - beneath the waves in a giant-kelp forest.
+camera: default_camera {
+    position: (1.0, 3.0, 11.0)
+    look_at: (0.0, 9.5, -16.0)
+    field_of_view: 62.0
+    near_far: (0.1, 2000.0)
+}
+
+surface: Scene {
+    scale: (1.0, 1.0, 1.0)
+    format: rgba16f
+}
+
+surface: Linear {
+    scale: (1.0, 1.0, 1.0)
+    format: rgba16f
+}
+
+surface: Depth {
+    scale: (1.0, 1.0, 1.0)
+    format: default_depth
+}
+
+surface: Lit {
+    scale: (1.0, 1.0, 1.0)
+    format: rgba16f
+}
+
+surface: BloomA {
+    scale: (0.25, 0.25, 1.0)
+    format: rgba16f
+}
+
+surface: BloomB {
+    scale: (0.125, 0.125, 1.0)
+    format: rgba16f
+}
+
+model: forest {
+    path: kelp.obj
+    scale: (1.0, 1.0, 1.0)
+}
+
+model: school {
+    path: fish.obj
+    scale: (1.0, 1.0, 1.0)
+}
+
+model: floor {
+    path: ocean_grid.obj
+    scale: (1.0, 1.0, 1.0)
+}
+
+pass: Water {
+    targets: (Scene, Linear, Depth)
+    clear: (0.0, 0.0, 0.0, 1.0)
+    camera: default_camera
+    geometry: water {
+        path: screen_rect
+        vs: ray.vert
+        fs: kelp_backdrop.frag
+    }
+}
+
+pass: Kelp {
+    targets: (Scene, Linear, Depth)
+    camera: default_camera
+    geometry: kelp {
+        model: forest
+        vs: kelp.vert
+        fs: kelp.frag
+    }
+}
+
+pass: Fish {
+    targets: (Scene, Linear, Depth)
+    camera: default_camera
+    geometry: fish {
+        model: school
+        vs: fish.vert
+        fs: fish.frag
+    }
+}
+
+pass: Seabed {
+    targets: (Scene, Linear, Depth)
+    camera: default_camera
+    geometry: seabed {
+        model: floor
+        vs: seabed.vert
+        fs: seabed.frag
+    }
+}
+
+pass: GodRays {
+    samplers: (Scene, Linear)
+    targets: (Lit)
+    camera: default_camera
+    geometry: rays {
+        path: screen_rect
+        vs: ray.vert
+        fs: kelp_rays.frag
+    }
+}
+
+pass: BloomExtract {
+    samplers: (Lit)
+    targets: (BloomA)
+    geometry: extract {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_extract.frag
+    }
+}
+
+pass: BloomBlur {
+    samplers: (BloomA)
+    targets: (BloomB)
+    geometry: blur {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: bloom_blur.frag
+    }
+}
+
+pass: Composite {
+    samplers: (Lit, BloomA, BloomB)
+    targets: (default_color)
+    geometry: display {
+        path: screen_rect
+        vs: fullscreen.vert
+        fs: post_kelp.frag
+    }
+}
