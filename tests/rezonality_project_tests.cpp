@@ -872,12 +872,169 @@ TEST_CASE("Rezonality live watch is idle without content reads",
     CHECK(idle.files_hashed == baseline.files_hashed);
     CHECK(idle.bytes_hashed == baseline.bytes_hashed);
 
-    // An edit is still detected after idle polls.
+    // A shader-only edit is still detected and rebuilds without decoding
+    // the unchanged image and model again.
+    const auto decoded = live.asset_counters();
+    CHECK(decoded.image_decodes == 1);
+    CHECK(decoded.model_decodes == 1);
     const fs::path shader = fixture.path / "vklive-original" / "geom.frag";
     write(shader, read(shader) + "\n// edited\n");
     const auto edited = wait_for_result(live);
     REQUIRE(edited);
     REQUIRE(edited->build);
     CHECK(edited->generation > initial->generation);
+    const auto reused = live.asset_counters();
+    CHECK(reused.image_decodes == 1);
+    CHECK(reused.model_decodes == 1);
+    CHECK(reused.image_reuses == 1);
+    CHECK(reused.model_reuses == 1);
     live.stop();
+}
+
+TEST_CASE("Rezonality reuses decoded assets across shader-only candidates",
+    "[rezonality][project][assets]")
+{
+    ProjectFixture fixture("default");
+    const fs::path box_source = plugin_root() / "examples" / "ray_tracer";
+    fs::copy_file(box_source / "cornell-box.obj",
+        fixture.path / "cornell-box.obj");
+    fs::copy_file(box_source / "cornell-box.mtl",
+        fixture.path / "cornell-box.mtl");
+    const fs::path scenegraph = fixture.path / "assets.scenegraph";
+    const std::string both_models = R"scene(
+surface: Noise { path: noise.png }
+surface: Color { scale: (1, 1, 1) format: default_color }
+surface: Depth { scale: (1, 1, 1) format: default_depth }
+model: sphere { path: vklive-original/sphere.gltf }
+model: box { path: cornell-box.obj }
+pass: Sphere {
+    samplers: (Noise)
+    targets: (Color, Depth)
+    geometry: shape {
+        model: sphere
+        vs: vklive-original/geom.vert
+        fs: vklive-original/geom.frag
+    }
+}
+pass: Box {
+    targets: (Color, Depth)
+    geometry: shape {
+        model: box
+        vs: vklive-original/geom.vert
+        fs: vklive-original/geom.frag
+    }
+}
+)scene";
+    write(scenegraph, both_models);
+    age_tree(fixture.path, std::chrono::minutes(60));
+    auto configured = options(fixture.path);
+    configured.scenegraph = "assets.scenegraph";
+    rezonality::ProjectPipeline pipeline(
+        plugin_root(), configured, accept_shader);
+
+    const auto box_color = [](const rezonality::BuildResult& result) {
+        const auto& materials = result.build->models[1]->materials;
+        const auto green = std::find_if(materials.begin(), materials.end(),
+            [](const auto& material) {
+                return material.name == "DarkGreen";
+            });
+        REQUIRE(green != materials.end());
+        return green->base_color_factor.g;
+    };
+    const auto noise_surface = [](const rezonality::BuildResult& result)
+        -> const rezonality::ShaderBuild::Surface& {
+        const auto& surfaces = result.build->surfaces;
+        const auto found = std::find_if(surfaces.begin(), surfaces.end(),
+            [](const auto& surface) { return surface.name == "Noise"; });
+        REQUIRE(found != surfaces.end());
+        return *found;
+    };
+
+    const auto first = pipeline.build(1);
+    REQUIRE(first.build);
+    REQUIRE(first.build->models.size() == 2);
+    auto counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 2);
+    CHECK(counters.image_decodes == 1);
+    CHECK(pipeline.cached_assets() == 3);
+    CHECK(std::abs(box_color(first) - 0.32f) < 1e-4f);
+
+    // Shader-only edit: every asset is reused and candidates stay
+    // independent copies of identical decoded data.
+    const fs::path shader = fixture.path / "vklive-original" / "geom.frag";
+    write(shader, read(shader) + "\n// shader edit\n");
+    const auto shader_edit = pipeline.build(2);
+    REQUIRE(shader_edit.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 2);
+    CHECK(counters.image_decodes == 1);
+    CHECK(counters.model_reuses == 2);
+    CHECK(counters.image_reuses == 1);
+    const auto& first_noise = noise_surface(first);
+    const auto& reused_noise = noise_surface(shader_edit);
+    CHECK(reused_noise.image_pixels == first_noise.image_pixels);
+    CHECK(reused_noise.image_pixels.data() != first_noise.image_pixels.data());
+    // Reused models alias the earlier candidate's immutable import.
+    CHECK(shader_edit.build->models[0].shared()
+        == first.build->models[0].shared());
+    CHECK(shader_edit.build->models[1].shared()
+        == first.build->models[1].shared());
+
+    // A same-size edit to a file only the model references (its material
+    // library) re-imports that model alone.
+    const fs::path library = fixture.path / "cornell-box.mtl";
+    std::string material_text = read(library);
+    const size_t green = material_text.find("Kd 0.0 0.32 0.0");
+    REQUIRE(green != std::string::npos);
+    material_text.replace(green, 15, "Kd 0.0 0.33 0.0");
+    write(library, material_text);
+    age_file(library, std::chrono::minutes(50));
+    const auto material_edit = pipeline.build(3);
+    REQUIRE(material_edit.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 3);
+    CHECK(counters.image_decodes == 1);
+    CHECK(std::abs(box_color(material_edit) - 0.33f) < 1e-4f);
+
+    // Break the image: the candidate fails while decoded models stay cached,
+    // and repair decodes only the repaired image.
+    const fs::path noise = fixture.path / "noise.png";
+    const std::string noise_bytes = read(noise);
+    write(noise, "not an image");
+    age_file(noise, std::chrono::minutes(40));
+    const auto broken = pipeline.build(4);
+    CHECK_FALSE(broken.build);
+    CHECK(broken.diagnostic_path == noise);
+    write(noise, noise_bytes);
+    age_file(noise, std::chrono::minutes(30));
+    const auto repaired = pipeline.build(5);
+    REQUIRE(repaired.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 3);
+    CHECK(counters.image_decodes == 3);
+    CHECK(noise_surface(repaired).image_pixels == first_noise.image_pixels);
+
+    // A decode whose input is still racy is not retained, so a rewrite
+    // within the timestamp granularity cannot reuse stale pixels.
+    write(noise, noise_bytes);
+    const auto racy = pipeline.build(6);
+    REQUIRE(racy.build);
+    const auto racy_again = pipeline.build(7);
+    REQUIRE(racy_again.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.image_decodes == 5);
+    age_file(noise, std::chrono::minutes(20));
+
+    // The cache is bounded by the latest complete scene.
+    std::string one_model = both_models;
+    const size_t sphere_pass = one_model.find("pass: Sphere");
+    const size_t box_pass = one_model.find("pass: Box");
+    one_model.erase(sphere_pass, box_pass - sphere_pass);
+    one_model.erase(one_model.find("model: sphere"),
+        one_model.find("model: box") - one_model.find("model: sphere"));
+    write(scenegraph, one_model);
+    const auto smaller = pipeline.build(8);
+    REQUIRE(smaller.build);
+    CHECK(smaller.build->models.size() == 1);
+    CHECK(pipeline.cached_assets() == 2);
 }
