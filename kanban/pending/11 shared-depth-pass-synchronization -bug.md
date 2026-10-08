@@ -2,8 +2,7 @@
 
 **Summary:** Synchronize shared depth images so successive drawing passes preserve correct visibility.
 
-**Priority:** 11  
-**Severity:** HIGH  
+**Priority:** P1  
 **Source:** `plugins/rezonality/src/native_backend_vulkan.cpp`
 
 **Evidence and trigger:** B25; the shipped robot scene reuses depth across clear/load/test/write passes, but dependencies cover only color and sampling.

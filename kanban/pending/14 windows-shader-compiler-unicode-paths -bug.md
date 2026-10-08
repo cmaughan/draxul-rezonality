@@ -2,8 +2,7 @@
 
 **Summary:** Let projects whose paths fall outside the Windows active code page compile instead of failing every shader build.
 
-**Priority:** 14  
-**Severity:** HIGH  
+**Priority:** P1  
 **Source:** `plugins/rezonality/src/live_project.cpp`  
 **Found during:** `kanban/done/13 international-project-path-serialization -bug.md`
 
