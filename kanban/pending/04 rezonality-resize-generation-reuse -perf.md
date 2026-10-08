@@ -22,7 +22,7 @@
   - `Rezonality native generations keep source assets across resizes` pins the shared classification rule for both backends.
   - Before/after stall and memory figures are in the Baseline item (Metal); Vulkan figures are part of the open Platforms item.
 - [ ] **Platforms:** Check resize, reload failure, and render goldens on Vulkan and Metal.
-  - macOS/Metal: Rezonality render goldens and the resize test pass in the Rezonality aggregate.
+  - macOS/Metal (2026-10-08): all seven Rezonality render goldens, the resize test, and the classification test pass in `python3 do.py test debug --rezonality`; the reload-failure contract test (`Rezonality watches valid, broken, and repaired shader edits`) passed on an isolated rerun after a load-induced timeout; same-cache smoke passed.
   - Windows/Vulkan (not compiled or run on macOS; type-checked with `clang++ -fsyntax-only` against Vulkan 1.4 headers and VMA 3.1.0): build; run `py do.py test debug --rezonality`; then manually drag-resize a split containing `examples/pbr_robot` and `examples/ray_tracer` with the Vulkan validation layer enabled and confirm no validation errors, no use-after-free of shared pipelines/descriptor layouts when generations retire, correct output after each step, and that a window resize (new swapchain/target generation) rebuilds programs but not models. Measure drag-frame p95 and retired-memory peak before/after on an asset-rich scene.
 - [ ] **Acceptance:** Size changes replace only size-dependent resources.
   - Met on Metal (tested). Pending the Windows/Vulkan check above.
