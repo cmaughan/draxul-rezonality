@@ -16,8 +16,16 @@
 **Cross-platform validation**
 - [x] Check Windows quoting and POSIX argument boundaries. `Rezonality quotes Windows compiler arguments for the CRT` runs on every platform. Arguments that contain spaces and emoji reach the real macOS compiler as single argv entries.
 - [x] macOS `--rezonality` aggregate (registered Rezonality goldens included) and same-cache smoke.
-- [ ] Windows `--rezonality` aggregate, goldens, and smoke: pending CI. The Windows `run_process` change (working directory, status, output cap) was checked by reading only.
+- [x] Windows aggregate, goldens, and same-cache smoke executed on 2026-10-08; compiler-specific coverage passed. Scope failures and costs are retained below.
 **Agent documentation and tooling**
 - [x] Update product project/compiler boundary notes (`AGENTS.md`).
 **Acceptance criteria**
 - [x] Production diagnostic decoding is testable without invoking a compiler.
+
+## Windows closure evidence, 2026-10-08
+
+Parent ran `py do.py test debug --rezonality` in `build-ninja-debug` after rebuilding the explicit-UCN international fixtures: project suite passed (13.30 s), dynamic module passed (262 assertions / 5 cases, 85.53 s), Neovim passed (4.27 s), and all seven golden comparisons passed (114.19 test-seconds). Full selection: 64/70 passed, CTest 306.89 s / runner 308.27 s; 19 build steps in 130.635 s, no reconfigure. Five core entries failed; the native Vulkan suite also failed its validation-log assertion on a stale machine NVIDIA layer manifest (421/422 assertions passed). Golden logs contain real synchronization hazards, so comparison success is not synchronization-clean evidence: [shared-depth tracking](../pending/11%20shared-depth-pass-synchronization%20-bug.md) and [ray scratch tracking](../pending/15%20ray-build-scratch-synchronization%20-bug.md) remain open.
+
+Paired fresh-profile same-cache Debug smoke passed, exit 0 (35.273 s wrapper total including MSVC setup, parent-measured); the earlier default-profile timeout remains unresolved in the parent's separate startup investigation. Retained parent logs: `build-ninja-debug/windows-gates/final-core-rezonality.log`, `final-core-rezonality-ctest.log`, and `final-debug-smoke.log`. This closes the compiler slice, not the aggregate's unrelated failures; no new macOS run is claimed.
+
+Final Release confirmation (parent, 2026-10-08): same-cache smoke retry passed, exit 0, 33.866647 s including toolchain setup; log `build-ninja-debug/windows-gates/final-release-smoke-retry.log`. The first attempt failed during resource-exhausted MSVC environment setup (68.059 s), before app startup; it is retained as an environmental failure, not an application failure.

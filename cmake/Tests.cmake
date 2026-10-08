@@ -18,6 +18,9 @@ if(APPLE)
     # Exercises real Metal preparation limits against a system device.
     list(APPEND _rezonality_native_test_sources
         "${_rezonality_root}/tests/rezonality_metal_backend_tests.mm")
+else()
+    list(APPEND _rezonality_native_test_sources
+        "${_rezonality_root}/tests/rezonality_vulkan_backend_tests.cpp")
 endif()
 draxul_add_test_target(
     draxul-test-rezonality-native rezonality 1

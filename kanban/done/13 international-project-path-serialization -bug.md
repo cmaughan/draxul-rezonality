@@ -15,7 +15,7 @@
 - [x] **Fix:** Contain failures in affected exported callbacks and preserve the active project on reload failure.
   `create_instance` and `export_reload_json` no longer let exceptions cross the C ABI; `import_reload_json` was already contained. Build failures continue through the failed-candidate path that keeps the active generation.
 - [x] **Acceptance:** Projects under accented, Asian, and emoji paths open and reload safely on Windows with a non-UTF-8 code page.
-  Covered by `The staged Rezonality module opens and reloads international project paths` (requires `ready` on macOS). On Windows the bundled narrow-argv glslangValidator cannot open names outside the code page, so those candidates fail safely with a diagnostic; tracked by `kanban/pending/14 windows-shader-compiler-unicode-paths -bug.md`. Not executed on Windows locally.
+  Covered by `The staged Rezonality module opens and reloads international project paths` (now requires `ready` on both platforms). The Windows narrow-argv compiler limitation was subsequently fixed and validated with encoding-independent fixtures on code page 1252; see `kanban/done/14 windows-shader-compiler-unicode-paths -bug.md` for the 2026-10-08 evidence.
 - [x] **Acceptance:** Presentation and diagnostics remain valid text; existing publication error handling remains effective.
   The test checks UTF-8 presentation status, an ASCII default diagnostics identity, the published UTF-8 `project_path`, and export/import round-trip of the UTF-8 path.
 - [x] **Validation:** Run the Rezonality-scoped aggregate, affected reload checks, and same-cache smoke; preserve macOS path behavior.

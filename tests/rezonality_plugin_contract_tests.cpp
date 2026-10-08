@@ -325,8 +325,8 @@ TEST_CASE("The staged Rezonality module opens and reloads international project 
     const fs::path root = fs::temp_directory_path()
         / ("draxul-rezonality-international-" + std::to_string(fixture_id));
     for (const std::u8string_view name : {
-             std::u8string_view(u8"café-projèt"),
-             std::u8string_view(u8"日本語プロジェクト"),
+             std::u8string_view(u8"caf\u00E9-proj\u00E8t"),
+             std::u8string_view(u8"\u65E5\u672C\u8A9E\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8"),
              std::u8string_view(u8"mixer-\U0001F39B\U0001F3B5"),
          })
     {

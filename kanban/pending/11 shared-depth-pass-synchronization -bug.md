@@ -2,7 +2,7 @@
 
 **Summary:** Synchronize shared depth images so successive drawing passes preserve correct visibility.
 
-**Priority:** P1  
+**Priority:** P1 — shared attachment hazards can corrupt live scene visibility.
 **Source:** `plugins/rezonality/src/native_backend_vulkan.cpp`
 
 **Evidence and trigger:** B25; the shipped robot scene reuses depth across clear/load/test/write passes, but dependencies cover only color and sampling.
@@ -20,3 +20,11 @@
 - [ ] **Validation:** Preserve Metal behavior; run the Rezonality-scoped aggregate, Vulkan rendering checks, and same-cache smoke.
   - macOS (2026-10-08, with cards 04/06 on top): `python3 do.py test debug --rezonality` — all seven Rezonality render goldens (including `rezonality-pbr-robot` and `rezonality-deferred-shading`) and the Rezonality runtime/audio/layout/Neovim suites passed; the Rezonality contract and project suites failed only under concurrent multi-agent load (shared `/tmp` fixture paths, watcher timing) and passed when rerun in isolation. `python3 do.py smoke debug --skip-build` passed.
   - The Vulkan file was type-checked on macOS with `clang++ -fsyntax-only` against Vulkan 1.4 headers and VMA 3.1.0, but it is not compiled or run by the macOS build. Windows: build, run the Rezonality render goldens (`py do.py test debug --rezonality`) and the validation-layer check above.
+
+## Windows evidence and blockers, 2026-10-08
+
+Parent's `py do.py test debug --rezonality` retained `build-ninja-debug/windows-gates/final-core-rezonality-ctest.log`: all seven golden comparisons pass, but the real application emits depth load/store READ_AFTER_WRITE, stencil-transition WRITE_AFTER_WRITE, and cross-submit attachment hazards (for example PBR lines 1549 onward). This is not clean synchronization validation. Core + product selection was 64/70; paired fresh-profile same-cache Debug smoke passed. The separate stale NVIDIA `W:\p4\...VK_LAYER_NV_GPU_Trace...json` loader error must not be confused with or used to dismiss these genuine synchronization reports.
+
+Source attribution, not instrumented handle identification: host `libs/draxul-renderer/src/vulkan/vk_context.cpp:330` has no source access mask, omits late fragment tests, and omits destination color/depth reads in its incoming dependency. Its depth attachment uses `STORE_OP_DONT_CARE` even for subsequent LOAD continuation passes; attachment lifetime semantics also need review. The renderer supplies that host load pass to plugins. NanoVG `libs/draxul-nanovg/backend/src/nanovg_vk.cpp:535` clears stencil from UNDEFINED while both external dependencies cover color stages/access only, matching the stencil hazard's reported access scopes. Rezonality's own offscreen dependencies already include early/late depth tests and attachment read/write access.
+
+The new native PBR fixture uses a color-only host target (no real host depth continuation or NanoVG), exercises eight alternating resizes, and reported 421/422 assertions passing; its validation assertion failed only on the stale loader manifest, not SYNC hazards. This supports the host/NanoVG attribution, but is not a passing suite or proof that every packaged-plugin path is safe. It only loads `pbr_robot`; `robot2` has the same scenegraph but different fragment shaders, and deferred shading is not resized. Keep both acceptance and validation unchecked until actual packaged synchronization hazards are resolved and the required project/resize/occlusion evidence is retained. A separate ray-tracer scratch-buffer hazard is tracked in [15 ray-build-scratch-synchronization -bug.md](15%20ray-build-scratch-synchronization%20-bug.md).

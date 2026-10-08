@@ -617,7 +617,7 @@ TEST_CASE("Rezonality compiler adapter plans platform argument spellings",
     "[rezonality][project][compiler]")
 {
     const fs::path root = fs::temp_directory_path() / "rezonality-plan";
-    const fs::path project = root / fs::path(u8"日本語 プロジェクト");
+    const fs::path project = root / fs::path(u8"\u65E5\u672C\u8A9E \u30D7\u30ED\u30B8\u30A7\u30AF\u30C8");
     const fs::path ascii_project = root / "ascii project";
     const fs::path output = root / "out" / "fragment-1-0.spv";
     const auto accept_all = [](const fs::path&) { return true; };
@@ -856,7 +856,7 @@ TEST_CASE("Rezonality bundled compiler builds international projects",
         SKIP("No bundled glslangValidator for this platform");
 
     const fs::path root = unique_temp_path("draxul-rezonality-compiler");
-    const fs::path project = root / fs::path(u8"日本語 プロジェクト-\U0001F3B5");
+    const fs::path project = root / fs::path(u8"\u65E5\u672C\u8A9E \u30D7\u30ED\u30B8\u30A7\u30AF\u30C8-\U0001F3B5");
     REQUIRE(fs::create_directories(project / "shaders"));
     REQUIRE(fs::create_directories(root / "out"));
     write(project / "shaders" / "common.glsl",
