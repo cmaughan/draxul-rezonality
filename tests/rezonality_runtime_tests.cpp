@@ -342,6 +342,7 @@ TEST_CASE("Rezonality native generations keep source assets across resizes",
     CHECK_FALSE(rezonality::surface_is_viewport_independent(build, 5));
     CHECK(rezonality::surface_upload_bytes(build.surfaces[1]) == 16);
     CHECK(rezonality::surface_upload_bytes(build.surfaces[2]) == 0);
+}
 
 TEST_CASE("Rezonality runtime transfers build payloads without copying",
     "[rezonality][runtime][backend]")
