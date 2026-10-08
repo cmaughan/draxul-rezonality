@@ -7,6 +7,12 @@ local state = {
   diagnostics_dir = nil,
   installed_after_ms = 0,
   documents = {},
+  -- Per diagnostics file: last observed stat revision and decoded document.
+  -- Unchanged files are neither reread nor rebuilt on idle refresh ticks.
+  document_cache = {},
+  registry_signature = nil,
+  -- Per buffer: signature of the diagnostics last published to it.
+  applied = {},
   entries = {},
   by_path = {},
   registry_panes = {},
@@ -122,23 +128,73 @@ local function now_ms()
   return math.floor((vim.uv or vim.loop).hrtime() / 1000000)
 end
 
-local function load_documents()
-  local documents = {}
+-- Rezonality publishes each record by atomic rename, so a new inode, size, or
+-- modification/change time identifies a new revision without reading it.
+local function file_revision(path)
+  local stat = (vim.uv or vim.loop).fs_stat(path)
+  if not stat or stat.type ~= "file" then
+    return nil
+  end
+  return table.concat({
+    tostring(stat.ino or 0),
+    tostring(stat.size or 0),
+    tostring(stat.mtime and stat.mtime.sec or 0),
+    tostring(stat.mtime and stat.mtime.nsec or 0),
+    tostring(stat.ctime and stat.ctime.sec or 0),
+    tostring(stat.ctime and stat.ctime.nsec or 0),
+  }, ":")
+end
+
+local function read_document(path)
+  local value = decode(path)
+  local timestamp = value and tonumber(value.timestamp_unix_ms)
+  if not value or (state.installed_after_ms ~= 0
+      and not (timestamp and timestamp >= state.installed_after_ms)) then
+    return nil
+  end
+  local id = source_id(path)
+  return {
+    id = id,
+    project_path = normalize(value.project_path),
+    value = value,
+  }
+end
+
+-- Returns true when any diagnostics record appeared, changed, or disappeared.
+-- reread ignores recorded revisions for an explicit user refresh.
+local function load_documents(reread)
+  local previous = reread and {} or state.document_cache
+  local cache = {}
+  local changed = reread == true
   for _, path in ipairs(vim.fn.glob(join(state.diagnostics_dir, "*.json"),
       false, true)) do
-    local value = decode(path)
-    local timestamp = value and tonumber(value.timestamp_unix_ms)
-    if value and (state.installed_after_ms == 0
-        or (timestamp and timestamp >= state.installed_after_ms)) then
-      local id = source_id(path)
-      documents[id] = {
-        id = id,
-        project_path = normalize(value.project_path),
-        value = value,
-      }
+    local revision = file_revision(path)
+    local cached = previous[path]
+    if revision and cached and cached.revision == revision then
+      cache[path] = cached
+    elseif revision then
+      cache[path] = { revision = revision, document = read_document(path) }
+      changed = true
+    end
+  end
+  for path in pairs(previous) do
+    if not cache[path] then
+      changed = true
+      break
+    end
+  end
+  state.document_cache = cache
+  if not changed then
+    return false
+  end
+  local documents = {}
+  for _, entry in pairs(cache) do
+    if entry.document then
+      documents[entry.document.id] = entry.document
     end
   end
   state.documents = documents
+  return true
 end
 
 local function parse_plugin_config(pane)
@@ -453,7 +509,23 @@ local function rebuild_entries()
   state.by_path = by_path
 end
 
-local function apply_buffer(buffer)
+-- A stable description of what apply_buffer() would publish. Comparing it
+-- with the last applied value avoids resetting unchanged diagnostics.
+local function buffer_signature(path, entries)
+  local parts = { path }
+  for _, entry in ipairs(entries or {}) do
+    local sources = vim.tbl_keys(entry.sources or {})
+    table.sort(sources)
+    table.insert(parts, table.concat(sources, "\2"))
+    table.insert(parts, table.concat({ tostring(entry.line),
+      tostring(entry.column), tostring(entry.severity), entry.stage or "",
+      tostring(entry.attempted_generation), entry.source_text,
+      entry.message }, "\1"))
+  end
+  return table.concat(parts, "\0")
+end
+
+local function apply_buffer(buffer, force)
   if not vim.api.nvim_buf_is_valid(buffer) then
     return
   end
@@ -479,8 +551,13 @@ local function apply_buffer(buffer)
     end
     vim.b[buffer].rezonality_apply_key = wanted_key
   end
+  local entries = state.by_path[current_path]
+  local signature = buffer_signature(current_path, entries)
+  if not force and state.applied[buffer] == signature then
+    return
+  end
+  state.applied[buffer] = signature
   vim.diagnostic.reset(namespace, buffer)
-  local entries = state.by_path[normalize(vim.api.nvim_buf_get_name(buffer))]
   if not entries then
     return
   end
@@ -508,19 +585,19 @@ local function apply_buffer(buffer)
   })
 end
 
-local function apply_all_buffers()
+local function apply_all_buffers(force)
   for _, buffer in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buffer) then
-      apply_buffer(buffer)
+      apply_buffer(buffer, force)
     end
   end
 end
 
-local function rebuild()
+local function rebuild(force)
   rebuild_instances()
   rebuild_files()
   rebuild_entries()
-  apply_all_buffers()
+  apply_all_buffers(force)
 end
 
 local function default_server_runtime_dir()
@@ -603,19 +680,38 @@ local function route_args(...)
   return args
 end
 
-local function finish_registry(panes, err)
+-- signature identifies the registry content (the raw CLI output where one
+-- exists). An unchanged topology keeps the instance/file/diagnostic model.
+local function finish_registry(panes, err, signature)
   state.registry_pending = false
   state.last_registry_refresh_ms = now_ms()
-  if type(panes) == "table" then
+  local available = type(panes) == "table"
+  if available and signature == nil then
+    local ok, encoded = pcall(vim.json.encode, panes)
+    signature = ok and encoded or nil
+  end
+  local unchanged
+  if available then
+    unchanged = signature ~= nil and state.registry_available
+      and state.registry_signature == signature
+  else
+    err = err or "Draxul pane registry is unavailable"
+    unchanged = not state.registry_available and state.registry_error == err
+  end
+  if available then
     state.registry_panes = panes
     state.registry_available = true
     state.registry_error = nil
+    state.registry_signature = signature
   else
     state.registry_panes = {}
     state.registry_available = false
-    state.registry_error = err or "Draxul pane registry is unavailable"
+    state.registry_error = err
+    state.registry_signature = nil
   end
-  rebuild()
+  if not unchanged then
+    rebuild()
+  end
   local waiters = state.registry_waiters
   state.registry_waiters = {}
   for _, waiter in ipairs(waiters) do
@@ -661,7 +757,7 @@ function M.refresh_registry(force, callback)
       end
       local ok, panes = pcall(vim.json.decode, result.stdout)
       finish_registry(ok and panes or nil,
-        ok and nil or "pane registry returned invalid JSON")
+        ok and nil or "pane registry returned invalid JSON", result.stdout)
     end))
     return
   end
@@ -672,15 +768,18 @@ function M.refresh_registry(force, callback)
   end
   local ok, panes = pcall(vim.json.decode, output)
   finish_registry(ok and panes or nil,
-    ok and nil or "pane registry returned invalid JSON")
+    ok and nil or "pane registry returned invalid JSON", output)
 end
 
-function M.refresh()
+-- Background ticks call this too, so an idle editor only stats the
+-- diagnostics records; rereading and republishing happen on change.
+function M.refresh(reread)
   if not state.enabled then
     return
   end
-  load_documents()
-  rebuild()
+  if load_documents(reread) then
+    rebuild()
+  end
   M.refresh_registry(false)
 end
 
@@ -1057,6 +1156,7 @@ end
 function M.disable()
   state.enabled = false
   stop_timer(false)
+  state.applied = {}
   for _, buffer in ipairs(vim.api.nvim_list_bufs()) do
     vim.diagnostic.reset(namespace, buffer)
   end
@@ -1064,12 +1164,17 @@ end
 
 function M.enable()
   state.enabled = true
-  M.refresh()
+  -- Republish everything once: setup() may have changed display options.
+  load_documents()
+  rebuild(true)
+  M.refresh_registry(false)
   if state.config.auto_refresh and state.config.refresh_ms > 0 then
     local uv = vim.uv or vim.loop
     state.timer = state.timer or uv.new_timer()
     state.timer:start(state.config.refresh_ms, state.config.refresh_ms,
-      vim.schedule_wrap(M.refresh))
+      vim.schedule_wrap(function()
+        M.refresh()
+      end))
   end
 end
 
@@ -1084,7 +1189,7 @@ local function create_commands()
   end
   command("RezRefresh", "RezonalityRefresh", function()
     M.refresh_registry(true)
-    M.refresh()
+    M.refresh(true)
   end, {})
   command("RezProblems", "RezonalityProblems", function(options)
     M.problems(not options.bang)
@@ -1104,14 +1209,24 @@ function M.setup(options)
   state.diagnostics_dir = state.config.diagnostics_dir or default_diagnostics_dir()
   state.installed_after_ms = install_epoch()
   state.last_registry_refresh_ms = 0
+  -- Cached records were filtered with the previous directory and epoch.
+  state.document_cache = {}
+  state.registry_signature = nil
   create_commands()
   local group = vim.api.nvim_create_augroup("RezonalityDiagnostics", { clear = true })
-  vim.api.nvim_create_autocmd({ "BufReadPost", "BufEnter" }, {
+  vim.api.nvim_create_autocmd({ "BufReadPost", "BufEnter", "BufFilePost" }, {
     group = group,
     callback = function(args)
       if state.enabled then
-        apply_buffer(args.buf)
+        -- Rereading a file republishes its diagnostics against the new text.
+        apply_buffer(args.buf, args.event == "BufReadPost")
       end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    group = group,
+    callback = function(args)
+      state.applied[args.buf] = nil
     end,
   })
   vim.api.nvim_create_autocmd("VimLeavePre", {

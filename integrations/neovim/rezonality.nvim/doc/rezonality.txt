@@ -167,6 +167,13 @@ Defaults:
 Set apply_key to an empty string to disable the buffer-local mapping. The
 |:RezApply| command remains available. flash_ms is clamped to at least 100 ms.
 
+Every refresh_ms the package only checks the size, identity, and timestamps
+of each diagnostic record; it rereads a record and republishes buffer
+diagnostics only when that record or the resulting diagnostics changed. The
+live pane registry is queried at most every registry_refresh_ms and rebuilds
+the pane, file, and diagnostic views only when its output changed, so idle
+editors do not reset unchanged diagnostics.
+
 Set g:rezonality_auto_setup = 0 before packages load when calling setup()
 yourself. REZONALITY_DIAGNOSTICS_DIR overrides cache discovery for testing.
 Set server_runtime_dir for an isolated server runtime, or draxul_command as an

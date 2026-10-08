@@ -200,7 +200,9 @@ shown once with every contributing pane and open directly when selected. On an
 error line, `:RezFocus` focuses a contributing pane and `:RezReload` recompiles
 it; ambiguous errors open a pane chooser. `:RezRefresh` rescans immediately,
 while `:RezStatus` reports diagnostic, active-source, and registry counts.
-`:RezDisable` and `:RezEnable` control the background 500-ms refresh. The former
+`:RezDisable` and `:RezEnable` control the background 500-ms refresh, which
+only rereads diagnostic records and republishes buffer diagnostics when they
+change. The former
 `:Rezonality*` command names remain compatibility aliases. Closed Rezonality
 instances remove their diagnostic record, and a successful rebuild clears
 their prior compile errors.

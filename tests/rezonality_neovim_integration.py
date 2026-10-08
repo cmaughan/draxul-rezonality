@@ -216,6 +216,15 @@ def main() -> int:
             "compatibility_commands": 10,
             "status_visible": True,
             "server_discovery": True,
+            "idle_reads": 0,
+            "idle_diagnostic_sets": 0,
+            "idle_diagnostic_resets": 0,
+            "idle_registry_polled": True,
+            "replacement_arrived": True,
+            "closed_pane_removed": True,
+            "timer_stopped": True,
+            "disabled_cleared": True,
+            "disabled_idle_work": 0,
         }
         if observed != expected:
             raise RuntimeError(f"unexpected Neovim result: {observed!r}")

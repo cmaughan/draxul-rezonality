@@ -3,47 +3,56 @@ vim.opt.runtimepath:prepend(vim.env.REZONALITY_TEST_PACKAGE)
 
 local rezonality = require("rezonality")
 local control_actions = {}
+local closed_panes = {}
+local function live_panes()
+  local project = vim.fn.fnamemodify(vim.env.REZONALITY_TEST_FIRST, ":h")
+  local panes = {}
+  for _, pane in ipairs({
+    {
+      id = "pane-left",
+      space_id = "space-flight",
+      tab_id = "tab-deck",
+      space_name = "Flight",
+      tab_name = "Deck",
+      name = "Left camera",
+      client_plugin_id = "dev.draxul.rezonality",
+      client_plugin_config_json = vim.json.encode({
+        project_path = project,
+        diagnostics_id = "flight-left",
+      }),
+    },
+    {
+      id = "pane-right",
+      space_id = "space-flight",
+      tab_id = "tab-deck",
+      space_name = "Flight",
+      tab_name = "Deck",
+      name = "Right camera",
+      client_plugin_id = "dev.draxul.rezonality",
+      client_plugin_config_json = vim.json.encode({
+        project_path = project,
+        diagnostics_id = "flight-right",
+      }),
+    },
+    {
+      id = "pane-shell",
+      client_plugin_id = "",
+    },
+  }) do
+    if not closed_panes[pane.id] then
+      table.insert(panes, pane)
+    end
+  end
+  return panes
+end
+local function record_control(verb, instance)
+  table.insert(control_actions, verb .. ":" .. instance.pane_id)
+  return true
+end
 rezonality.setup({
   auto_refresh = false,
-  registry_provider = function()
-    local project = vim.fn.fnamemodify(vim.env.REZONALITY_TEST_FIRST, ":h")
-    return {
-      {
-        id = "pane-left",
-        space_id = "space-flight",
-        tab_id = "tab-deck",
-        space_name = "Flight",
-        tab_name = "Deck",
-        name = "Left camera",
-        client_plugin_id = "dev.draxul.rezonality",
-        client_plugin_config_json = vim.json.encode({
-          project_path = project,
-          diagnostics_id = "flight-left",
-        }),
-      },
-      {
-        id = "pane-right",
-        space_id = "space-flight",
-        tab_id = "tab-deck",
-        space_name = "Flight",
-        tab_name = "Deck",
-        name = "Right camera",
-        client_plugin_id = "dev.draxul.rezonality",
-        client_plugin_config_json = vim.json.encode({
-          project_path = project,
-          diagnostics_id = "flight-right",
-        }),
-      },
-      {
-        id = "pane-shell",
-        client_plugin_id = "",
-      },
-    }
-  end,
-  control_runner = function(verb, instance)
-    table.insert(control_actions, verb .. ":" .. instance.pane_id)
-    return true
-  end,
+  registry_provider = live_panes,
+  control_runner = record_control,
 })
 
 vim.cmd.edit(vim.fn.fnameescape(vim.env.REZONALITY_TEST_FIRST))
@@ -123,9 +132,108 @@ for _, name in ipairs({ "RezonalityRefresh", "RezonalityProblems",
   end
 end
 
+local all_entries = #rezonality._state().entries
+
+-- Idle refresh: an unchanged editor must not reread records or republish
+-- diagnostics, while record replacement and pane closure still arrive.
+local uv = vim.uv or vim.loop
+local idle = { reads = 0, sets = 0, resets = 0, registry = 0 }
+local real_open = io.open
+io.open = function(path, ...)
+  if type(path) == "string" and path:match("%.json$") then
+    idle.reads = idle.reads + 1
+  end
+  return real_open(path, ...)
+end
+local real_set, real_reset = vim.diagnostic.set, vim.diagnostic.reset
+vim.diagnostic.set = function(...)
+  idle.sets = idle.sets + 1
+  return real_set(...)
+end
+vim.diagnostic.reset = function(...)
+  idle.resets = idle.resets + 1
+  return real_reset(...)
+end
+local function reset_idle_counts()
+  for key in pairs(idle) do
+    idle[key] = 0
+  end
+end
+local function wait_until(predicate)
+  return vim.wait(10000, predicate, 10)
+end
+local function message_present(buffer, text)
+  for _, item in ipairs(vim.diagnostic.get(buffer)) do
+    if item.message == text then
+      return true
+    end
+  end
+  return false
+end
+
+rezonality.setup({
+  refresh_ms = 20,
+  registry_refresh_ms = 60,
+  registry_provider = function()
+    idle.registry = idle.registry + 1
+    return live_panes()
+  end,
+  control_runner = record_control,
+})
+vim.cmd.edit(vim.fn.fnameescape(vim.env.REZONALITY_TEST_FIRST))
+local first_buffer = vim.api.nvim_get_current_buf()
+wait_until(function()
+  return idle.registry >= 2
+end)
+reset_idle_counts()
+vim.wait(600, function()
+  return false
+end, 10)
+local idle_reads, idle_sets, idle_resets = idle.reads, idle.sets, idle.resets
+local idle_registry_polled = idle.registry > 0
+
+local diagnostics_dir = rezonality._state().diagnostics_dir
+local left_record = diagnostics_dir .. "/flight-left.json"
+local template_file = assert(real_open(left_record, "rb"))
+local replacement = vim.json.decode(template_file:read("*a"))
+template_file:close()
+replacement.diagnostics = { {
+  path = vim.env.REZONALITY_TEST_FIRST,
+  stage = "compile",
+  severity = "error",
+  line = 1,
+  column = 1,
+  message = "replaced left error",
+} }
+local staged = assert(real_open(left_record .. ".tmp", "wb"))
+staged:write(vim.json.encode(replacement))
+staged:close()
+assert(uv.fs_rename(left_record .. ".tmp", left_record))
+local replacement_arrived = wait_until(function()
+  return message_present(first_buffer, "replaced left error")
+    and message_present(first_buffer, "shared shader error")
+end)
+
+closed_panes["pane-left"] = true
+local closed_pane_removed = wait_until(function()
+  return #rezonality._state().instances == 1
+    and not message_present(first_buffer, "replaced left error")
+end)
+
+vim.cmd("RezDisable")
+local timer_stopped = not rezonality._state().timer:is_active()
+local disabled_cleared = #vim.diagnostic.get(first_buffer) == 0
+reset_idle_counts()
+vim.wait(200, function()
+  return false
+end, 10)
+local disabled_idle_work = idle.reads + idle.registry + idle.sets
+io.open = real_open
+vim.diagnostic.set, vim.diagnostic.reset = real_set, real_reset
+
 local output = assert(io.open(vim.env.REZONALITY_TEST_RESULT, "wb"))
 output:write(vim.json.encode({
-  all_entries = #rezonality._state().entries,
+  all_entries = all_entries,
   first_inline = #first,
   second_inline = #second,
   quickfix = #quickfix,
@@ -146,6 +254,15 @@ output:write(vim.json.encode({
   status_visible = status_messages:find("Rezonality: 3 diagnostics in 2 files; 3 active sources; 2 live panes", 1, true) ~= nil,
   server_discovery = rezonality._draxul_executable()
     == vim.env.REZONALITY_TEST_DRAXUL,
+  idle_reads = idle_reads,
+  idle_diagnostic_sets = idle_sets,
+  idle_diagnostic_resets = idle_resets,
+  idle_registry_polled = idle_registry_polled,
+  replacement_arrived = replacement_arrived,
+  closed_pane_removed = closed_pane_removed,
+  timer_stopped = timer_stopped,
+  disabled_cleared = disabled_cleared,
+  disabled_idle_work = disabled_idle_work,
 }))
 output:close()
 vim.cmd("qa!")
