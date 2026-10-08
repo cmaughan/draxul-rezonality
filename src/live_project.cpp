@@ -42,31 +42,12 @@ constexpr size_t kMaximumBuildDiagnostics = 128;
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
 
-constexpr uint64_t kFnvOffset = 1469598103934665603ull;
-constexpr uint64_t kFnvPrime = 1099511628211ull;
-
 struct ProcessResult
 {
     int exit_code = -1;
     std::string output;
     std::string error;
 };
-
-uint64_t hash_bytes(uint64_t hash, const void* data, size_t size)
-{
-    const auto* bytes = static_cast<const unsigned char*>(data);
-    for (size_t i = 0; i < size; ++i)
-    {
-        hash ^= bytes[i];
-        hash *= kFnvPrime;
-    }
-    return hash;
-}
-
-uint64_t hash_string(uint64_t hash, std::string_view value)
-{
-    return hash_bytes(hash, value.data(), value.size());
-}
 
 std::optional<std::string> read_text(const fs::path& path)
 {
@@ -1238,45 +1219,7 @@ std::optional<BuildResult> LiveProject::take_result()
 
 uint64_t ProjectPipeline::fingerprint() const
 {
-    uint64_t hash = kFnvOffset;
-    std::error_code ec;
-    fs::recursive_directory_iterator iterator(options_.project_path,
-        fs::directory_options::skip_permission_denied, ec);
-    if (ec)
-        throw std::runtime_error("could not scan Rezonality project: "
-            + ec.message());
-    std::vector<fs::path> files;
-    for (; iterator != fs::recursive_directory_iterator(); iterator.increment(ec))
-    {
-        if (ec)
-            throw std::runtime_error("could not scan Rezonality project: "
-                + ec.message());
-        const auto& entry = *iterator;
-        // Shader includes have no required suffix. Ignore only repository
-        // metadata, not unrecognized files that a shader may include.
-        if (entry.is_directory() && entry.path().filename() == ".git")
-        {
-            iterator.disable_recursion_pending();
-            continue;
-        }
-        std::error_code entry_error;
-        if (entry.is_regular_file(entry_error))
-            files.push_back(entry.path());
-        else if (entry_error)
-            throw std::runtime_error("could not inspect Rezonality project file: "
-                + entry_error.message());
-    }
-    if (ec)
-        throw std::runtime_error("could not scan Rezonality project: "
-            + ec.message());
-    std::sort(files.begin(), files.end());
-    for (const auto& file : files)
-    {
-        hash = hash_string(hash, generic_path_utf8(file));
-        if (const auto contents = read_text(file))
-            hash = hash_string(hash, *contents);
-    }
-    return hash;
+    return file_index_.fingerprint(options_.project_path);
 }
 
 BuildResult build_candidate(const fs::path& plugin_directory,

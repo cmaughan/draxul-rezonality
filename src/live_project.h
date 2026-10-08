@@ -4,6 +4,7 @@
 #include "camera.h"
 #include "diagnostics.h"
 #include "model_loader.h"
+#include "project_file_index.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -165,16 +166,26 @@ public:
         ProjectOptions options, CompileShader compile_shader = {});
 
     [[nodiscard]] BuildResult build(uint64_t generation) const;
+    // Logically const: refreshes only the pipeline's private file index.
+    // Must be called from the single thread that owns the pipeline.
     [[nodiscard]] uint64_t fingerprint() const;
     [[nodiscard]] const ProjectOptions& options() const
     {
         return options_;
     }
 
+    // Test/diagnostic observation of idle watch cost. Safe to read from any
+    // thread.
+    [[nodiscard]] ProjectWatchCounters watch_counters() const
+    {
+        return file_index_.counters();
+    }
+
 private:
     std::filesystem::path plugin_directory_;
     ProjectOptions options_;
     CompileShader compile_shader_;
+    mutable ProjectFileIndex file_index_;
 };
 
 class LiveProject
@@ -198,6 +209,10 @@ public:
     const ProjectOptions& options() const
     {
         return pipeline_.options();
+    }
+    [[nodiscard]] ProjectWatchCounters watch_counters() const
+    {
+        return pipeline_.watch_counters();
     }
 
 private:

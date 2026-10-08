@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -718,4 +719,165 @@ pass: Main {
 
     std::error_code ec;
     fs::remove_all(output, ec);
+}
+
+namespace
+{
+
+// Gives a file a modification time well outside the racy-stamp window so
+// its stamp alone identifies its bytes. Distinct ages model distinct saves.
+void age_file(const fs::path& path, std::chrono::minutes age)
+{
+    fs::last_write_time(path, fs::file_time_type::clock::now() - age);
+}
+
+struct TreeSize
+{
+    uint64_t files = 0;
+    uint64_t bytes = 0;
+};
+
+TreeSize age_tree(const fs::path& root, std::chrono::minutes age)
+{
+    TreeSize size;
+    for (const auto& entry : fs::recursive_directory_iterator(root))
+    {
+        if (!entry.is_regular_file())
+            continue;
+        age_file(entry.path(), age);
+        ++size.files;
+        size.bytes += entry.file_size();
+    }
+    return size;
+}
+
+} // namespace
+
+TEST_CASE("Rezonality project watch rereads only changed files",
+    "[rezonality][project][watch]")
+{
+    ProjectFixture fixture("default");
+    const TreeSize tree = age_tree(fixture.path, std::chrono::minutes(60));
+    REQUIRE(tree.bytes > 100000);
+    rezonality::ProjectPipeline pipeline(
+        plugin_root(), options(fixture.path), accept_shader);
+
+    // The first scan establishes the index: the only full-content read.
+    const uint64_t initial = pipeline.fingerprint();
+    const auto indexed = pipeline.watch_counters();
+    CHECK(indexed.scans == 1);
+    CHECK(indexed.files_hashed == tree.files);
+    CHECK(indexed.bytes_hashed == tree.bytes);
+
+    // Idle polls stat files without reading them.
+    for (int poll = 0; poll < 5; ++poll)
+        CHECK(pipeline.fingerprint() == initial);
+    const auto idle = pipeline.watch_counters();
+    CHECK(idle.scans == 6);
+    CHECK(idle.files_seen == tree.files * 6);
+    CHECK(idle.files_hashed == indexed.files_hashed);
+    CHECK(idle.bytes_hashed == indexed.bytes_hashed);
+
+    // Touching a file rereads only that file and is not a content change.
+    const fs::path shader = fixture.path / "screen.frag";
+    const uint64_t shader_bytes = fs::file_size(shader);
+    age_file(shader, std::chrono::minutes(50));
+    CHECK(pipeline.fingerprint() == initial);
+    const auto touched = pipeline.watch_counters();
+    CHECK(touched.files_hashed == idle.files_hashed + 1);
+    CHECK(touched.bytes_hashed == idle.bytes_hashed + shader_bytes);
+
+    // A same-size edit with a new stamp is detected by rereading one file.
+    std::string original = read(shader);
+    std::string same_size = original;
+    REQUIRE_FALSE(same_size.empty());
+    same_size[0] = same_size[0] == '/' ? '#' : '/';
+    write(shader, same_size);
+    age_file(shader, std::chrono::minutes(40));
+    const uint64_t edited = pipeline.fingerprint();
+    CHECK(edited != initial);
+    const auto after_edit = pipeline.watch_counters();
+    CHECK(after_edit.files_hashed == touched.files_hashed + 1);
+    CHECK(after_edit.bytes_hashed == touched.bytes_hashed + shader_bytes);
+
+    // A rewrite inside the filesystem's timestamp granularity can keep the
+    // same size and stamp. A freshly written file stays racy, so it is reread
+    // until its stamp is old enough to identify its contents.
+    const fs::path include = fixture.path / "shared.glsl-include";
+    write(include, "// first save\n");
+    const auto racy_stamp = fs::last_write_time(include);
+    const uint64_t first_save = pipeline.fingerprint();
+    CHECK(first_save != edited);
+    write(include, "// other save\n");
+    fs::last_write_time(include, racy_stamp);
+    const uint64_t second_save = pipeline.fingerprint();
+    CHECK(second_save != first_save);
+    age_file(include, std::chrono::minutes(30));
+    CHECK(pipeline.fingerprint() == second_save);
+    const auto settled = pipeline.watch_counters();
+    CHECK(pipeline.fingerprint() == second_save);
+    CHECK(pipeline.watch_counters().bytes_hashed == settled.bytes_hashed);
+
+    // Deleting files drops them from the bounded index; restoring the
+    // original bytes restores the original fingerprint.
+    fs::remove(include);
+    write(shader, original);
+    age_file(shader, std::chrono::minutes(20));
+    const auto before_delete = pipeline.watch_counters();
+    CHECK(pipeline.fingerprint() == initial);
+    const auto after_delete = pipeline.watch_counters();
+    CHECK(after_delete.files_seen == before_delete.files_seen + tree.files);
+    CHECK(after_delete.bytes_hashed
+        == before_delete.bytes_hashed + shader_bytes);
+
+    // A failed scan reports an error and the next successful scan recovers.
+    const fs::path unavailable = fixture.path.string() + ".unavailable";
+    std::error_code error;
+    fs::remove_all(unavailable, error);
+    RestoreRenamedDirectory restore{ fixture.path, unavailable };
+    fs::rename(fixture.path, unavailable, error);
+    REQUIRE_FALSE(error);
+    CHECK_THROWS(pipeline.fingerprint());
+    fs::rename(unavailable, fixture.path, error);
+    REQUIRE_FALSE(error);
+    CHECK(pipeline.fingerprint() == initial);
+}
+
+TEST_CASE("Rezonality live watch is idle without content reads",
+    "[rezonality][project][watch]")
+{
+    ProjectFixture fixture("default");
+    const TreeSize tree = age_tree(fixture.path, std::chrono::minutes(60));
+    auto configured = options(fixture.path);
+    configured.compile_debounce_ms = 0;
+    rezonality::LiveProject live(plugin_root(), configured, [] {},
+        accept_shader);
+    live.start();
+    const auto initial = wait_for_result(live);
+    REQUIRE(initial);
+    REQUIRE(initial->build);
+
+    // Wait for several 100 ms polls; none may reread unchanged contents.
+    const auto baseline = live.watch_counters();
+    CHECK(baseline.bytes_hashed == tree.bytes);
+    const auto deadline
+        = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (live.watch_counters().scans < baseline.scans + 4
+        && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto idle = live.watch_counters();
+    CHECK(idle.scans >= baseline.scans + 4);
+    CHECK(idle.files_hashed == baseline.files_hashed);
+    CHECK(idle.bytes_hashed == baseline.bytes_hashed);
+
+    // An edit is still detected after idle polls.
+    const fs::path shader = fixture.path / "vklive-original" / "geom.frag";
+    write(shader, read(shader) + "\n// edited\n");
+    const auto edited = wait_for_result(live);
+    REQUIRE(edited);
+    REQUIRE(edited->build);
+    CHECK(edited->generation > initial->generation);
+    live.stop();
 }
