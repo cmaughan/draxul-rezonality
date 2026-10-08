@@ -105,6 +105,21 @@ activation outcome; Metal and Vulkan only decide compatibility and prepare,
 record, and retire native generations. Keep native handles out of all three
 product-internal interfaces.
 
+Product target map (`CMakeLists.txt`, `cmake/Tests.cmake`):
+
+| Target | Owns | Tests |
+|--------|------|-------|
+| `draxul-rezonality-project` | CPU parsing, assets, diagnostics, compiler, watcher | `draxul-test-rezonality-project` |
+| `draxul-rezonality-runtime` | candidate/activation policy | `draxul-test-rezonality-runtime` (also backend-neutral GPU publication policy) |
+| `draxul-rezonality-audio` | capture, permission, DSP | `draxul-test-rezonality-audio` |
+| `draxul-rezonality-native` (OBJECT) | C ABI adapter plus the selected Metal or Vulkan backend, compiled once | `draxul-test-rezonality-native` links these objects in-process |
+| `draxul-rezonality-plugin` (MODULE) | the staged module, built from `draxul-rezonality-native` | `draxul-test-rezonality` loads it dynamically (serial) |
+
+Put pure cases in the library suite that owns the code. Only cases that need
+the ABI in-process or a native device belong in the native suite, and only
+cases that must load the built module belong in the dynamic suite. The module
+resolves SDL from its host on macOS; test executables own `SDL3::SDL3`.
+
 ## Live-edit and failure-recovery checks
 
 Exercise live editing against a copied fixture, never by destructively editing

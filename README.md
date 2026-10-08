@@ -239,7 +239,9 @@ allow their focused tests to run without the native renderer or application.
 `rezonality_plugin.cpp` is the C ABI and controller adapter. CMake selects
 `native_backend_metal.mm` or `native_backend_vulkan.cpp`; the selected private
 backend owns generation preparation, command recording, and completed-frame
-retirement while the controller owns activation and failure policy.
+retirement while the controller owns activation and failure policy. Both
+compile once into the `draxul-rezonality-native` object library, which the
+module and the in-process native test suite link.
 
 There is deliberately no embedded source editor, project menu, node-graph
 panel, standalone SDL window, or ImGui application shell in this port.

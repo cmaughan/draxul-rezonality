@@ -136,22 +136,34 @@ target_include_directories(draxul-rezonality-audio
 target_link_libraries(draxul-rezonality-audio PRIVATE
     ${DRAXUL_REZONALITY_SDL_TARGET})
 
-add_library(draxul-rezonality-plugin MODULE
+# The C ABI adapter and the selected native backend compile once per
+# configuration. Both the MODULE and the in-process native contract test link
+# these objects (direct object-library links add the objects to the consumer),
+# so the test never recompiles plugin or backend sources. An object library,
+# rather than a static archive, keeps the otherwise unreferenced exported
+# draxul_plugin_query_v2 entry point in the module.
+add_library(draxul-rezonality-native OBJECT
     src/animation_clock.h
     src/native_backend.h
     src/native_backend_helpers.h
     src/surface_dimensions.h
     ${_rezonality_native_backend_source}
     src/rezonality_plugin.cpp)
-target_link_libraries(draxul-rezonality-plugin PRIVATE
+set_target_properties(draxul-rezonality-native PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(draxul-rezonality-native PUBLIC
     Draxul::PluginSDK
     Draxul::PluginSupport::Adapter
     draxul-rezonality-project
     draxul-rezonality-runtime
     draxul-rezonality-audio)
-target_compile_definitions(draxul-rezonality-plugin PRIVATE
+target_compile_definitions(draxul-rezonality-native PRIVATE
     GLM_FORCE_DEPTH_ZERO_TO_ONE)
-target_include_directories(draxul-rezonality-plugin PRIVATE ${stb_SOURCE_DIR})
+target_include_directories(draxul-rezonality-native PRIVATE ${stb_SOURCE_DIR})
+
+add_library(draxul-rezonality-plugin MODULE)
+target_link_libraries(draxul-rezonality-plugin PRIVATE
+    draxul-rezonality-native)
 if(APPLE)
     set_source_files_properties(src/mic_permission.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -159,16 +171,17 @@ if(APPLE)
     target_link_libraries(draxul-rezonality-audio PRIVATE
         "-framework Foundation"
         ${REZONALITY_AVFOUNDATION_FRAMEWORK})
-    target_link_libraries(draxul-rezonality-plugin PRIVATE
+    target_link_libraries(draxul-rezonality-native PUBLIC
         spirv-cross-msl
         "-framework Metal"
         "-framework Foundation")
     # The host already embeds SDL3. Resolve the module's SDL audio calls from
-    # that copy instead of linking a second static SDL into the dylib.
+    # that copy instead of linking a second static SDL into the dylib. Test
+    # executables that link the same objects own SDL3::SDL3 instead.
     target_link_options(draxul-rezonality-plugin PRIVATE
         "LINKER:-undefined,dynamic_lookup")
 else()
-    target_link_libraries(draxul-rezonality-plugin PRIVATE
+    target_link_libraries(draxul-rezonality-native PUBLIC
         Vulkan::Vulkan
         Draxul::PluginSupport::VulkanResources
         GPUOpen::VulkanMemoryAllocator)
@@ -204,6 +217,7 @@ draxul_register_bundled_plugin(
         draxul-rezonality-project
         draxul-rezonality-runtime
         draxul-rezonality-audio
+        draxul-rezonality-native
         draxul-rezonality-plugin
     TEST_SOURCES ${_rezonality_test_sources}
     TEST_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Tests.cmake")
