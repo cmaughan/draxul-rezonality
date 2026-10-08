@@ -122,6 +122,11 @@ struct BackendResourceStats
     uint64_t programs_reused = 0;
     // Static image and model bytes copied for newly created resources.
     uint64_t asset_upload_bytes = 0;
+    // Bytes of one-time texture-upload staging still allocated when queried
+    // (Vulkan). Returns to zero once uploads are recorded and their frame
+    // slots complete; streaming audio uploads are not included. Metal has no
+    // plugin-owned staging and reports zero.
+    uint64_t retained_upload_staging_bytes = 0;
     GenerationReuse last_reuse = GenerationReuse::Rebuild;
 };
 

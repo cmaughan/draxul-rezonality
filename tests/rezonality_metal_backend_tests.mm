@@ -238,6 +238,9 @@ TEST_CASE("Rezonality Metal resize keeps models, images, and pipelines",
     CHECK(first.asset_upload_bytes > 0);
     CHECK(backend.active_compatible());
     record_and_wait(backend, queue, initial, 0);
+    // Metal uploads static pixels with replaceRegion and keeps no
+    // plugin-owned staging buffers.
+    CHECK(backend.resource_stats().retained_upload_staging_bytes == 0);
 
     // Size-only change: only viewport-sized surfaces are recreated.
     MetalTestFrame resized(device, 96, 80, MTLPixelFormatBGRA8Unorm);

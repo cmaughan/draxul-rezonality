@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -163,6 +164,14 @@ struct RetiredGeneration
     uint64_t pending_slots = 0;
 };
 
+// A one-time texture-upload staging buffer whose copy was recorded into the
+// frame slots in `pending_slots`; destroyed once all of them have completed.
+struct RetiredUpload
+{
+    draxul::vkresources::BufferResource buffer;
+    uint64_t pending_slots = 0;
+};
+
 struct BackendState
 {
     VkDevice device = VK_NULL_HANDLE;
@@ -172,6 +181,7 @@ struct BackendState
     VmaAllocator allocator = VK_NULL_HANDLE;
     std::optional<VulkanGeneration> active;
     std::vector<RetiredGeneration> retired;
+    std::vector<RetiredUpload> retired_uploads;
 };
 
 struct VulkanVertexResources
@@ -330,6 +340,8 @@ void destroy_backend(BackendState& backend)
         destroy_generation(*backend.active);
     for (auto& retired : backend.retired)
         destroy_generation(retired.generation);
+    for (auto& upload : backend.retired_uploads)
+        draxul::vkresources::destroy_buffer(backend.allocator, upload.buffer);
     if (backend.vertex_buffer)
         vkDestroyBuffer(backend.device, backend.vertex_buffer, nullptr);
     if (backend.vertex_memory)
@@ -2079,8 +2091,24 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
     return generation;
 }
 
-void initialize_generation_images(
-    VkCommandBuffer command, VulkanGeneration& generation)
+// Hands a static texture's staging buffer to frame-slot retirement once its
+// copy has been recorded, so the mapped copy of the pixels is released as
+// soon as that frame slot completes instead of living as long as the image.
+// Slots outside the 64-bit retirement mask keep the buffer with its resource,
+// which then releases it at generation retirement as before.
+void retire_upload_after_slot(draxul::vkresources::BufferResource& buffer,
+    uint32_t frame_index, std::vector<RetiredUpload>& retired_uploads)
+{
+    if (!buffer.buffer || frame_index >= 64)
+        return;
+    retired_uploads.push_back({ std::exchange(buffer,
+                                    draxul::vkresources::BufferResource{}),
+        uint64_t{ 1 } << frame_index });
+}
+
+void initialize_generation_images(VkCommandBuffer command,
+    VulkanGeneration& generation, uint32_t frame_index,
+    std::vector<RetiredUpload>& retired_uploads)
 {
     for (auto& shared_surface : generation.surfaces)
     {
@@ -2122,6 +2150,8 @@ void initialize_generation_images(
                 vkCmdCopyBufferToImage(command, surface.upload_buffer.buffer,
                     surface.attachment.image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                retire_upload_after_slot(
+                    surface.upload_buffer, frame_index, retired_uploads);
             }
             else
             {
@@ -2173,6 +2203,8 @@ void initialize_generation_images(
                 vkCmdCopyBufferToImage(command,
                     texture.upload_buffer.buffer, texture.attachment.image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                retire_upload_after_slot(
+                    texture.upload_buffer, frame_index, retired_uploads);
                 VkImageMemoryBarrier after = before;
                 after.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 after.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -2447,7 +2479,30 @@ BackendPreparation NativeBackend::prepare(const ShaderBuild& build)
 
 BackendResourceStats NativeBackend::resource_stats() const
 {
-    return impl_->stats;
+    BackendResourceStats stats = impl_->stats;
+    // One-time upload staging still alive: buffers whose copy has not been
+    // recorded yet (held by a surface or texture, possibly shared between
+    // generations) plus recorded ones waiting for their frame slots.
+    std::unordered_set<const void*> counted;
+    const auto count_generation = [&](const VulkanGeneration& generation) {
+        for (const auto& surface : generation.surfaces)
+            if (counted.insert(surface.get()).second)
+                stats.retained_upload_staging_bytes
+                    += surface->upload_buffer.size;
+        for (const auto& model : generation.models)
+            if (counted.insert(model.get()).second)
+                for (const auto& slots : model->textures)
+                    for (const auto& texture : slots)
+                        stats.retained_upload_staging_bytes
+                            += texture.upload_buffer.size;
+    };
+    if (impl_->backend.active)
+        count_generation(*impl_->backend.active);
+    for (const auto& retired : impl_->backend.retired)
+        count_generation(retired.generation);
+    for (const auto& upload : impl_->backend.retired_uploads)
+        stats.retained_upload_staging_bytes += upload.buffer.size;
+    return stats;
 }
 
 void NativeBackend::activate_prepared()
@@ -2482,6 +2537,16 @@ void NativeBackend::retire_completed_slot(uint32_t frame_index)
         else
             ++iterator;
     }
+    auto& uploads = impl_->backend.retired_uploads;
+    for (auto& upload : uploads)
+    {
+        upload.pending_slots &= ~slot;
+        if (upload.pending_slots == 0)
+            draxul::vkresources::destroy_buffer(
+                impl_->backend.allocator, upload.buffer);
+    }
+    std::erase_if(uploads,
+        [](const RetiredUpload& upload) { return upload.pending_slots == 0; });
 }
 
 DraxulPluginRenderResultV2 NativeBackend::record(
@@ -2499,7 +2564,8 @@ DraxulPluginRenderResultV2 NativeBackend::record(
 
     const VkCommandBuffer command
         = static_cast<VkCommandBuffer>(frame->command_buffer);
-    initialize_generation_images(command, *impl_->backend.active);
+    initialize_generation_images(command, *impl_->backend.active,
+        frame->frame_index, impl_->backend.retired_uploads);
     if (audio)
     {
         update_audio_surfaces(command, *impl_->backend.active,
