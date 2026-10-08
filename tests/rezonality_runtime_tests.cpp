@@ -271,3 +271,93 @@ TEST_CASE("Rezonality runtime preserves last good state after failures",
     REQUIRE(runtime.active_build());
     CHECK(runtime.active_build()->generation == 7);
 }
+
+TEST_CASE("Rezonality runtime transfers build payloads without copying",
+    "[rezonality][runtime][backend]")
+{
+    // Asset-heavy payloads are observed by their heap storage: a copy would
+    // allocate new buffers, a move transfers the original ones.
+    const auto heavy_candidate = [](uint64_t generation) {
+        auto result = candidate(generation, 1, 1);
+        result.build->surfaces[0].image_pixels.assign(4096 * 4, 7);
+        rezonality::ModelData model;
+        model.vertices.resize(1024);
+        rezonality::ModelMaterial material;
+        material.base_color.pixels.assign(2048 * 4, 9);
+        model.materials.push_back(std::move(material));
+        result.build->models.emplace_back(std::move(model));
+        return result;
+    };
+    struct PayloadIdentity
+    {
+        const uint8_t* pixels = nullptr;
+        const rezonality::ModelVertex* vertices = nullptr;
+        const uint8_t* texture = nullptr;
+    };
+    const auto identify = [](const rezonality::ShaderBuild& build) {
+        return PayloadIdentity{
+            build.surfaces[0].image_pixels.data(),
+            build.models[0]->vertices.data(),
+            build.models[0]->materials[0].base_color.pixels.data(),
+        };
+    };
+    const auto same = [](const PayloadIdentity& left,
+                          const PayloadIdentity& right) {
+        return left.pixels == right.pixels
+            && left.vertices == right.vertices
+            && left.texture == right.texture;
+    };
+
+    rezonality::RuntimeController runtime;
+    FakeBackend backend;
+    auto first = heavy_candidate(1);
+    const PayloadIdentity built = identify(*first.build);
+    runtime.accept(first);
+    REQUIRE(runtime.pending_build());
+    CHECK(same(identify(*runtime.pending_build()), built));
+
+    const auto activated = runtime.prepare_frame(backend, 0);
+    REQUIRE(activated.disposition
+        == rezonality::RuntimePrepareDisposition::Activated);
+    CHECK(activated.transition.active_generation == 1);
+    CHECK(activated.transition.status == "live g1 | 1 passes | 1 surfaces");
+    CHECK_FALSE(runtime.pending_build());
+    REQUIRE(runtime.active_build());
+    CHECK(same(identify(*runtime.active_build()), built));
+
+    // Resize/target recreation prepares the active build again and keeps the
+    // same owned payloads in place.
+    backend.compatible = false;
+    const auto recreated = runtime.prepare_frame(backend, 1);
+    REQUIRE(recreated.disposition
+        == rezonality::RuntimePrepareDisposition::Activated);
+    CHECK(recreated.transition.active_generation == 1);
+    REQUIRE(runtime.active_build());
+    CHECK(same(identify(*runtime.active_build()), built));
+
+    // A rejected replacement destroys only the candidate; the last good
+    // build keeps its payloads and generation.
+    auto replacement = heavy_candidate(2);
+    runtime.accept(replacement);
+    backend.prepare_succeeds = false;
+    const auto rejected = runtime.prepare_frame(backend, 2);
+    CHECK(rejected.disposition
+        == rezonality::RuntimePrepareDisposition::Rejected);
+    CHECK(rejected.transition.active_generation == 1);
+    CHECK_FALSE(runtime.pending_build());
+    REQUIRE(runtime.active_build());
+    CHECK(runtime.active_build()->generation == 1);
+    CHECK(same(identify(*runtime.active_build()), built));
+
+    auto repaired = heavy_candidate(3);
+    const PayloadIdentity repaired_payload = identify(*repaired.build);
+    runtime.accept(repaired);
+    backend.prepare_succeeds = true;
+    backend.compatible = true;
+    const auto repaired_activation = runtime.prepare_frame(backend, 0);
+    REQUIRE(repaired_activation.disposition
+        == rezonality::RuntimePrepareDisposition::Activated);
+    CHECK(repaired_activation.transition.active_generation == 3);
+    REQUIRE(runtime.active_build());
+    CHECK(same(identify(*runtime.active_build()), repaired_payload));
+}
