@@ -88,7 +88,9 @@ set(_rezonality_project_sources
     src/live_project.cpp
     src/live_project.h
     src/model_loader.cpp
-    src/model_loader.h)
+    src/model_loader.h
+    src/shader_compiler.cpp
+    src/shader_compiler.h)
 
 add_library(draxul-rezonality-project STATIC
     ${_rezonality_project_sources})

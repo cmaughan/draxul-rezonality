@@ -1245,16 +1245,9 @@ TEST_CASE("The staged Rezonality module opens and reloads international project 
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 }
                 INFO(current);
-#if defined(_WIN32)
-                // The bundled Windows glslangValidator receives arguments
-                // through the active code page, so names it cannot represent
-                // fail as an ordinary candidate diagnostic. See
-                // kanban/pending/14 windows-shader-compiler-unicode-paths -bug.md.
-                CHECK((current.find(ready) != std::string::npos
-                    || current.find(failed) != std::string::npos));
-#else
+                // Windows runs the narrow-argv compiler inside the project
+                // with project-relative names, so these must compile too.
                 CHECK(current.find(ready) != std::string::npos);
-#endif
                 return current;
             };
             const std::string status = settle(1);

@@ -105,6 +105,15 @@ activation outcome; Metal and Vulkan only decide compatibility and prepare,
 record, and retire native generations. Keep native handles out of all three
 product-internal interfaces.
 
+Compiler execution lives in `src/shader_compiler.{h,cpp}` inside the project
+target, split into a pure invocation plan, a replaceable `ProcessRunner`, and
+result interpretation. Test spawn failure, timeout, compiler output formats,
+the diagnostic cap, and output-file handling with a recorded runner; keep one
+real-compiler case and the real-module edit/break/repair tests. On Windows the
+bundled compiler has a narrow, code-page argv, so it runs in the project
+directory with project-relative shader and include paths; macOS passes
+absolute UTF-8 paths unchanged.
+
 ## Live-edit and failure-recovery checks
 
 Exercise live editing against a copied fixture, never by destructively editing
