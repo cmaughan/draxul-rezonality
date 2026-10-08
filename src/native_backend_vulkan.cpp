@@ -2312,11 +2312,13 @@ void build_model_acceleration_structures(VkCommandBuffer command,
     range.primitiveCount = model.index_count / 3;
     const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = { &range };
     generation.ray.cmd_build(command, 1, &build, ranges);
+    // The TLAS build reads the BLAS and also rewrites the shared scratch
+    // buffer; builds access scratch as acceleration-structure read/write.
     VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    barrier.srcAccessMask
-        = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    barrier.dstAccessMask
-        = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     vkCmdPipelineBarrier(command,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
