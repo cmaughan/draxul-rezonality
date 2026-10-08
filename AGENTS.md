@@ -120,6 +120,17 @@ the ABI in-process or a native device belong in the native suite, and only
 cases that must load the built module belong in the dynamic suite. The module
 resolves SDL from its host on macOS; test executables own `SDL3::SDL3`.
 
+Compiler execution lives in `src/shader_compiler.{h,cpp}` inside the project
+target, split into a pure invocation plan, a replaceable `ProcessRunner`, and
+result interpretation. Test spawn failure, timeout, compiler output formats,
+the diagnostic cap, and output-file handling with a recorded runner; keep one
+real-compiler case and the real-module edit/break/repair tests. On Windows the
+bundled compiler has a narrow, code-page argv, so it runs in the project
+directory with project-relative shader and include paths; macOS passes
+absolute UTF-8 paths unchanged. Scene parsing rejects inputs neither backend
+can honour (previous-frame `!surface` samplers, or a pass sampling its own
+target) before preparation, so the failure keeps the last good generation.
+
 ## Live-edit and failure-recovery checks
 
 Exercise live editing against a copied fixture, never by destructively editing

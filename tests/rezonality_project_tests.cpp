@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "live_project.h"
+#include "shader_compiler.h"
 #include "surface_dimensions.h"
 
 #include <algorithm>
@@ -23,11 +24,22 @@ fs::path plugin_root()
     return fs::path(DRAXUL_REZONALITY_TEST_ROOT);
 }
 
+// Unique per call so concurrent runs from other checkouts sharing the
+// temporary directory cannot remove or populate each other's fixtures.
+fs::path unique_temp_path(std::string_view name)
+{
+    return fs::temp_directory_path()
+        / (std::string(name) + "-"
+            + std::to_string(std::chrono::steady_clock::now()
+                                 .time_since_epoch()
+                                 .count()));
+}
+
 struct ProjectFixture
 {
     explicit ProjectFixture(std::string_view example)
-        : path(fs::temp_directory_path()
-              / ("draxul-rezonality-project-" + std::string(example)))
+        : path(unique_temp_path(
+              "draxul-rezonality-project-" + std::string(example)))
     {
         std::error_code error;
         fs::remove_all(path, error);
@@ -539,6 +551,395 @@ TEST_CASE("Rezonality project pipeline reports injected compiler failures",
     CHECK(failed.error == "injected compiler diagnostic");
 }
 
+namespace
+{
+
+// Simulates a Windows code page that cannot represent any non-ASCII name.
+bool ascii_only(const fs::path& path)
+{
+    const std::u8string text = path.u8string();
+    return std::all_of(text.begin(), text.end(),
+        [](char8_t value) { return static_cast<unsigned char>(value) < 0x80; });
+}
+
+std::string argument_text(const fs::path& argument)
+{
+    const std::u8string text = argument.generic_u8string();
+    return std::string(text.begin(), text.end());
+}
+
+rezonality::ShaderCompileRequest compile_request(const fs::path& project,
+    const fs::path& output)
+{
+    return {
+        .compiler = fs::path("compiler") / "glslangValidator",
+        .project_path = project,
+        .shader = project / "shaders" / "main.frag",
+        .output_path = output,
+    };
+}
+
+// Records the planned process and replays a recorded compiler outcome.
+struct RecordedCompiler
+{
+    rezonality::ProcessResult result;
+    std::vector<uint32_t> written_spirv;
+    fs::path output_path;
+    std::vector<rezonality::ProcessRequest> requests;
+
+    rezonality::CompilerEnvironment environment(
+        rezonality::CompilerPathPolicy policy
+        = rezonality::CompilerPathPolicy::Absolute)
+    {
+        return {
+            .run = [this](const rezonality::ProcessRequest& request) {
+                requests.push_back(request);
+                if (!written_spirv.empty())
+                {
+                    std::ofstream output(output_path, std::ios::binary);
+                    output.write(
+                        reinterpret_cast<const char*>(written_spirv.data()),
+                        static_cast<std::streamsize>(
+                            written_spirv.size() * sizeof(uint32_t)));
+                }
+                return result;
+            },
+            .policy = policy,
+            .encodable = ascii_only,
+        };
+    }
+};
+
+} // namespace
+
+TEST_CASE("Rezonality compiler adapter plans platform argument spellings",
+    "[rezonality][project][compiler]")
+{
+    const fs::path root = fs::temp_directory_path() / "rezonality-plan";
+    const fs::path project = root / fs::path(u8"日本語 プロジェクト");
+    const fs::path ascii_project = root / "ascii project";
+    const fs::path output = root / "out" / "fragment-1-0.spv";
+    const auto accept_all = [](const fs::path&) { return true; };
+
+    // Absolute spelling is the unchanged macOS invocation.
+    auto absolute = rezonality::plan_compiler_invocation(
+        compile_request(ascii_project, output),
+        rezonality::CompilerPathPolicy::Absolute, accept_all);
+    REQUIRE(absolute.error.empty());
+    CHECK(absolute.process.working_directory.empty());
+    REQUIRE(absolute.process.arguments.size() >= 10);
+    CHECK(absolute.process.arguments[0]
+        == fs::path("compiler") / "glslangValidator");
+    CHECK(absolute.process.arguments[4]
+        == ascii_project / "shaders" / "main.frag");
+    CHECK(absolute.process.arguments[6] == output);
+    CHECK(argument_text(absolute.process.arguments[9])
+        == "-I" + argument_text(ascii_project));
+
+    // The same spelling cannot carry an unrepresentable project name.
+    const auto rejected = rezonality::plan_compiler_invocation(
+        compile_request(project, output),
+        rezonality::CompilerPathPolicy::Absolute, ascii_only);
+    CHECK(rejected.error.find("cannot be passed to glslangValidator")
+        != std::string::npos);
+    CHECK(rejected.error_path == project / "shaders" / "main.frag");
+
+    // Project-relative spelling runs in the project and never names it.
+    const auto relative = rezonality::plan_compiler_invocation(
+        compile_request(project, output),
+        rezonality::CompilerPathPolicy::ProjectRelative, ascii_only);
+    REQUIRE(relative.error.empty());
+    CHECK(relative.process.working_directory == project);
+    CHECK(argument_text(relative.process.arguments[4]) == "shaders/main.frag");
+    CHECK(relative.process.arguments[6] == output);
+    CHECK(argument_text(relative.process.arguments[9]) == "-I.");
+    for (size_t index = 1; index < relative.process.arguments.size(); ++index)
+        CHECK(ascii_only(relative.process.arguments[index]));
+
+    // Output under the same international ancestor skips the shared part.
+    const auto shared = rezonality::plan_compiler_invocation(
+        compile_request(project / "inner", project / "temp" / "out.spv"),
+        rezonality::CompilerPathPolicy::ProjectRelative, ascii_only);
+    REQUIRE(shared.error.empty());
+    CHECK(argument_text(shared.process.arguments[6]) == "../temp/out.spv");
+
+    // Output that can be spelled neither way fails actionably.
+    const auto unreachable = rezonality::plan_compiler_invocation(
+        compile_request(ascii_project, project / "out.spv"),
+        rezonality::CompilerPathPolicy::ProjectRelative, ascii_only);
+    CHECK(unreachable.error.find("Shader output directory")
+        != std::string::npos);
+    CHECK(unreachable.error.find("TMP/TEMP") != std::string::npos);
+}
+
+TEST_CASE("Rezonality quotes Windows compiler arguments for the CRT",
+    "[rezonality][project][compiler]")
+{
+    using rezonality::quote_windows_argument;
+    CHECK(quote_windows_argument(L"-V") == L"-V");
+    CHECK(quote_windows_argument(L"C:\\a\\b.frag") == L"C:\\a\\b.frag");
+    CHECK(quote_windows_argument(L"") == L"\"\"");
+    CHECK(quote_windows_argument(L"C:\\my project\\a.frag")
+        == L"\"C:\\my project\\a.frag\"");
+    // Backslashes before the closing quote are doubled.
+    CHECK(quote_windows_argument(L"-IC:\\my project\\")
+        == L"\"-IC:\\my project\\\\\"");
+    // Embedded quotes are escaped along with their preceding backslashes.
+    CHECK(quote_windows_argument(L"a\\\"b c")
+        == L"\"a\\\\\\\"b c\"");
+    CHECK(quote_windows_argument(L"tab\there") == L"\"tab\there\"");
+}
+
+TEST_CASE("Rezonality compiler adapter interprets recorded process outcomes",
+    "[rezonality][project][compiler]")
+{
+    const fs::path root = unique_temp_path(
+        "draxul-rezonality-recorded-compiler");
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    REQUIRE(fs::create_directories(root / "out"));
+    const fs::path project = root / "project";
+    const fs::path output = root / "out" / "fragment.spv";
+    const auto request = compile_request(project, output);
+    const fs::path shader = request.shader;
+    RecordedCompiler compiler;
+    compiler.output_path = output;
+    std::vector<uint32_t> spirv;
+    std::vector<rezonality::DiagnosticEntry> diagnostics;
+
+    SECTION("spawn failure")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::StartFailed;
+        compiler.result.error = "Could not start glslangValidator (error 2)";
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        REQUIRE(diagnostics.size() == 1);
+        CHECK(diagnostics[0].path == shader);
+        CHECK(diagnostics[0].stage == "compile");
+        CHECK(diagnostics[0].message == compiler.result.error);
+    }
+
+    SECTION("timeout")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::TimedOut;
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        REQUIRE(diagnostics.size() == 1);
+        CHECK(diagnostics[0].message.find("timed out after 10s compiling main.frag")
+            != std::string::npos);
+        REQUIRE(compiler.requests.size() == 1);
+        CHECK(compiler.requests[0].timeout == rezonality::kCompilerTimeout);
+    }
+
+    SECTION("relative compiler diagnostics resolve inside the project")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::Exited;
+        compiler.result.exit_code = 2;
+        // Recorded glslangValidator 15 output for a project-relative run.
+        compiler.result.output = "shaders/main.frag\n"
+                                 "ERROR: shaders/main.frag:5: 'undefined_thing' : undeclared identifier \n"
+                                 "WARNING: shaders/common.glsl:2: 'x' : unused\n"
+                                 "ERROR: 2 compilation errors.  No code generated.\n\n\n"
+                                 "SPIR-V is not generated for failed compile or link\n";
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(
+                rezonality::CompilerPathPolicy::ProjectRelative),
+            spirv, diagnostics));
+        REQUIRE(compiler.requests.size() == 1);
+        CHECK(compiler.requests[0].working_directory == project);
+        REQUIRE(diagnostics.size() == 2);
+        CHECK(diagnostics[0].path == project / "shaders" / "main.frag");
+        CHECK(diagnostics[0].severity == "error");
+        CHECK(diagnostics[0].line == 5);
+        CHECK(diagnostics[0].message
+            == "'undefined_thing' : undeclared identifier");
+        CHECK(diagnostics[1].path == project / "shaders" / "common.glsl");
+        CHECK(diagnostics[1].severity == "warning");
+        CHECK(diagnostics[1].line == 2);
+    }
+
+    SECTION("absolute compiler diagnostics keep their path")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::Exited;
+        compiler.result.exit_code = 2;
+        compiler.result.output = "ERROR: " + argument_text(shader)
+            + ":12: 'main' : missing\n";
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        REQUIRE(diagnostics.size() == 1);
+        CHECK(diagnostics[0].path.lexically_normal()
+            == shader.lexically_normal());
+        CHECK(diagnostics[0].line == 12);
+    }
+
+    SECTION("link and usage errors fall back to the shader")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::Exited;
+        compiler.result.exit_code = 3;
+        compiler.result.output = "shaders/main.frag\n"
+                                 "ERROR: Linking fragment stage: Missing entry point: Each stage requires one entry point\n\n"
+                                 "SPIR-V is not generated for failed compile or link\n";
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        REQUIRE(diagnostics.size() == 1);
+        CHECK(diagnostics[0].path == shader);
+        CHECK(diagnostics[0].message.rfind("ERROR: Linking fragment stage", 0)
+            == 0);
+
+        diagnostics.clear();
+        compiler.result.exit_code = 1;
+        compiler.result.output = "glslangValidator: Error: unable to open input file (use -h for usage)\n";
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        REQUIRE(diagnostics.size() == 1);
+        CHECK(diagnostics[0].message.find("unable to open input file")
+            != std::string::npos);
+
+        diagnostics.clear();
+        compiler.result.output.clear();
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        REQUIRE(diagnostics.size() == 1);
+        CHECK_FALSE(diagnostics[0].message.empty());
+    }
+
+    SECTION("diagnostics are bounded and undecodable names do not throw")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::Exited;
+        compiler.result.exit_code = 2;
+        compiler.result.output = "ERROR: caf\xe9.frag:3: code page name\n";
+        for (int line = 1; line <= 300; ++line)
+            compiler.result.output += "ERROR: shaders/main.frag:"
+                + std::to_string(line) + ": repeated\n";
+        CHECK_NOTHROW(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        CHECK(diagnostics.size() == rezonality::kMaximumBuildDiagnostics);
+        CHECK(diagnostics[0].line == 3);
+    }
+
+    SECTION("successful exit reads the requested output")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::Exited;
+        compiler.result.exit_code = 0;
+        compiler.written_spirv = { 0x07230203u, 0x00010500u, 7u };
+        REQUIRE(rezonality::compile_shader(request,
+            compiler.environment(
+                rezonality::CompilerPathPolicy::ProjectRelative),
+            spirv, diagnostics));
+        CHECK(spirv == compiler.written_spirv);
+        CHECK(diagnostics.empty());
+    }
+
+    SECTION("successful exit without output keeps the compiler explanation")
+    {
+        compiler.result.status = rezonality::ProcessResult::Status::Exited;
+        compiler.result.exit_code = 0;
+        compiler.result.output = "shaders/main.frag\nERROR: Failed to open file: out/fragment.spv\n";
+        CHECK_FALSE(rezonality::compile_shader(request,
+            compiler.environment(), spirv, diagnostics));
+        REQUIRE(diagnostics.size() == 1);
+        CHECK(diagnostics[0].message.find("produced no SPIR-V for main.frag")
+            != std::string::npos);
+        CHECK(diagnostics[0].message.find("Failed to open file")
+            != std::string::npos);
+    }
+
+    fs::remove_all(root, ec);
+}
+
+TEST_CASE("Rezonality bundled compiler builds international projects",
+    "[rezonality][project][compiler][international]")
+{
+    const fs::path compiler = rezonality::bundled_compiler_path(plugin_root());
+    if (!fs::is_regular_file(compiler))
+        SKIP("No bundled glslangValidator for this platform");
+
+    const fs::path root = unique_temp_path("draxul-rezonality-compiler");
+    const fs::path project = root / fs::path(u8"日本語 プロジェクト-\U0001F3B5");
+    REQUIRE(fs::create_directories(project / "shaders"));
+    REQUIRE(fs::create_directories(root / "out"));
+    write(project / "shaders" / "common.glsl",
+        "vec4 tint() { return vec4(1.0); }\n");
+    // Includes resolve beside the shader and from the project root.
+    write(project / "shaders" / "local.frag",
+        "#version 450\n"
+        "#extension GL_GOOGLE_include_directive : require\n"
+        "#include \"common.glsl\"\n"
+        "layout(location = 0) out vec4 color;\n"
+        "void main() { color = tint(); }\n");
+    write(project / "shaders" / "rooted.frag",
+        "#version 450\n"
+        "#extension GL_GOOGLE_include_directive : require\n"
+        "#include \"shaders/common.glsl\"\n"
+        "layout(location = 0) out vec4 color;\n"
+        "void main() { color = tint(); }\n");
+    write(project / "shaders" / "broken.frag",
+        "#version 450\n"
+        "layout(location = 0) out vec4 color;\n"
+        "void main()\n"
+        "{\n"
+        "    color = undefined_value;\n"
+        "}\n");
+
+    const auto build = [&](const rezonality::CompilerEnvironment& environment,
+                           const char* shader_name,
+                           std::vector<rezonality::DiagnosticEntry>& diagnostics) {
+        std::vector<uint32_t> spirv;
+        const fs::path output = root / "out" / "shader.spv";
+        const bool compiled = rezonality::compile_shader({
+                                                             .compiler = compiler,
+                                                             .project_path = project,
+                                                             .shader = project / "shaders" / shader_name,
+                                                             .output_path = output,
+                                                         },
+            environment, spirv, diagnostics);
+        std::error_code ec;
+        fs::remove(output, ec);
+        return compiled && !spirv.empty() && spirv.front() == 0x07230203u;
+    };
+
+    rezonality::CompilerEnvironment native;
+    rezonality::CompilerEnvironment restricted;
+    restricted.policy = rezonality::CompilerPathPolicy::ProjectRelative;
+    restricted.encodable = ascii_only;
+    for (const auto* environment : { &native, &restricted })
+    {
+        DYNAMIC_SECTION((environment == &native ? "native" : "restricted"))
+        {
+            std::vector<rezonality::DiagnosticEntry> diagnostics;
+            CHECK(build(*environment, "local.frag", diagnostics));
+            CHECK(build(*environment, "rooted.frag", diagnostics));
+            for (const auto& diagnostic : diagnostics)
+                UNSCOPED_INFO(diagnostic.message);
+            CHECK(diagnostics.empty());
+
+            CHECK_FALSE(build(*environment, "broken.frag", diagnostics));
+            REQUIRE_FALSE(diagnostics.empty());
+            CHECK(diagnostics[0].path.lexically_normal()
+                == (project / "shaders" / "broken.frag").lexically_normal());
+            CHECK(diagnostics[0].line == 5);
+            CHECK(diagnostics[0].message.find("undefined_value")
+                != std::string::npos);
+        }
+    }
+
+    std::vector<rezonality::DiagnosticEntry> missing;
+    std::vector<uint32_t> spirv;
+    CHECK_FALSE(rezonality::compile_shader({
+                                               .compiler = root / "missing-compiler",
+                                               .project_path = project,
+                                               .shader = project / "shaders" / "local.frag",
+                                               .output_path = root / "out" / "missing.spv",
+                                           },
+        {}, spirv, missing));
+    REQUIRE(missing.size() == 1);
+    CHECK(missing[0].message.find("Could not start glslangValidator")
+        != std::string::npos);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 TEST_CASE("Rezonality parses scene text before resolving assets",
     "[rezonality][project][pipeline]")
 {
@@ -595,6 +996,80 @@ pass: UseFirst {
     CHECK_FALSE(malformed.scene);
     CHECK(malformed.diagnostic_path == scenegraph);
     CHECK(malformed.error.find("at least one enabled pass")
+        != std::string::npos);
+}
+
+TEST_CASE("Rezonality rejects texture feedback before preparation",
+    "[rezonality][project][pipeline]")
+{
+    rezonality::ProjectOptions configured;
+    configured.project_path = fs::path("virtual-project");
+    const fs::path scenegraph
+        = configured.project_path / "feedback.scenegraph";
+    const auto parse = [&](const std::string& source) {
+        return rezonality::parse_scene_text(configured, scenegraph, source);
+    };
+    const std::string surfaces = "surface: History { format: rgba16f }\n"
+                                 "surface: Bloom.A { }\n";
+
+    // An earlier pass's output is a valid input for a later pass.
+    const auto chained = parse(surfaces + R"scene(
+pass: Write {
+    targets: (History)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+pass: Read {
+    samplers: (History)
+    geometry: Screen { path: screen_rect vs: b.vert fs: b.frag }
+}
+)scene");
+    REQUIRE(chained.scene);
+    REQUIRE(chained.scene->passes.size() == 2);
+    REQUIRE(chained.scene->passes[1].samplers.size() == 1);
+    CHECK_FALSE(chained.scene->passes[1].samplers[0].previous_frame);
+
+    // Previous-frame history is parsed but neither backend keeps it.
+    const auto history = parse(surfaces + R"scene(
+pass: Write {
+    targets: (History)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+
+pass: Accumulate {
+    samplers: (History, !Bloom.A)
+    targets: (Bloom.A)
+    geometry: Screen { path: screen_rect vs: b.vert fs: b.frag }
+}
+)scene");
+    CHECK_FALSE(history.scene);
+    CHECK(history.diagnostic_path == scenegraph);
+    CHECK(history.diagnostic_line == 9);
+    CHECK(history.error.find("Pass 'Accumulate' samples '!Bloom.A'")
+        != std::string::npos);
+    CHECK(history.error.find("previous frame") != std::string::npos);
+
+    // Reading and writing one texture in a pass is rejected by name.
+    const auto aliased = parse(surfaces + R"scene(
+pass: Loop {
+    samplers: (History)
+    targets: (History)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+)scene");
+    CHECK_FALSE(aliased.scene);
+    CHECK(aliased.diagnostic_line == 4);
+    CHECK(aliased.error.find("Pass 'Loop' samples 'History' while writing it")
+        != std::string::npos);
+
+    // Passes without targets write default_color, which is also an alias.
+    const auto implicit = parse(surfaces + R"scene(
+pass: Direct {
+    samplers: (default_color)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+)scene");
+    CHECK_FALSE(implicit.scene);
+    CHECK(implicit.error.find("'default_color' while writing it")
         != std::string::npos);
 }
 

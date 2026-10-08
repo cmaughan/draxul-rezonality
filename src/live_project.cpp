@@ -1,6 +1,7 @@
 #include "live_project.h"
 #include "image_loader.h"
 #include "path_utf8.h"
+#include "shader_compiler.h"
 
 #include <nlohmann/json.hpp>
 
@@ -19,38 +20,16 @@
 #include <stdexcept>
 #include <system_error>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <signal.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-extern char** environ;
-#endif
-
 namespace rezonality
 {
 namespace
 {
-
-constexpr size_t kMaximumBuildDiagnostics = 128;
 
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
 
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
-
-struct ProcessResult
-{
-    int exit_code = -1;
-    std::string output;
-    std::string error;
-};
 
 uint64_t hash_bytes(uint64_t hash, const void* data, size_t size)
 {
@@ -147,20 +126,6 @@ void collect_active_sources(ShaderBuild& build)
     std::sort(build.source_files.begin(), build.source_files.end());
 }
 
-std::vector<uint32_t> read_spirv(const fs::path& path)
-{
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
-    if (!input)
-        return {};
-    const auto size = input.tellg();
-    if (size <= 0 || size % 4 != 0)
-        return {};
-    std::vector<uint32_t> words(static_cast<size_t>(size) / 4);
-    input.seekg(0);
-    input.read(reinterpret_cast<char*>(words.data()), size);
-    return input ? words : std::vector<uint32_t>{};
-}
-
 std::string trim(std::string value)
 {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -169,213 +134,6 @@ std::string trim(std::string value)
     const auto last = value.find_last_not_of(" \t\r\n");
     return value.substr(first, last - first + 1);
 }
-
-#if defined(_WIN32)
-
-std::wstring quote_windows_argument(std::wstring_view value)
-{
-    bool quote = value.empty();
-    for (const wchar_t ch : value)
-        quote = quote || ch == L' ' || ch == L'\t' || ch == L'"';
-    if (!quote)
-        return std::wstring(value);
-
-    std::wstring result(1, L'"');
-    size_t slashes = 0;
-    for (const wchar_t ch : value)
-    {
-        if (ch == L'\\')
-        {
-            ++slashes;
-            continue;
-        }
-        if (ch == L'"')
-            result.append(slashes * 2 + 1, L'\\');
-        else
-            result.append(slashes, L'\\');
-        slashes = 0;
-        result.push_back(ch);
-    }
-    result.append(slashes * 2, L'\\');
-    result.push_back(L'"');
-    return result;
-}
-
-ProcessResult run_process(const std::vector<fs::path>& arguments)
-{
-    ProcessResult result;
-    if (arguments.empty())
-    {
-        result.error = "No compiler command was supplied";
-        return result;
-    }
-
-    SECURITY_ATTRIBUTES security{ sizeof(security), nullptr, TRUE };
-    HANDLE read_pipe = nullptr;
-    HANDLE write_pipe = nullptr;
-    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0))
-    {
-        result.error = "Could not create compiler output pipe";
-        return result;
-    }
-    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
-
-    std::wstring command;
-    for (const auto& argument : arguments)
-    {
-        if (!command.empty())
-            command.push_back(L' ');
-        command += quote_windows_argument(argument.wstring());
-    }
-    std::vector<wchar_t> mutable_command(command.begin(), command.end());
-    mutable_command.push_back(L'\0');
-
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_HIDE;
-    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    startup.hStdOutput = write_pipe;
-    startup.hStdError = write_pipe;
-    PROCESS_INFORMATION process{};
-    const std::wstring executable = arguments.front().wstring();
-    const BOOL created = CreateProcessW(executable.c_str(),
-        mutable_command.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
-    CloseHandle(write_pipe);
-    if (!created)
-    {
-        CloseHandle(read_pipe);
-        result.error = "Could not start glslangValidator (error "
-            + std::to_string(GetLastError()) + ")";
-        return result;
-    }
-    CloseHandle(process.hThread);
-
-    std::array<char, 4096> buffer{};
-    const auto deadline
-        = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    bool finished = false;
-    while (!finished && std::chrono::steady_clock::now() < deadline)
-    {
-        DWORD available = 0;
-        while (PeekNamedPipe(read_pipe, nullptr, 0, nullptr,
-                   &available, nullptr)
-            && available > 0)
-        {
-            DWORD count = 0;
-            const DWORD amount = std::min<DWORD>(
-                available, static_cast<DWORD>(buffer.size()));
-            if (!ReadFile(read_pipe, buffer.data(), amount,
-                    &count, nullptr)
-                || count == 0)
-                break;
-            result.output.append(buffer.data(), count);
-            available -= count;
-        }
-        finished = WaitForSingleObject(process.hProcess, 10)
-            == WAIT_OBJECT_0;
-    }
-    if (!finished)
-    {
-        TerminateProcess(process.hProcess, 1);
-        WaitForSingleObject(process.hProcess, 2000);
-        result.error = "glslangValidator timed out";
-    }
-    DWORD count = 0;
-    while (ReadFile(read_pipe, buffer.data(),
-               static_cast<DWORD>(buffer.size()), &count, nullptr)
-        && count > 0)
-        result.output.append(buffer.data(), count);
-    CloseHandle(read_pipe);
-    DWORD exit_code = 1;
-    GetExitCodeProcess(process.hProcess, &exit_code);
-    CloseHandle(process.hProcess);
-    result.exit_code = static_cast<int>(exit_code);
-    return result;
-}
-
-#else
-
-ProcessResult run_process(const std::vector<fs::path>& arguments)
-{
-    ProcessResult result;
-    if (arguments.empty())
-    {
-        result.error = "No compiler command was supplied";
-        return result;
-    }
-
-    int pipe_handles[2]{};
-    if (pipe(pipe_handles) != 0)
-    {
-        result.error = "Could not create compiler output pipe";
-        return result;
-    }
-
-    std::vector<std::string> storage;
-    storage.reserve(arguments.size());
-    for (const auto& argument : arguments)
-        storage.push_back(argument.string());
-    std::vector<char*> argv;
-    argv.reserve(storage.size() + 1);
-    for (auto& argument : storage)
-        argv.push_back(argument.data());
-    argv.push_back(nullptr);
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, pipe_handles[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, pipe_handles[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, pipe_handles[0]);
-    posix_spawn_file_actions_addclose(&actions, pipe_handles[1]);
-
-    pid_t child = 0;
-    const int spawn_result = posix_spawn(&child, storage.front().c_str(),
-        &actions, nullptr, argv.data(), environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(pipe_handles[1]);
-    if (spawn_result != 0)
-    {
-        close(pipe_handles[0]);
-        result.error = "Could not start glslangValidator (error "
-            + std::to_string(spawn_result) + ")";
-        return result;
-    }
-
-    const int flags = fcntl(pipe_handles[0], F_GETFL, 0);
-    fcntl(pipe_handles[0], F_SETFL, flags | O_NONBLOCK);
-    std::array<char, 4096> buffer{};
-    const auto deadline
-        = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    int status = 0;
-    bool finished = false;
-    while (!finished && std::chrono::steady_clock::now() < deadline)
-    {
-        ssize_t count = 0;
-        while ((count = read(
-                    pipe_handles[0], buffer.data(), buffer.size()))
-            > 0)
-            result.output.append(buffer.data(), static_cast<size_t>(count));
-        finished = waitpid(child, &status, WNOHANG) == child;
-        if (!finished)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    if (!finished)
-    {
-        kill(child, SIGKILL);
-        waitpid(child, &status, 0);
-        result.error = "glslangValidator timed out";
-    }
-    ssize_t count = 0;
-    while ((count = read(pipe_handles[0], buffer.data(), buffer.size())) > 0)
-        result.output.append(buffer.data(), static_cast<size_t>(count));
-    close(pipe_handles[0]);
-    result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    return result;
-}
-
-#endif
 
 std::optional<std::string> first_match(const std::string& source,
     const std::regex& expression)
@@ -591,12 +349,30 @@ bool parse_uv_origin(const std::string& body, std::string_view owner,
     return false;
 }
 
+std::regex block_header(std::string_view kind)
+{
+    return std::regex("(^|[\\r\\n])\\s*" + std::string(kind)
+        + R"(\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{)");
+}
+
+// Name and offset of the opening brace of each block of kind.
+std::vector<std::pair<std::string, size_t>> named_block_offsets(
+    const std::string& source, std::string_view kind)
+{
+    std::vector<std::pair<std::string, size_t>> blocks;
+    const std::regex header = block_header(kind);
+    for (auto begin = std::sregex_iterator(source.begin(), source.end(), header);
+         begin != std::sregex_iterator(); ++begin)
+        blocks.emplace_back((*begin)[2].str(),
+            static_cast<size_t>(begin->position() + begin->length() - 1));
+    return blocks;
+}
+
 std::vector<std::pair<std::string, std::string>> named_blocks(
     const std::string& source, std::string_view kind)
 {
     std::vector<std::pair<std::string, std::string>> blocks;
-    const std::regex header("(^|[\\r\\n])\\s*" + std::string(kind)
-        + R"(\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{)");
+    const std::regex header = block_header(kind);
     for (auto begin = std::sregex_iterator(source.begin(), source.end(), header);
          begin != std::sregex_iterator(); ++begin)
     {
@@ -609,6 +385,57 @@ std::vector<std::pair<std::string, std::string>> named_blocks(
             source.substr(open + 1, close - open - 1));
     }
     return blocks;
+}
+
+// One-based line of a named block header, or 1 when it cannot be found.
+// Comment stripping preserves line breaks, so parsed text lines match the
+// source the user edits.
+int block_line(const std::string& parsed, std::string_view kind,
+    std::string_view name)
+{
+    for (const auto& [block, open] : named_block_offsets(parsed, kind))
+        if (block == name)
+            return 1 + static_cast<int>(std::count(
+                parsed.begin(), parsed.begin() + open, '\n'));
+    return 1;
+}
+
+// Both native backends bind a sampler to the surface's current texture and
+// keep no history copy. Reject inputs they cannot honour before preparation:
+// a previous-frame sampler would silently read the current target, and a
+// pass sampling its own target reads and writes one texture at once.
+// Sampling a surface written by an earlier pass remains valid.
+bool validate_pass_inputs(const std::string& parsed,
+    const SceneDescription& description, int& diagnostic_line,
+    std::string& error)
+{
+    for (const auto& pass : description.passes)
+    {
+        for (const auto& sampler : pass.samplers)
+        {
+            if (sampler.previous_frame)
+            {
+                error = "Pass '" + pass.name + "' samples '!" + sampler.surface
+                    + "' (previous frame), which Rezonality does not support; "
+                      "sample a surface written by an earlier pass instead";
+            }
+            else if (std::find(pass.targets.begin(), pass.targets.end(),
+                         sampler.surface)
+                != pass.targets.end())
+            {
+                error = "Pass '" + pass.name + "' samples '" + sampler.surface
+                    + "' while writing it as a target; write a separate "
+                      "surface and sample it in a later pass";
+            }
+            else
+            {
+                continue;
+            }
+            diagnostic_line = block_line(parsed, "pass", pass.name);
+            return false;
+        }
+    }
+    return true;
 }
 
 std::optional<SceneDescription> parse_scene_text_impl(
@@ -843,128 +670,14 @@ std::optional<SceneDescription> parse_scene_text_impl(
         diagnostic_line = 1;
         return std::nullopt;
     }
+    if (!validate_pass_inputs(parsed, description, diagnostic_line, error))
+        return std::nullopt;
     for (auto& pass : description.passes)
         for (const auto& target : pass.targets)
             if (target != "default_color" && target != "default_depth")
                 for (auto& surface : description.surfaces)
                     surface.target = surface.target || surface.name == target;
     return description;
-}
-
-void parse_compiler_diagnostics(const std::string& output,
-    const fs::path& shader, std::vector<DiagnosticEntry>& diagnostics)
-{
-    const size_t initial_count = diagnostics.size();
-    std::istringstream lines(output);
-    std::string line;
-    static const std::regex path_line(
-        R"((ERROR|WARNING):\s*(.*?):([0-9]+):\s*(.*))",
-        std::regex::icase);
-    static const std::regex generic_line(
-        R"((.*?):([0-9]+):\s*(.*))", std::regex::icase);
-    std::string fallback;
-    while (std::getline(lines, line))
-    {
-        if (line.empty() || diagnostics.size() >= kMaximumBuildDiagnostics)
-            continue;
-        std::smatch match;
-        if (std::regex_search(line, match, path_line))
-        {
-            std::string severity = trim(match[1].str());
-            std::transform(severity.begin(), severity.end(), severity.begin(),
-                [](unsigned char value) {
-                    return static_cast<char>(std::tolower(value));
-                });
-            diagnostics.push_back({
-                .path = fs::u8path(trim(match[2].str())),
-                .stage = "compile",
-                .severity = std::move(severity),
-                .line = std::max(1, std::stoi(match[3].str())),
-                .message = trim(match[4].str()),
-            });
-            continue;
-        }
-        if (std::regex_search(line, match, generic_line))
-        {
-            diagnostics.push_back({
-                .path = fs::u8path(trim(match[1].str())),
-                .stage = "compile",
-                .severity = "error",
-                .line = std::max(1, std::stoi(match[2].str())),
-                .message = trim(match[3].str()),
-            });
-            continue;
-        }
-        if (fallback.empty()
-            && (line.find("ERROR") != std::string::npos
-                || line.find("error") != std::string::npos))
-        {
-            fallback = trim(line);
-        }
-    }
-    if (diagnostics.size() == initial_count
-        && diagnostics.size() < kMaximumBuildDiagnostics)
-    {
-        if (fallback.empty())
-            fallback = trim(output);
-        if (fallback.size() > 300)
-            fallback.resize(300);
-        diagnostics.push_back({
-            .path = shader,
-            .stage = "compile",
-            .severity = "error",
-            .message = std::move(fallback),
-        });
-    }
-}
-
-bool compile_shader(const fs::path& compiler, const fs::path& project_path,
-    const fs::path& shader, const fs::path& output_path,
-    std::vector<uint32_t>& spirv, std::vector<DiagnosticEntry>& diagnostics)
-{
-    std::vector<fs::path> arguments{
-        compiler, "-V", "--target-env", "vulkan1.2", shader,
-        "-o", output_path, "-l", "-g",
-        fs::path("-I").concat(project_path.native())
-    };
-#if defined(__APPLE__)
-    arguments.emplace_back("-DREZONALITY_METAL_SEPARATE_MODEL_SAMPLER=1");
-#endif
-    ProcessResult process = run_process(arguments);
-    if (!process.error.empty())
-    {
-        if (diagnostics.size() < kMaximumBuildDiagnostics)
-        {
-            diagnostics.push_back({
-                .path = shader,
-                .stage = "compile",
-                .severity = "error",
-                .message = process.error,
-            });
-        }
-        return false;
-    }
-    if (process.exit_code != 0)
-    {
-        parse_compiler_diagnostics(process.output, shader, diagnostics);
-        return false;
-    }
-    spirv = read_spirv(output_path);
-    if (spirv.empty())
-    {
-        if (diagnostics.size() < kMaximumBuildDiagnostics)
-        {
-            diagnostics.push_back({
-                .path = shader,
-                .stage = "compile",
-                .severity = "error",
-                .message = "glslangValidator produced no SPIR-V for "
-                    + path_utf8(shader.filename()),
-            });
-        }
-        return false;
-    }
-    return true;
 }
 
 void finalize_compile_diagnostics(BuildResult& result)
@@ -1001,17 +714,6 @@ void finalize_compile_diagnostics(BuildResult& result)
     result.diagnostic_path = selected.path;
     result.diagnostic_line = selected.line;
     result.error = selected.message;
-}
-
-fs::path compiler_path(const fs::path& plugin_directory)
-{
-#if defined(_WIN32)
-    return plugin_directory / "tools" / "win" / "glslangValidator.exe";
-#elif defined(__APPLE__)
-    return plugin_directory / "tools" / "mac" / "glslangValidator";
-#else
-    return plugin_directory / "tools" / "linux" / "glslangValidator";
-#endif
 }
 
 } // namespace
@@ -1288,7 +990,7 @@ BuildResult build_candidate(const fs::path& plugin_directory,
     result.generation = generation;
     try
     {
-    const fs::path compiler = compiler_path(plugin_directory);
+    const fs::path compiler = bundled_compiler_path(plugin_directory);
     std::error_code compiler_error;
     if (!compile_shader_operation
         && !fs::is_regular_file(compiler, compiler_error))
@@ -1335,8 +1037,13 @@ BuildResult build_candidate(const fs::path& plugin_directory,
                              std::vector<uint32_t>& spirv) {
         if (!compile_shader_operation)
         {
-            return compile_shader(compiler, options.project_path,
-                shader, output, spirv, result.diagnostics);
+            return compile_shader({
+                                      .compiler = compiler,
+                                      .project_path = options.project_path,
+                                      .shader = shader,
+                                      .output_path = output,
+                                  },
+                CompilerEnvironment{}, spirv, result.diagnostics);
         }
         if (!compile_shader_operation(
                 shader, spirv, result.diagnostics))

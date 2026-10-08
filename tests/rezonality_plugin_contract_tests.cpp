@@ -409,16 +409,9 @@ TEST_CASE("The staged Rezonality module opens and reloads international project 
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 }
                 INFO(current);
-#if defined(_WIN32)
-                // The bundled Windows glslangValidator receives arguments
-                // through the active code page, so names it cannot represent
-                // fail as an ordinary candidate diagnostic. See
-                // kanban/pending/14 windows-shader-compiler-unicode-paths -bug.md.
-                CHECK((current.find(ready) != std::string::npos
-                    || current.find(failed) != std::string::npos));
-#else
+                // Windows runs the narrow-argv compiler inside the project
+                // with project-relative names, so these must compile too.
                 CHECK(current.find(ready) != std::string::npos);
-#endif
                 return current;
             };
             const std::string status = settle(1);
@@ -588,6 +581,104 @@ TEST_CASE("The staged Rezonality module survives real PBR project edits",
     REQUIRE_FALSE(ec);
     write_text(scene_path, scene);
     reload_and_wait("ready g8");
+
+    api->quiesce_instance(instance);
+    api->destroy_instance(instance);
+    fs::remove_all(fixture, ec);
+    CHECK_FALSE(ec);
+}
+
+TEST_CASE("The staged Rezonality module rejects texture feedback edits",
+    "[rezonality][integration][dynamic][feedback]")
+{
+    namespace fs = std::filesystem;
+    DynamicPluginModule module(fs::path(DRAXUL_REZONALITY_MODULE_PATH));
+    const auto* api = module.api();
+    REQUIRE(api != nullptr);
+
+    const fs::path fixture = fs::temp_directory_path()
+        / ("draxul-rezonality-feedback-"
+            + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code ec;
+    REQUIRE(fs::create_directories(fixture));
+    fs::copy(plugin_root() / "examples" / "simple", fixture,
+        fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+        ec);
+    REQUIRE_FALSE(ec);
+
+    HostState host_state;
+    DraxulPluginHostApiV2 host{};
+    host.struct_size = sizeof(host);
+    host.abi_version = DRAXUL_PLUGIN_ABI_VERSION;
+    host.host_context = &host_state;
+    host.request_redraw = &request_redraw;
+    host.request_tick = &request_tick;
+    host.notify_presentation_changed = &request_noop;
+    host.log = &log_noop;
+    host.query_service = &query_service_noop;
+    const std::string directory = plugin_root().string();
+    const std::string config = nlohmann::json{
+        { "project_path", fixture.string() },
+        { "auto_reload", false },
+        { "paused", true },
+    }
+                                   .dump();
+    DraxulPluginCreateInfoV2 create_info{};
+    create_info.struct_size = sizeof(create_info);
+    create_info.host = &host;
+    create_info.plugin_id = api->plugin_id;
+    create_info.plugin_directory_utf8 = directory.c_str();
+    create_info.config_json = config.data();
+    create_info.config_json_length = config.size();
+    create_info.initial_viewport = {
+        sizeof(DraxulPluginViewportV2), 0, 0, 640, 480, 1.0f, 96.0f
+    };
+    void* instance = api->create_instance(&create_info);
+    REQUIRE(instance != nullptr);
+    DraxulPluginPresentationExtensionV2 presentation{};
+    REQUIRE(api->query_extension(instance,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID,
+                sizeof(DRAXUL_PLUGIN_PRESENTATION_EXTENSION_ID) - 1,
+                DRAXUL_PLUGIN_PRESENTATION_EXTENSION_VERSION,
+                &presentation, sizeof(presentation))
+        != 0);
+    // The example samples A in Composite after Pass1 writes it.
+    REQUIRE(wait_for_status(*api, instance, presentation, "ready g1"));
+    const auto reload_and_wait = [&](std::string_view expected) {
+        REQUIRE(presentation.dispatch_action(instance,
+                    "rezonality_reload", sizeof("rezonality_reload") - 1)
+            != 0);
+        REQUIRE(wait_for_status(*api, instance, presentation, expected));
+        return presentation_status(instance, presentation);
+    };
+
+    const fs::path scenegraph = fixture / "default.scenegraph";
+    const std::string scene = read_text(scenegraph);
+    const auto replace = [&scene](std::string_view from, std::string_view to) {
+        std::string edited = scene;
+        const size_t at = edited.find(from);
+        REQUIRE(at != std::string::npos);
+        edited.replace(at, from.size(), to);
+        return edited;
+    };
+
+    write_text(scenegraph, replace("samplers: (A)", "samplers: (!A)"));
+    // Rejected while parsing, so neither backend prepares the candidate.
+    const std::string history = reload_and_wait("BUILD FAILED g2");
+    CHECK(history.find("default.scenegraph:17") != std::string::npos);
+    CHECK(history.find("Pass 'Composite' samples '!A' (previous frame)")
+        != std::string::npos);
+
+    write_text(scenegraph,
+        replace("targets: (A)", "targets: (A)\n    samplers: (A)"));
+    const std::string aliased = reload_and_wait("BUILD FAILED g3");
+    CHECK(aliased.find("default.scenegraph:7") != std::string::npos);
+    CHECK(aliased.find("Pass 'Pass1' samples 'A' while writing it")
+        != std::string::npos);
+
+    write_text(scenegraph, scene);
+    reload_and_wait("ready g4");
 
     api->quiesce_instance(instance);
     api->destroy_instance(instance);
