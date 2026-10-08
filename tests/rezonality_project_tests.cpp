@@ -999,6 +999,80 @@ pass: UseFirst {
         != std::string::npos);
 }
 
+TEST_CASE("Rezonality rejects texture feedback before preparation",
+    "[rezonality][project][pipeline]")
+{
+    rezonality::ProjectOptions configured;
+    configured.project_path = fs::path("virtual-project");
+    const fs::path scenegraph
+        = configured.project_path / "feedback.scenegraph";
+    const auto parse = [&](const std::string& source) {
+        return rezonality::parse_scene_text(configured, scenegraph, source);
+    };
+    const std::string surfaces = "surface: History { format: rgba16f }\n"
+                                 "surface: Bloom.A { }\n";
+
+    // An earlier pass's output is a valid input for a later pass.
+    const auto chained = parse(surfaces + R"scene(
+pass: Write {
+    targets: (History)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+pass: Read {
+    samplers: (History)
+    geometry: Screen { path: screen_rect vs: b.vert fs: b.frag }
+}
+)scene");
+    REQUIRE(chained.scene);
+    REQUIRE(chained.scene->passes.size() == 2);
+    REQUIRE(chained.scene->passes[1].samplers.size() == 1);
+    CHECK_FALSE(chained.scene->passes[1].samplers[0].previous_frame);
+
+    // Previous-frame history is parsed but neither backend keeps it.
+    const auto history = parse(surfaces + R"scene(
+pass: Write {
+    targets: (History)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+
+pass: Accumulate {
+    samplers: (History, !Bloom.A)
+    targets: (Bloom.A)
+    geometry: Screen { path: screen_rect vs: b.vert fs: b.frag }
+}
+)scene");
+    CHECK_FALSE(history.scene);
+    CHECK(history.diagnostic_path == scenegraph);
+    CHECK(history.diagnostic_line == 9);
+    CHECK(history.error.find("Pass 'Accumulate' samples '!Bloom.A'")
+        != std::string::npos);
+    CHECK(history.error.find("previous frame") != std::string::npos);
+
+    // Reading and writing one texture in a pass is rejected by name.
+    const auto aliased = parse(surfaces + R"scene(
+pass: Loop {
+    samplers: (History)
+    targets: (History)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+)scene");
+    CHECK_FALSE(aliased.scene);
+    CHECK(aliased.diagnostic_line == 4);
+    CHECK(aliased.error.find("Pass 'Loop' samples 'History' while writing it")
+        != std::string::npos);
+
+    // Passes without targets write default_color, which is also an alias.
+    const auto implicit = parse(surfaces + R"scene(
+pass: Direct {
+    samplers: (default_color)
+    geometry: Screen { path: screen_rect vs: a.vert fs: a.frag }
+}
+)scene");
+    CHECK_FALSE(implicit.scene);
+    CHECK(implicit.error.find("'default_color' while writing it")
+        != std::string::npos);
+}
+
 TEST_CASE("Rezonality candidate resolution reports missing assets",
     "[rezonality][project][pipeline]")
 {

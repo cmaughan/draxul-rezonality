@@ -112,7 +112,9 @@ the diagnostic cap, and output-file handling with a recorded runner; keep one
 real-compiler case and the real-module edit/break/repair tests. On Windows the
 bundled compiler has a narrow, code-page argv, so it runs in the project
 directory with project-relative shader and include paths; macOS passes
-absolute UTF-8 paths unchanged.
+absolute UTF-8 paths unchanged. Scene parsing rejects inputs neither backend
+can honour (previous-frame `!surface` samplers, or a pass sampling its own
+target) before preparation, so the failure keeps the last good generation.
 
 ## Live-edit and failure-recovery checks
 

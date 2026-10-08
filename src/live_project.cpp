@@ -349,12 +349,30 @@ bool parse_uv_origin(const std::string& body, std::string_view owner,
     return false;
 }
 
+std::regex block_header(std::string_view kind)
+{
+    return std::regex("(^|[\\r\\n])\\s*" + std::string(kind)
+        + R"(\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{)");
+}
+
+// Name and offset of the opening brace of each block of kind.
+std::vector<std::pair<std::string, size_t>> named_block_offsets(
+    const std::string& source, std::string_view kind)
+{
+    std::vector<std::pair<std::string, size_t>> blocks;
+    const std::regex header = block_header(kind);
+    for (auto begin = std::sregex_iterator(source.begin(), source.end(), header);
+         begin != std::sregex_iterator(); ++begin)
+        blocks.emplace_back((*begin)[2].str(),
+            static_cast<size_t>(begin->position() + begin->length() - 1));
+    return blocks;
+}
+
 std::vector<std::pair<std::string, std::string>> named_blocks(
     const std::string& source, std::string_view kind)
 {
     std::vector<std::pair<std::string, std::string>> blocks;
-    const std::regex header("(^|[\\r\\n])\\s*" + std::string(kind)
-        + R"(\s*:\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{)");
+    const std::regex header = block_header(kind);
     for (auto begin = std::sregex_iterator(source.begin(), source.end(), header);
          begin != std::sregex_iterator(); ++begin)
     {
@@ -367,6 +385,57 @@ std::vector<std::pair<std::string, std::string>> named_blocks(
             source.substr(open + 1, close - open - 1));
     }
     return blocks;
+}
+
+// One-based line of a named block header, or 1 when it cannot be found.
+// Comment stripping preserves line breaks, so parsed text lines match the
+// source the user edits.
+int block_line(const std::string& parsed, std::string_view kind,
+    std::string_view name)
+{
+    for (const auto& [block, open] : named_block_offsets(parsed, kind))
+        if (block == name)
+            return 1 + static_cast<int>(std::count(
+                parsed.begin(), parsed.begin() + open, '\n'));
+    return 1;
+}
+
+// Both native backends bind a sampler to the surface's current texture and
+// keep no history copy. Reject inputs they cannot honour before preparation:
+// a previous-frame sampler would silently read the current target, and a
+// pass sampling its own target reads and writes one texture at once.
+// Sampling a surface written by an earlier pass remains valid.
+bool validate_pass_inputs(const std::string& parsed,
+    const SceneDescription& description, int& diagnostic_line,
+    std::string& error)
+{
+    for (const auto& pass : description.passes)
+    {
+        for (const auto& sampler : pass.samplers)
+        {
+            if (sampler.previous_frame)
+            {
+                error = "Pass '" + pass.name + "' samples '!" + sampler.surface
+                    + "' (previous frame), which Rezonality does not support; "
+                      "sample a surface written by an earlier pass instead";
+            }
+            else if (std::find(pass.targets.begin(), pass.targets.end(),
+                         sampler.surface)
+                != pass.targets.end())
+            {
+                error = "Pass '" + pass.name + "' samples '" + sampler.surface
+                    + "' while writing it as a target; write a separate "
+                      "surface and sample it in a later pass";
+            }
+            else
+            {
+                continue;
+            }
+            diagnostic_line = block_line(parsed, "pass", pass.name);
+            return false;
+        }
+    }
+    return true;
 }
 
 std::optional<SceneDescription> parse_scene_text_impl(
@@ -601,6 +670,8 @@ std::optional<SceneDescription> parse_scene_text_impl(
         diagnostic_line = 1;
         return std::nullopt;
     }
+    if (!validate_pass_inputs(parsed, description, diagnostic_line, error))
+        return std::nullopt;
     for (auto& pass : description.passes)
         for (const auto& target : pass.targets)
             if (target != "default_color" && target != "default_depth")
