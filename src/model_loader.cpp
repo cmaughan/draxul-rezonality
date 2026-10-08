@@ -3,6 +3,7 @@
 #include "image_loader.h"
 #include "path_utf8.h"
 
+#include <assimp/DefaultIOSystem.h>
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
 #include <assimp/postprocess.h>
@@ -49,7 +50,8 @@ void flip_texture_rows(ModelTexture& texture)
 bool load_texture(const aiScene& scene, const aiMaterial& material,
     aiTextureType type, const std::filesystem::path& model_path,
     std::array<uint8_t, 4> fallback, bool srgb, bool flip_y,
-    ModelTexture& result, std::string& error)
+    ModelTexture& result, std::string& error,
+    std::vector<std::filesystem::path>* dependencies)
 {
     aiString requested;
     if (material.GetTextureCount(type) == 0
@@ -101,6 +103,8 @@ bool load_texture(const aiScene& scene, const aiMaterial& material,
             = std::filesystem::u8path(requested.C_Str());
         if (texture_path.is_relative())
             texture_path = model_path.parent_path() / texture_path;
+        if (dependencies)
+            dependencies->push_back(texture_path);
         if (load_rgba8_image(texture_path, result.width, result.height,
                 result.pixels, error))
         {
@@ -157,10 +161,43 @@ void bake_basis(ModelVertex& vertex, const glm::vec3& scale)
         * handedness;
 }
 
+// Records every file Assimp opens or probes while importing, so callers can
+// tell when a model's external buffers or material libraries change.
+class RecordingIOSystem final : public Assimp::DefaultIOSystem
+{
+public:
+    explicit RecordingIOSystem(std::vector<std::filesystem::path>& files)
+        : files_(&files)
+    {
+    }
+
+    bool Exists(const char* file) const override
+    {
+        record(file);
+        return Assimp::DefaultIOSystem::Exists(file);
+    }
+
+    Assimp::IOStream* Open(const char* file, const char* mode) override
+    {
+        record(file);
+        return Assimp::DefaultIOSystem::Open(file, mode);
+    }
+
+private:
+    void record(const char* file) const
+    {
+        if (file && *file)
+            files_->push_back(std::filesystem::u8path(file).lexically_normal());
+    }
+
+    std::vector<std::filesystem::path>* files_;
+};
+
 } // namespace
 
 bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
-    bool flip_texture_y, ModelData& model, std::string& error)
+    bool flip_texture_y, ModelData& model, std::string& error,
+    std::vector<std::filesystem::path>* dependencies)
 {
     if (!std::isfinite(scale.x) || !std::isfinite(scale.y)
         || !std::isfinite(scale.z)
@@ -173,6 +210,12 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
         return false;
     }
     Assimp::Importer importer;
+    if (dependencies)
+    {
+        dependencies->push_back(path);
+        // The importer takes ownership of the handler.
+        importer.SetIOHandler(new RecordingIOSystem(*dependencies));
+    }
     constexpr unsigned flags = aiProcess_Triangulate
         | aiProcess_PreTransformVertices
         | aiProcess_CalcTangentSpace | aiProcess_GenSmoothNormals;
@@ -220,26 +263,31 @@ bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
             source.GetTextureCount(aiTextureType_BASE_COLOR)
                 ? aiTextureType_BASE_COLOR : aiTextureType_DIFFUSE,
             path, { 255, 255, 255, 255 }, true, flip_texture_y,
-            material.base_color, error)
+            material.base_color, error,
+            dependencies)
             || !load_texture(*scene, source,
             source.GetTextureCount(aiTextureType_NORMALS)
                 ? aiTextureType_NORMALS : aiTextureType_NORMAL_CAMERA,
             path, { 128, 128, 255, 255 }, false, flip_texture_y,
-            material.normal, error)
+            material.normal, error,
+            dependencies)
             || !load_texture(*scene, source,
             source.GetTextureCount(aiTextureType_METALNESS)
                 ? aiTextureType_METALNESS : aiTextureType_DIFFUSE_ROUGHNESS,
             path, { 255, 255, 255, 255 }, false, flip_texture_y,
-            material.metallic_roughness, error)
+            material.metallic_roughness, error,
+            dependencies)
             || !load_texture(*scene, source,
             source.GetTextureCount(aiTextureType_EMISSIVE)
                 ? aiTextureType_EMISSIVE : aiTextureType_EMISSION_COLOR,
             path, { 255, 255, 255, 255 }, true, flip_texture_y,
-            material.emissive, error)
+            material.emissive, error,
+            dependencies)
             || !load_texture(*scene, source,
             aiTextureType_AMBIENT_OCCLUSION, path,
             { 255, 255, 255, 255 }, false, flip_texture_y,
-            material.occlusion, error))
+            material.occlusion, error,
+            dependencies))
             return false;
         candidate.materials.push_back(std::move(material));
     }

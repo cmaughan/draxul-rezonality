@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1193,4 +1194,322 @@ pass: Main {
 
     std::error_code ec;
     fs::remove_all(output, ec);
+}
+
+namespace
+{
+
+// Gives a file a modification time well outside the racy-stamp window so
+// its stamp alone identifies its bytes. Distinct ages model distinct saves.
+void age_file(const fs::path& path, std::chrono::minutes age)
+{
+    fs::last_write_time(path, fs::file_time_type::clock::now() - age);
+}
+
+struct TreeSize
+{
+    uint64_t files = 0;
+    uint64_t bytes = 0;
+};
+
+TreeSize age_tree(const fs::path& root, std::chrono::minutes age)
+{
+    TreeSize size;
+    for (const auto& entry : fs::recursive_directory_iterator(root))
+    {
+        if (!entry.is_regular_file())
+            continue;
+        age_file(entry.path(), age);
+        ++size.files;
+        size.bytes += entry.file_size();
+    }
+    return size;
+}
+
+} // namespace
+
+TEST_CASE("Rezonality project watch rereads only changed files",
+    "[rezonality][project][watch]")
+{
+    ProjectFixture fixture("default");
+    const TreeSize tree = age_tree(fixture.path, std::chrono::minutes(60));
+    REQUIRE(tree.bytes > 100000);
+    rezonality::ProjectPipeline pipeline(
+        plugin_root(), options(fixture.path), accept_shader);
+
+    // The first scan establishes the index: the only full-content read.
+    const uint64_t initial = pipeline.fingerprint();
+    const auto indexed = pipeline.watch_counters();
+    CHECK(indexed.scans == 1);
+    CHECK(indexed.files_hashed == tree.files);
+    CHECK(indexed.bytes_hashed == tree.bytes);
+
+    // Idle polls stat files without reading them.
+    for (int poll = 0; poll < 5; ++poll)
+        CHECK(pipeline.fingerprint() == initial);
+    const auto idle = pipeline.watch_counters();
+    CHECK(idle.scans == 6);
+    CHECK(idle.files_seen == tree.files * 6);
+    CHECK(idle.files_hashed == indexed.files_hashed);
+    CHECK(idle.bytes_hashed == indexed.bytes_hashed);
+
+    // Touching a file rereads only that file and is not a content change.
+    const fs::path shader = fixture.path / "screen.frag";
+    const uint64_t shader_bytes = fs::file_size(shader);
+    age_file(shader, std::chrono::minutes(50));
+    CHECK(pipeline.fingerprint() == initial);
+    const auto touched = pipeline.watch_counters();
+    CHECK(touched.files_hashed == idle.files_hashed + 1);
+    CHECK(touched.bytes_hashed == idle.bytes_hashed + shader_bytes);
+
+    // A same-size edit with a new stamp is detected by rereading one file.
+    std::string original = read(shader);
+    std::string same_size = original;
+    REQUIRE_FALSE(same_size.empty());
+    same_size[0] = same_size[0] == '/' ? '#' : '/';
+    write(shader, same_size);
+    age_file(shader, std::chrono::minutes(40));
+    const uint64_t edited = pipeline.fingerprint();
+    CHECK(edited != initial);
+    const auto after_edit = pipeline.watch_counters();
+    CHECK(after_edit.files_hashed == touched.files_hashed + 1);
+    CHECK(after_edit.bytes_hashed == touched.bytes_hashed + shader_bytes);
+
+    // A rewrite inside the filesystem's timestamp granularity can keep the
+    // same size and stamp. A freshly written file stays racy, so it is reread
+    // until its stamp is old enough to identify its contents.
+    const fs::path include = fixture.path / "shared.glsl-include";
+    write(include, "// first save\n");
+    const auto racy_stamp = fs::last_write_time(include);
+    const uint64_t first_save = pipeline.fingerprint();
+    CHECK(first_save != edited);
+    write(include, "// other save\n");
+    fs::last_write_time(include, racy_stamp);
+    const uint64_t second_save = pipeline.fingerprint();
+    CHECK(second_save != first_save);
+    age_file(include, std::chrono::minutes(30));
+    CHECK(pipeline.fingerprint() == second_save);
+    const auto settled = pipeline.watch_counters();
+    CHECK(pipeline.fingerprint() == second_save);
+    CHECK(pipeline.watch_counters().bytes_hashed == settled.bytes_hashed);
+
+    // Deleting files drops them from the bounded index; restoring the
+    // original bytes restores the original fingerprint.
+    fs::remove(include);
+    write(shader, original);
+    age_file(shader, std::chrono::minutes(20));
+    const auto before_delete = pipeline.watch_counters();
+    CHECK(pipeline.fingerprint() == initial);
+    const auto after_delete = pipeline.watch_counters();
+    CHECK(after_delete.files_seen == before_delete.files_seen + tree.files);
+    CHECK(after_delete.bytes_hashed
+        == before_delete.bytes_hashed + shader_bytes);
+
+    // A failed scan reports an error and the next successful scan recovers.
+    const fs::path unavailable = fixture.path.string() + ".unavailable";
+    std::error_code error;
+    fs::remove_all(unavailable, error);
+    RestoreRenamedDirectory restore{ fixture.path, unavailable };
+    fs::rename(fixture.path, unavailable, error);
+    REQUIRE_FALSE(error);
+    CHECK_THROWS(pipeline.fingerprint());
+    fs::rename(unavailable, fixture.path, error);
+    REQUIRE_FALSE(error);
+    CHECK(pipeline.fingerprint() == initial);
+}
+
+TEST_CASE("Rezonality live watch is idle without content reads",
+    "[rezonality][project][watch]")
+{
+    ProjectFixture fixture("default");
+    const TreeSize tree = age_tree(fixture.path, std::chrono::minutes(60));
+    auto configured = options(fixture.path);
+    configured.compile_debounce_ms = 0;
+    rezonality::LiveProject live(plugin_root(), configured, [] {},
+        accept_shader);
+    live.start();
+    const auto initial = wait_for_result(live);
+    REQUIRE(initial);
+    REQUIRE(initial->build);
+
+    // Wait for several 100 ms polls; none may reread unchanged contents.
+    const auto baseline = live.watch_counters();
+    CHECK(baseline.bytes_hashed == tree.bytes);
+    const auto deadline
+        = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (live.watch_counters().scans < baseline.scans + 4
+        && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto idle = live.watch_counters();
+    CHECK(idle.scans >= baseline.scans + 4);
+    CHECK(idle.files_hashed == baseline.files_hashed);
+    CHECK(idle.bytes_hashed == baseline.bytes_hashed);
+
+    // A shader-only edit is still detected and rebuilds without decoding
+    // the unchanged image and model again.
+    const auto decoded = live.asset_counters();
+    CHECK(decoded.image_decodes == 1);
+    CHECK(decoded.model_decodes == 1);
+    const fs::path shader = fixture.path / "vklive-original" / "geom.frag";
+    write(shader, read(shader) + "\n// edited\n");
+    const auto edited = wait_for_result(live);
+    REQUIRE(edited);
+    REQUIRE(edited->build);
+    CHECK(edited->generation > initial->generation);
+    const auto reused = live.asset_counters();
+    CHECK(reused.image_decodes == 1);
+    CHECK(reused.model_decodes == 1);
+    CHECK(reused.image_reuses == 1);
+    CHECK(reused.model_reuses == 1);
+    live.stop();
+}
+
+TEST_CASE("Rezonality reuses decoded assets across shader-only candidates",
+    "[rezonality][project][assets]")
+{
+    ProjectFixture fixture("default");
+    const fs::path box_source = plugin_root() / "examples" / "ray_tracer";
+    fs::copy_file(box_source / "cornell-box.obj",
+        fixture.path / "cornell-box.obj");
+    fs::copy_file(box_source / "cornell-box.mtl",
+        fixture.path / "cornell-box.mtl");
+    const fs::path scenegraph = fixture.path / "assets.scenegraph";
+    const std::string both_models = R"scene(
+surface: Noise { path: noise.png }
+surface: Color { scale: (1, 1, 1) format: default_color }
+surface: Depth { scale: (1, 1, 1) format: default_depth }
+model: sphere { path: vklive-original/sphere.gltf }
+model: box { path: cornell-box.obj }
+pass: Sphere {
+    samplers: (Noise)
+    targets: (Color, Depth)
+    geometry: shape {
+        model: sphere
+        vs: vklive-original/geom.vert
+        fs: vklive-original/geom.frag
+    }
+}
+pass: Box {
+    targets: (Color, Depth)
+    geometry: shape {
+        model: box
+        vs: vklive-original/geom.vert
+        fs: vklive-original/geom.frag
+    }
+}
+)scene";
+    write(scenegraph, both_models);
+    age_tree(fixture.path, std::chrono::minutes(60));
+    auto configured = options(fixture.path);
+    configured.scenegraph = "assets.scenegraph";
+    rezonality::ProjectPipeline pipeline(
+        plugin_root(), configured, accept_shader);
+
+    const auto box_color = [](const rezonality::BuildResult& result) {
+        const auto& materials = result.build->models[1]->materials;
+        const auto green = std::find_if(materials.begin(), materials.end(),
+            [](const auto& material) {
+                return material.name == "DarkGreen";
+            });
+        REQUIRE(green != materials.end());
+        return green->base_color_factor.g;
+    };
+    const auto noise_surface = [](const rezonality::BuildResult& result)
+        -> const rezonality::ShaderBuild::Surface& {
+        const auto& surfaces = result.build->surfaces;
+        const auto found = std::find_if(surfaces.begin(), surfaces.end(),
+            [](const auto& surface) { return surface.name == "Noise"; });
+        REQUIRE(found != surfaces.end());
+        return *found;
+    };
+
+    const auto first = pipeline.build(1);
+    REQUIRE(first.build);
+    REQUIRE(first.build->models.size() == 2);
+    auto counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 2);
+    CHECK(counters.image_decodes == 1);
+    CHECK(pipeline.cached_assets() == 3);
+    CHECK(std::abs(box_color(first) - 0.32f) < 1e-4f);
+
+    // Shader-only edit: every asset is reused and candidates stay
+    // independent copies of identical decoded data.
+    const fs::path shader = fixture.path / "vklive-original" / "geom.frag";
+    write(shader, read(shader) + "\n// shader edit\n");
+    const auto shader_edit = pipeline.build(2);
+    REQUIRE(shader_edit.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 2);
+    CHECK(counters.image_decodes == 1);
+    CHECK(counters.model_reuses == 2);
+    CHECK(counters.image_reuses == 1);
+    const auto& first_noise = noise_surface(first);
+    const auto& reused_noise = noise_surface(shader_edit);
+    CHECK(reused_noise.image_pixels == first_noise.image_pixels);
+    CHECK(reused_noise.image_pixels.data() != first_noise.image_pixels.data());
+    // Reused models alias the earlier candidate's immutable import.
+    CHECK(shader_edit.build->models[0].shared()
+        == first.build->models[0].shared());
+    CHECK(shader_edit.build->models[1].shared()
+        == first.build->models[1].shared());
+
+    // A same-size edit to a file only the model references (its material
+    // library) re-imports that model alone.
+    const fs::path library = fixture.path / "cornell-box.mtl";
+    std::string material_text = read(library);
+    const size_t green = material_text.find("Kd 0.0 0.32 0.0");
+    REQUIRE(green != std::string::npos);
+    material_text.replace(green, 15, "Kd 0.0 0.33 0.0");
+    write(library, material_text);
+    age_file(library, std::chrono::minutes(50));
+    const auto material_edit = pipeline.build(3);
+    REQUIRE(material_edit.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 3);
+    CHECK(counters.image_decodes == 1);
+    CHECK(std::abs(box_color(material_edit) - 0.33f) < 1e-4f);
+
+    // Break the image: the candidate fails while decoded models stay cached,
+    // and repair decodes only the repaired image.
+    const fs::path noise = fixture.path / "noise.png";
+    const std::string noise_bytes = read(noise);
+    write(noise, "not an image");
+    age_file(noise, std::chrono::minutes(40));
+    const auto broken = pipeline.build(4);
+    CHECK_FALSE(broken.build);
+    CHECK(broken.diagnostic_path == noise);
+    write(noise, noise_bytes);
+    age_file(noise, std::chrono::minutes(30));
+    const auto repaired = pipeline.build(5);
+    REQUIRE(repaired.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.model_decodes == 3);
+    CHECK(counters.image_decodes == 3);
+    CHECK(noise_surface(repaired).image_pixels == first_noise.image_pixels);
+
+    // A decode whose input is still racy is not retained, so a rewrite
+    // within the timestamp granularity cannot reuse stale pixels.
+    write(noise, noise_bytes);
+    const auto racy = pipeline.build(6);
+    REQUIRE(racy.build);
+    const auto racy_again = pipeline.build(7);
+    REQUIRE(racy_again.build);
+    counters = pipeline.asset_counters();
+    CHECK(counters.image_decodes == 5);
+    age_file(noise, std::chrono::minutes(20));
+
+    // The cache is bounded by the latest complete scene.
+    std::string one_model = both_models;
+    const size_t sphere_pass = one_model.find("pass: Sphere");
+    const size_t box_pass = one_model.find("pass: Box");
+    one_model.erase(sphere_pass, box_pass - sphere_pass);
+    one_model.erase(one_model.find("model: sphere"),
+        one_model.find("model: box") - one_model.find("model: sphere"));
+    write(scenegraph, one_model);
+    const auto smaller = pipeline.build(8);
+    REQUIRE(smaller.build);
+    CHECK(smaller.build->models.size() == 1);
+    CHECK(pipeline.cached_assets() == 2);
 }

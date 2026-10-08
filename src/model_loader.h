@@ -4,7 +4,9 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rezonality
@@ -64,7 +66,52 @@ struct ModelData
     std::vector<ModelMaterial> materials;
 };
 
+// One immutable decoded model shared by every candidate build that uses it
+// and by the project's decoded-asset cache, so reusing an import never copies
+// its vertices or texture pixels. Converts to const ModelData& so renderers
+// read it exactly like an owned model.
+class SharedModel
+{
+public:
+    SharedModel()
+        : data_(std::make_shared<const ModelData>())
+    {
+    }
+    explicit SharedModel(ModelData model)
+        : data_(std::make_shared<const ModelData>(std::move(model)))
+    {
+    }
+    explicit SharedModel(std::shared_ptr<const ModelData> data)
+        : data_(data ? std::move(data) : std::make_shared<const ModelData>())
+    {
+    }
+
+    [[nodiscard]] const ModelData& get() const
+    {
+        return *data_;
+    }
+    operator const ModelData&() const
+    {
+        return *data_;
+    }
+    const ModelData* operator->() const
+    {
+        return data_.get();
+    }
+    [[nodiscard]] const std::shared_ptr<const ModelData>& shared() const
+    {
+        return data_;
+    }
+
+private:
+    std::shared_ptr<const ModelData> data_;
+};
+
+// When dependencies is non-null, every file the import opened or probed
+// (including the model itself, external buffers, material libraries, and
+// texture files) is appended so callers can detect changed inputs.
 bool load_model(const std::filesystem::path& path, const glm::vec3& scale,
-    bool flip_texture_y, ModelData& model, std::string& error);
+    bool flip_texture_y, ModelData& model, std::string& error,
+    std::vector<std::filesystem::path>* dependencies = nullptr);
 
 } // namespace rezonality

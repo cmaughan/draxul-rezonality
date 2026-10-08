@@ -47,20 +47,21 @@ const ShaderBuild* RuntimeController::desired(
 
 RuntimeTransition RuntimeController::activate_prepared()
 {
-    const ShaderBuild* selected = pending_build_ ? &*pending_build_
-                                                  : active_build_ ? &*active_build_
-                                                                  : nullptr;
-    if (!selected)
+    if (!pending_build_ && !active_build_)
         return transition();
 
-    // Copy before mutating either optional. This also keeps resize recreation
-    // valid when the selected value already belongs to active_build_.
-    ShaderBuild activated = *selected;
-    const size_t pass_count = activated.passes.size();
-    const size_t surface_count = activated.surfaces.size();
-    active_generation_ = activated.generation;
-    active_build_ = std::move(activated);
-    pending_build_.reset();
+    // A prepared pending candidate transfers ownership of its immutable
+    // payloads (shaders, models, pixels) into active storage. Recreating the
+    // already-active build after a resize leaves it in place. Neither path
+    // copies the build; the backend has already consumed it in prepare().
+    if (pending_build_)
+    {
+        active_build_ = std::move(pending_build_);
+        pending_build_.reset();
+    }
+    const size_t pass_count = active_build_->passes.size();
+    const size_t surface_count = active_build_->surfaces.size();
+    active_generation_ = active_build_->generation;
     last_success_unix_ms_ = unix_milliseconds();
     status_ = "live g" + std::to_string(active_generation_) + " | "
         + std::to_string(pass_count) + " passes | "

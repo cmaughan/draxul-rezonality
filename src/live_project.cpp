@@ -28,25 +28,6 @@ namespace
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
 
-constexpr uint64_t kFnvOffset = 1469598103934665603ull;
-constexpr uint64_t kFnvPrime = 1099511628211ull;
-
-uint64_t hash_bytes(uint64_t hash, const void* data, size_t size)
-{
-    const auto* bytes = static_cast<const unsigned char*>(data);
-    for (size_t i = 0; i < size; ++i)
-    {
-        hash ^= bytes[i];
-        hash *= kFnvPrime;
-    }
-    return hash;
-}
-
-uint64_t hash_string(uint64_t hash, std::string_view value)
-{
-    return hash_bytes(hash, value.data(), value.size());
-}
-
 std::optional<std::string> read_text(const fs::path& path)
 {
     std::ifstream input(path, std::ios::binary);
@@ -940,51 +921,14 @@ std::optional<BuildResult> LiveProject::take_result()
 
 uint64_t ProjectPipeline::fingerprint() const
 {
-    uint64_t hash = kFnvOffset;
-    std::error_code ec;
-    fs::recursive_directory_iterator iterator(options_.project_path,
-        fs::directory_options::skip_permission_denied, ec);
-    if (ec)
-        throw std::runtime_error("could not scan Rezonality project: "
-            + ec.message());
-    std::vector<fs::path> files;
-    for (; iterator != fs::recursive_directory_iterator(); iterator.increment(ec))
-    {
-        if (ec)
-            throw std::runtime_error("could not scan Rezonality project: "
-                + ec.message());
-        const auto& entry = *iterator;
-        // Shader includes have no required suffix. Ignore only repository
-        // metadata, not unrecognized files that a shader may include.
-        if (entry.is_directory() && entry.path().filename() == ".git")
-        {
-            iterator.disable_recursion_pending();
-            continue;
-        }
-        std::error_code entry_error;
-        if (entry.is_regular_file(entry_error))
-            files.push_back(entry.path());
-        else if (entry_error)
-            throw std::runtime_error("could not inspect Rezonality project file: "
-                + entry_error.message());
-    }
-    if (ec)
-        throw std::runtime_error("could not scan Rezonality project: "
-            + ec.message());
-    std::sort(files.begin(), files.end());
-    for (const auto& file : files)
-    {
-        hash = hash_string(hash, generic_path_utf8(file));
-        if (const auto contents = read_text(file))
-            hash = hash_string(hash, *contents);
-    }
-    return hash;
+    return file_index_.fingerprint(options_.project_path);
 }
 
 BuildResult build_candidate(const fs::path& plugin_directory,
     const ProjectOptions& options, SceneDescription scene,
     uint64_t generation, const fs::path& output_directory,
-    CompileShaderOperation compile_shader_operation)
+    CompileShaderOperation compile_shader_operation,
+    DecodedAssetCache* asset_cache)
 {
     BuildResult result;
     result.generation = generation;
@@ -1015,12 +959,36 @@ BuildResult build_candidate(const fs::path& plugin_directory,
     candidate.scenegraph_path = scene.scenegraph;
     candidate.surfaces = std::move(scene.surfaces);
     candidate.passes = std::move(scene.passes);
+    // Retire cache entries this candidate no longer references on every
+    // exit, keeping the previous complete scene when resolution stops early.
+    struct AssetResolution
+    {
+        DecodedAssetCache* cache = nullptr;
+        bool complete = false;
+        ~AssetResolution()
+        {
+            if (cache)
+                cache->finish_build(complete);
+        }
+    } asset_resolution{ asset_cache };
     candidate.models.reserve(scene.models.size());
     for (const SceneModelSource& source : scene.models)
     {
-        ModelData model;
-        if (!load_model(source.path, source.scale, source.flip_texture_y,
-                model, result.error))
+        SharedModel model;
+        bool loaded = false;
+        if (asset_cache)
+        {
+            loaded = asset_cache->load_model(source.path, source.scale,
+                source.flip_texture_y, model, result.error);
+        }
+        else
+        {
+            ModelData decoded;
+            loaded = load_model(source.path, source.scale,
+                source.flip_texture_y, decoded, result.error);
+            model = SharedModel(std::move(decoded));
+        }
+        if (!loaded)
         {
             result.diagnostic_path = source.path;
             result.diagnostic_line = 1;
@@ -1067,12 +1035,27 @@ BuildResult build_candidate(const fs::path& plugin_directory,
         if (surface.path.empty())
             continue;
         const bool hdr = surface.path.extension() == ".hdr";
-        const bool loaded = hdr
-            ? load_rgba32f_image(surface.path, surface.image_width,
-                  surface.image_height, surface.image_float_pixels,
-                  result.error)
-            : load_rgba8_image(surface.path, surface.image_width,
-                  surface.image_height, surface.image_pixels, result.error);
+        bool loaded = false;
+        if (asset_cache)
+        {
+            loaded = hdr
+                ? asset_cache->load_rgba32f_image(surface.path,
+                      surface.image_width, surface.image_height,
+                      surface.image_float_pixels, result.error)
+                : asset_cache->load_rgba8_image(surface.path,
+                      surface.image_width, surface.image_height,
+                      surface.image_pixels, result.error);
+        }
+        else
+        {
+            loaded = hdr
+                ? load_rgba32f_image(surface.path, surface.image_width,
+                      surface.image_height, surface.image_float_pixels,
+                      result.error)
+                : load_rgba8_image(surface.path, surface.image_width,
+                      surface.image_height, surface.image_pixels,
+                      result.error);
+        }
         if (!loaded)
         {
             result.diagnostic_path = surface.path;
@@ -1091,6 +1074,7 @@ BuildResult build_candidate(const fs::path& plugin_directory,
         }
         surface.format = storage_format;
     }
+    asset_resolution.complete = true;
     for (size_t index = 0; index < candidate.passes.size(); ++index)
     {
         auto& pass = candidate.passes[index];
@@ -1219,7 +1203,7 @@ BuildResult ProjectPipeline::build(uint64_t generation) const
         / std::to_string(reinterpret_cast<uintptr_t>(this));
     return build_candidate(plugin_directory_, options_,
         std::move(*parsed.scene), generation, output_directory,
-        compile_shader_);
+        compile_shader_, &asset_cache_);
 }
 
 void LiveProject::run(std::stop_token stop_token)

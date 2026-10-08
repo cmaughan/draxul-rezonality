@@ -81,6 +81,8 @@ endif()
 set(_rezonality_project_sources
     src/camera.cpp
     src/camera.h
+    src/decoded_asset_cache.cpp
+    src/decoded_asset_cache.h
     src/diagnostics.cpp
     src/diagnostics.h
     src/image_loader.cpp
@@ -89,6 +91,8 @@ set(_rezonality_project_sources
     src/live_project.h
     src/model_loader.cpp
     src/model_loader.h
+    src/project_file_index.cpp
+    src/project_file_index.h
     src/shader_compiler.cpp
     src/shader_compiler.h)
 

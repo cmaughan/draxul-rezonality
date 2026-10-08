@@ -2,8 +2,10 @@
 
 #include "audio_types.h"
 #include "camera.h"
+#include "decoded_asset_cache.h"
 #include "diagnostics.h"
 #include "model_loader.h"
+#include "project_file_index.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -93,7 +95,7 @@ struct ShaderBuild
     std::filesystem::path scenegraph_path;
     std::vector<std::filesystem::path> source_files;
     std::vector<Surface> surfaces;
-    std::vector<ModelData> models;
+    std::vector<SharedModel> models;
     std::vector<Pass> passes;
 };
 
@@ -146,13 +148,16 @@ using CompileShaderOperation = std::function<bool(
     const std::filesystem::path& scenegraph,
     std::string_view source);
 
+// asset_cache, when supplied, reuses decoded models and images whose inputs
+// are unchanged since an earlier candidate; without it every asset decodes.
 [[nodiscard]] BuildResult build_candidate(
     const std::filesystem::path& plugin_directory,
     const ProjectOptions& options,
     SceneDescription scene,
     uint64_t generation,
     const std::filesystem::path& output_directory,
-    CompileShaderOperation compile_shader = {});
+    CompileShaderOperation compile_shader = {},
+    DecodedAssetCache* asset_cache = nullptr);
 
 // Synchronous, CPU-only project construction seam. The live watcher owns one
 // pipeline and only schedules/publishes its immutable results.
@@ -164,6 +169,9 @@ public:
     ProjectPipeline(std::filesystem::path plugin_directory,
         ProjectOptions options, CompileShader compile_shader = {});
 
+    // build() and fingerprint() are logically const: they only refresh the
+    // pipeline's private decoded-asset cache and file index. Both must be
+    // called from the single thread that owns the pipeline.
     [[nodiscard]] BuildResult build(uint64_t generation) const;
     [[nodiscard]] uint64_t fingerprint() const;
     [[nodiscard]] const ProjectOptions& options() const
@@ -171,10 +179,27 @@ public:
         return options_;
     }
 
+    // Test/diagnostic observation of idle watch and asset-reuse cost. Safe to
+    // read from any thread.
+    [[nodiscard]] ProjectWatchCounters watch_counters() const
+    {
+        return file_index_.counters();
+    }
+    [[nodiscard]] DecodedAssetCounters asset_counters() const
+    {
+        return asset_cache_.counters();
+    }
+    [[nodiscard]] size_t cached_assets() const
+    {
+        return asset_cache_.cached_assets();
+    }
+
 private:
     std::filesystem::path plugin_directory_;
     ProjectOptions options_;
     CompileShader compile_shader_;
+    mutable ProjectFileIndex file_index_;
+    mutable DecodedAssetCache asset_cache_;
 };
 
 class LiveProject
@@ -198,6 +223,14 @@ public:
     const ProjectOptions& options() const
     {
         return pipeline_.options();
+    }
+    [[nodiscard]] ProjectWatchCounters watch_counters() const
+    {
+        return pipeline_.watch_counters();
+    }
+    [[nodiscard]] DecodedAssetCounters asset_counters() const
+    {
+        return pipeline_.asset_counters();
     }
 
 private:
