@@ -1069,19 +1069,42 @@ bool create_pass_render_target(VulkanGeneration& generation,
     subpass.colorAttachmentCount = static_cast<uint32_t>(colors.size());
     subpass.pColorAttachments = colors.data();
     subpass.pDepthStencilAttachment = depth ? &*depth : nullptr;
+    // Surfaces are shared between successive passes and frames: a pass may
+    // sample what an earlier pass wrote, load and write the same color target
+    // again, or load and test a depth image another pass cleared and wrote.
+    // The external dependencies therefore order earlier fragment sampling,
+    // color-attachment writes, and depth writes (depth load/clear ops run in
+    // the early fragment-test stage; depth stores in the late stage) before
+    // this pass's attachment loads, tests, and writes, and publish this
+    // pass's writes to later sampling and attachment use.
+    constexpr VkPipelineStageFlags kDepthStages
+        = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+        | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    constexpr VkPipelineStageFlags kAttachmentStages
+        = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | kDepthStages;
+    constexpr VkAccessFlags kAttachmentWrites
+        = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    constexpr VkAccessFlags kAttachmentAccess = kAttachmentWrites
+        | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+        | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
     VkSubpassDependency dependencies[2]{};
     dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[0].dstSubpass = 0;
-    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[0].srcStageMask
+        = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | kAttachmentStages;
+    dependencies[0].dstStageMask = kAttachmentStages;
+    dependencies[0].srcAccessMask
+        = VK_ACCESS_SHADER_READ_BIT | kAttachmentWrites;
+    dependencies[0].dstAccessMask = kAttachmentAccess;
     dependencies[1].srcSubpass = 0;
     dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[1].srcStageMask = kAttachmentStages;
+    dependencies[1].dstStageMask
+        = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | kAttachmentStages;
+    dependencies[1].srcAccessMask = kAttachmentWrites;
+    dependencies[1].dstAccessMask
+        = VK_ACCESS_SHADER_READ_BIT | kAttachmentAccess;
     VkRenderPassCreateInfo render_pass{
         VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
     };
@@ -1900,11 +1923,15 @@ void initialize_generation_images(
         before.subresourceRange = {
             surface.aspect, 0, 1, 0, 1
         };
+        // A depth surface's first pass may clear it or load and test it, so
+        // its layout transition must precede both depth-test stages.
         before.dstAccessMask = depth
-            ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+            ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
             : VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                    | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
                   : VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &before);
         if (!depth)
