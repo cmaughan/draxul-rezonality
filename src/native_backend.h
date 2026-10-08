@@ -2,6 +2,7 @@
 
 #include "audio_types.h"
 #include "camera.h"
+#include "generation_reuse.h"
 #include "runtime_controller.h"
 
 #include <draxul/plugin_api.h>
@@ -38,9 +39,13 @@ public:
 #endif
 
     [[nodiscard]] bool active_compatible() const;
+    // Prepares `build` for the bound frame. A viewport-only change of the
+    // active source build keeps its models, static images, and programs and
+    // recreates only viewport-sized resources (see GenerationReuse).
     BackendPreparation prepare(const ShaderBuild& build);
     void activate_prepared();
     void retire_completed_slot(uint32_t frame_index);
+    [[nodiscard]] BackendResourceStats resource_stats() const;
 
 private:
     struct Impl;

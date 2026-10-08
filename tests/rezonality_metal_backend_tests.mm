@@ -139,3 +139,167 @@ TEST_CASE("Rezonality Metal accepts the color-target limit and rejects more",
     CHECK(over_limit.error.find("9 color targets") != std::string::npos);
     CHECK(over_limit.error.find("at most 8") != std::string::npos);
 }
+
+namespace
+{
+
+// A borrowed Draxul Metal frame with its own drawable and continuation pass.
+struct MetalTestFrame
+{
+    MetalTestFrame(id<MTLDevice> device, int width, int height,
+        MTLPixelFormat format)
+    {
+        MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:format
+                                         width:static_cast<NSUInteger>(width)
+                                        height:static_cast<NSUInteger>(height)
+                                     mipmapped:NO];
+        descriptor.usage = MTLTextureUsageRenderTarget;
+        descriptor.storageMode = MTLStorageModePrivate;
+        drawable = [device newTextureWithDescriptor:descriptor];
+        REQUIRE(drawable != nil);
+        continuation = [MTLRenderPassDescriptor renderPassDescriptor];
+        continuation.colorAttachments[0].texture = drawable;
+        continuation.colorAttachments[0].loadAction = MTLLoadActionClear;
+        continuation.colorAttachments[0].storeAction = MTLStoreActionStore;
+        frame.struct_size = sizeof(frame);
+        frame.device = (__bridge void*)device;
+        frame.drawable_texture = (__bridge void*)drawable;
+        frame.continuation_render_pass_descriptor
+            = (__bridge void*)continuation;
+        frame.buffered_frame_count = 2;
+        frame.framebuffer_width = width;
+        frame.framebuffer_height = height;
+        frame.viewport = { sizeof(DraxulPluginViewportV2), 0, 0, width,
+            height, 1.0f, 96.0f };
+    }
+
+    id<MTLTexture> drawable = nil;
+    MTLRenderPassDescriptor* continuation = nil;
+    DraxulPluginMetalFrameV2 frame{};
+};
+
+void record_and_wait(rezonality::NativeBackend& backend,
+    id<MTLCommandQueue> queue, MetalTestFrame& test_frame,
+    uint32_t frame_index)
+{
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    REQUIRE(command != nil);
+    test_frame.frame.command_buffer = (__bridge void*)command;
+    test_frame.frame.frame_index = frame_index;
+    const auto result = backend.record(test_frame.frame, nullptr, true);
+    test_frame.frame.command_buffer = nullptr;
+    CHECK(result.ok);
+    [command commit];
+    [command waitUntilCompleted];
+    INFO((command.error ? command.error.localizedDescription.UTF8String
+                        : "no command-buffer error"));
+    CHECK(command.status == MTLCommandBufferStatusCompleted);
+}
+
+} // namespace
+
+TEST_CASE("Rezonality Metal resize keeps models, images, and pipelines",
+    "[rezonality][metal][resize]")
+{
+    rezonality::ProjectOptions options;
+    options.project_path = plugin_root() / "examples" / "pbr_robot";
+    options.scenegraph = "default.scenegraph";
+    const rezonality::ProjectPipeline pipeline(plugin_root(), options);
+    const auto built = pipeline.build(1);
+    INFO(built.error);
+    REQUIRE(built.build);
+    const auto& build = *built.build;
+    REQUIRE(build.models.size() == 1);
+    size_t static_images = 0;
+    for (size_t index = 0; index < build.surfaces.size(); ++index)
+        if (rezonality::surface_is_viewport_independent(build, index))
+            ++static_images;
+    REQUIRE(static_images == 1);
+    const size_t viewport_surfaces = build.surfaces.size() - static_images;
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    REQUIRE(device != nil);
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    REQUIRE(queue != nil);
+    rezonality::Camera camera;
+    rezonality::NativeBackend backend;
+
+    MetalTestFrame initial(device, 64, 64, MTLPixelFormatBGRA8Unorm);
+    backend.bind_frame(initial.frame, 0.0, camera);
+    REQUIRE(backend.prepare(build).ready);
+    backend.activate_prepared();
+    const auto first = backend.resource_stats();
+    CHECK(first.last_reuse == rezonality::GenerationReuse::Rebuild);
+    CHECK(first.generations_prepared == 1);
+    CHECK(first.models_created == 1);
+    CHECK(first.programs_created == build.passes.size());
+    CHECK(first.surfaces_created == build.surfaces.size());
+    CHECK(first.asset_upload_bytes > 0);
+    CHECK(backend.active_compatible());
+    record_and_wait(backend, queue, initial, 0);
+    // Metal uploads static pixels with replaceRegion and keeps no
+    // plugin-owned staging buffers.
+    CHECK(backend.resource_stats().retained_upload_staging_bytes == 0);
+
+    // Size-only change: only viewport-sized surfaces are recreated.
+    MetalTestFrame resized(device, 96, 80, MTLPixelFormatBGRA8Unorm);
+    backend.bind_frame(resized.frame, 0.0, camera);
+    CHECK_FALSE(backend.active_compatible());
+    const auto resize_preparation = backend.prepare(build);
+    INFO(resize_preparation.error);
+    REQUIRE(resize_preparation.ready);
+    backend.activate_prepared();
+    const auto second = backend.resource_stats();
+    CHECK(second.last_reuse == rezonality::GenerationReuse::ResizeTargets);
+    CHECK(second.generations_prepared == 2);
+    CHECK(second.models_created == first.models_created);
+    CHECK(second.models_reused == 1);
+    CHECK(second.programs_created == first.programs_created);
+    CHECK(second.programs_reused == build.passes.size());
+    CHECK(second.surfaces_created
+        == first.surfaces_created + viewport_surfaces);
+    CHECK(second.surfaces_reused == static_images);
+    CHECK(second.asset_upload_bytes == first.asset_upload_bytes);
+    CHECK(backend.active_compatible());
+    record_and_wait(backend, queue, resized, 1);
+    backend.retire_completed_slot(0);
+    backend.retire_completed_slot(1);
+
+    // A size beyond the device limit is rejected without losing the active
+    // generation or its shared assets.
+    MetalTestFrame oversized(device, 64, 64, MTLPixelFormatBGRA8Unorm);
+    oversized.frame.viewport.width = 40000;
+    backend.bind_frame(oversized.frame, 0.0, camera);
+    const auto rejected = backend.prepare(build);
+    CHECK_FALSE(rejected.ready);
+    CHECK(rejected.error.find("exceeds the device 2D texture limit")
+        != std::string::npos);
+    backend.bind_frame(resized.frame, 0.0, camera);
+    CHECK(backend.active_compatible());
+    record_and_wait(backend, queue, resized, 0);
+
+    // A new drawable format keeps source assets but rebuilds pipelines.
+    MetalTestFrame reformatted(device, 96, 80, MTLPixelFormatRGBA16Float);
+    backend.bind_frame(reformatted.frame, 0.0, camera);
+    CHECK_FALSE(backend.active_compatible());
+    REQUIRE(backend.prepare(build).ready);
+    backend.activate_prepared();
+    const auto third = backend.resource_stats();
+    CHECK(third.last_reuse == rezonality::GenerationReuse::ReuseAssets);
+    CHECK(third.models_created == first.models_created);
+    CHECK(third.programs_created
+        == first.programs_created + build.passes.size());
+    CHECK(third.asset_upload_bytes == first.asset_upload_bytes);
+    record_and_wait(backend, queue, reformatted, 1);
+
+    // A different source build never shares native resources.
+    auto rebuilt = build;
+    rebuilt.generation = build.generation + 1;
+    REQUIRE(backend.prepare(rebuilt).ready);
+    backend.activate_prepared();
+    const auto fourth = backend.resource_stats();
+    CHECK(fourth.last_reuse == rezonality::GenerationReuse::Rebuild);
+    CHECK(fourth.models_created == first.models_created + 1);
+    CHECK(fourth.asset_upload_bytes == 2 * first.asset_upload_bytes);
+}

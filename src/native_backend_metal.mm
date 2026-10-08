@@ -84,6 +84,7 @@ struct MetalGeneration
     id<MTLSamplerState> repeat_sampler = nil;
     id<MTLDepthStencilState> model_depth_state = nil;
     MTLPixelFormat format = MTLPixelFormatInvalid;
+    id<MTLDevice> device = nil;
     uint32_t width = 0;
     uint32_t height = 0;
     uint64_t source_generation = 0;
@@ -327,10 +328,17 @@ bool create_metal_acceleration_resources(id<MTLDevice> device,
     return false;
 }
 
+// Prepares a generation for `build`. When `reuse` is the active generation
+// of the same source build on the same device, its models and static images
+// are shared (Metal objects are reference counted, so the older generation
+// keeps them alive until its frame slots retire); with `reuse_programs`
+// (same drawable pixel format) its compiled pass pipelines are shared too, so
+// only viewport-sized surfaces and the uniform buffer are created.
 std::optional<MetalGeneration> create_generation(BackendState& backend,
     const ShaderBuild& build, const DraxulPluginMetalFrameV2& frame,
     double animation_seconds, const rezonality::Camera& camera,
-    std::string& error)
+    const MetalGeneration* reuse, bool reuse_programs,
+    rezonality::BackendResourceStats& stats, std::string& error)
 {
     id<MTLDevice> device = (__bridge id<MTLDevice>)frame.device;
     id<MTLTexture> target
@@ -388,7 +396,16 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     model_vertices.layouts[0].stepFunction
         = MTLVertexStepFunctionPerVertex;
 
+    if (reuse
+        && (reuse->surfaces.size() != build.surfaces.size()
+            || reuse->models.size() != build.models.size()
+            || reuse->passes.size() != build.passes.size()))
+    {
+        reuse = nullptr;
+        reuse_programs = false;
+    }
     MetalGeneration generation;
+    generation.device = device;
     generation.ray_project = std::any_of(build.passes.begin(),
         build.passes.end(), [](const auto& pass) {
             return pass.ray_trace;
@@ -447,8 +464,18 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
             || [device supportsFamily:MTLGPUFamilyMac2]
         ? 16384u
         : 8192u;
-    for (const auto& source : build.surfaces)
+    for (size_t surface_index = 0; surface_index < build.surfaces.size();
+         ++surface_index)
     {
+        const auto& source = build.surfaces[surface_index];
+        if (reuse && reuse->surfaces[surface_index].name == source.name
+            && rezonality::surface_is_viewport_independent(
+                build, surface_index))
+        {
+            generation.surfaces.push_back(reuse->surfaces[surface_index]);
+            ++stats.surfaces_reused;
+            continue;
+        }
         rezonality::SurfaceDimensions dimensions;
         if (!rezonality::checked_surface_dimensions(source,
                 generation.width, generation.height,
@@ -516,13 +543,28 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                                bytesPerRow:source.image_width * bytes_per_pixel];
         }
         generation.surfaces.push_back(surface);
+        ++stats.surfaces_created;
+        stats.asset_upload_bytes += rezonality::surface_upload_bytes(source);
     }
-    for (const auto& source_model : build.models)
+    for (size_t model_index = 0; model_index < build.models.size();
+         ++model_index)
     {
+        if (reuse)
+        {
+            // Shares buffers, textures, and acceleration structures; the
+            // built flag travels with the shared structures.
+            generation.models.push_back(reuse->models[model_index]);
+            ++stats.models_reused;
+            continue;
+        }
+        const auto& source_model = build.models[model_index];
         auto model = create_metal_model(device, source_model, error);
         if (!model)
             return std::nullopt;
         generation.models.push_back(std::move(*model));
+        ++stats.models_created;
+        stats.asset_upload_bytes
+            += rezonality::model_upload_bytes(source_model);
     }
     const auto find_surface = [&generation](std::string_view name)
         -> std::optional<size_t> {
@@ -534,6 +576,15 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
     for (size_t index = 0; index < build.passes.size(); ++index)
     {
         const auto& source = build.passes[index];
+        if (reuse_programs)
+        {
+            // Metal passes hold only surface indices and size-independent
+            // pipeline states; render pass descriptors are built per frame
+            // from the generation's own (resized) surfaces.
+            generation.passes.push_back(reuse->passes[index]);
+            ++stats.programs_reused;
+            continue;
+        }
         MetalGeneration::Pass pass;
         pass.model_index = source.model_index;
         pass.ray_trace = source.ray_trace;
@@ -617,6 +668,7 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
                     + "': " + ns_error(compile_error);
                 return std::nullopt;
             }
+            ++stats.programs_created;
             generation.passes.push_back(std::move(pass));
             continue;
         }
@@ -684,11 +736,40 @@ std::optional<MetalGeneration> create_generation(BackendState& backend,
             return std::nullopt;
         }
         pass.pipeline = pipeline;
+        ++stats.programs_created;
         generation.passes.push_back(std::move(pass));
     }
     generation.format = target.pixelFormat;
     generation.source_generation = build.generation;
+    ++stats.generations_prepared;
     return generation;
+}
+
+uint64_t object_identity(id object)
+{
+    return static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>((__bridge void*)object));
+}
+
+// Metal generations depend on the drawable pixel format, not on Draxul's
+// target generation, so the presentation generation stays zero.
+rezonality::GenerationShape generation_shape(
+    const MetalGeneration& generation)
+{
+    return { generation.source_generation, object_identity(generation.device),
+        static_cast<uint64_t>(generation.format), 0, generation.width,
+        generation.height };
+}
+
+rezonality::GenerationShape frame_shape(
+    const DraxulPluginMetalFrameV2& frame, id<MTLTexture> target,
+    uint64_t source_generation)
+{
+    return { source_generation,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frame.device)),
+        static_cast<uint64_t>(target.pixelFormat), 0,
+        static_cast<uint32_t>(std::max(1, frame.viewport.width)),
+        static_cast<uint32_t>(std::max(1, frame.viewport.height)) };
 }
 
 } // namespace
@@ -703,6 +784,7 @@ struct NativeBackend::Impl
     const DraxulPluginMetalFrameV2* frame = nullptr;
     const Camera* camera = nullptr;
     double animation_seconds = 0.0;
+    BackendResourceStats stats;
 };
 
 NativeBackend::NativeBackend()
@@ -726,22 +808,46 @@ bool NativeBackend::active_compatible() const
         return false;
     id<MTLTexture> target
         = (__bridge id<MTLTexture>)impl_->frame->drawable_texture;
-    return target
-        && impl_->backend.active->format == target.pixelFormat
-        && impl_->backend.active->width
-            == static_cast<uint32_t>(impl_->frame->viewport.width)
-        && impl_->backend.active->height
-            == static_cast<uint32_t>(impl_->frame->viewport.height);
+    if (!target)
+        return false;
+    const auto active = generation_shape(*impl_->backend.active);
+    return classify_generation_reuse(&active,
+               frame_shape(*impl_->frame, target, active.source_generation))
+        == GenerationReuse::Compatible;
 }
 
 BackendPreparation NativeBackend::prepare(const ShaderBuild& build)
 {
     if (!impl_->frame || !impl_->camera)
         return { false, "Rezonality Metal backend has no bound frame" };
+    const MetalGeneration* reuse = nullptr;
+    bool reuse_programs = false;
+    GenerationReuse reuse_kind = GenerationReuse::Rebuild;
+    id<MTLTexture> target
+        = (__bridge id<MTLTexture>)impl_->frame->drawable_texture;
+    if (impl_->backend.active && target)
+    {
+        const auto active = generation_shape(*impl_->backend.active);
+        reuse_kind = classify_generation_reuse(
+            &active, frame_shape(*impl_->frame, target, build.generation));
+        reuse = reuse_kind == GenerationReuse::Rebuild
+            ? nullptr
+            : &*impl_->backend.active;
+        reuse_programs = reuse_kind == GenerationReuse::ResizeTargets
+            || reuse_kind == GenerationReuse::Compatible;
+    }
     std::string error;
     impl_->prepared = create_generation(impl_->backend, build,
-        *impl_->frame, impl_->animation_seconds, *impl_->camera, error);
+        *impl_->frame, impl_->animation_seconds, *impl_->camera, reuse,
+        reuse_programs, impl_->stats, error);
+    if (impl_->prepared)
+        impl_->stats.last_reuse = reuse_kind;
     return { impl_->prepared.has_value(), std::move(error) };
+}
+
+BackendResourceStats NativeBackend::resource_stats() const
+{
+    return impl_->stats;
 }
 
 void NativeBackend::activate_prepared()
