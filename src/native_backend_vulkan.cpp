@@ -82,24 +82,36 @@ struct VulkanModelResource
     bool acceleration_structures_built = false;
 };
 
-struct VulkanPassResource
+// Viewport-size-independent pass state: layouts, pipelines, the offscreen
+// render pass, and the ray shader binding table. Shared by every generation
+// prepared from the same source build for the same presentation target.
+struct VulkanPassProgram
 {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    // Borrowed from Draxul (not destroyed) when `direct`.
     VkRenderPass render_pass = VK_NULL_HANDLE;
-    VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkDescriptorSetLayout uniform_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout sampler_layout = VK_NULL_HANDLE;
-    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-    VkDescriptorSet uniform_set = VK_NULL_HANDLE;
-    VkDescriptorSet sampler_set = VK_NULL_HANDLE;
     VkDescriptorSetLayout ray_layout = VK_NULL_HANDLE;
-    VkDescriptorSet ray_set = VK_NULL_HANDLE;
     draxul::vkresources::BufferResource shader_binding_table;
     VkStridedDeviceAddressRegionKHR raygen_region{};
     VkStridedDeviceAddressRegionKHR miss_region{};
     VkStridedDeviceAddressRegionKHR hit_region{};
     VkStridedDeviceAddressRegionKHR callable_region{};
+    bool direct = false;
+};
+
+// Per-generation pass bindings. The framebuffer and descriptor sets refer to
+// viewport-sized surfaces, so they are recreated with every generation.
+struct VulkanPassResource
+{
+    std::shared_ptr<VulkanPassProgram> program;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet uniform_set = VK_NULL_HANDLE;
+    VkDescriptorSet sampler_set = VK_NULL_HANDLE;
+    VkDescriptorSet ray_set = VK_NULL_HANDLE;
     std::vector<size_t> target_surfaces;
     std::optional<size_t> model_index;
     bool ray_trace = false;
@@ -127,8 +139,13 @@ struct VulkanGeneration
     draxul::vkresources::BufferResource uniform_buffer;
     size_t uniform_stride = 0;
     uint32_t buffered_frame_count = 1;
-    std::vector<VulkanSurfaceResource> surfaces;
-    std::vector<VulkanModelResource> models;
+    // Surfaces, models, and pass programs are reference counted so a
+    // viewport-only regeneration can share the immutable ones with the
+    // generation it replaces. Each is destroyed when the last generation that
+    // references it is destroyed, which retirement defers until every frame
+    // slot that used that generation has completed.
+    std::vector<std::shared_ptr<VulkanSurfaceResource>> surfaces;
+    std::vector<std::shared_ptr<VulkanModelResource>> models;
     std::vector<VulkanPassResource> passes;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -173,86 +190,135 @@ void destroy_vertex_resources(
     resources = {};
 }
 
-void destroy_model_texture(
-    VulkanGeneration& generation, VulkanModelTextureResource& texture)
+void destroy_model_texture(VkDevice device, VmaAllocator allocator,
+    VulkanModelTextureResource& texture)
 {
-    draxul::vkresources::destroy_buffer(
-        generation.allocator, texture.upload_buffer);
+    draxul::vkresources::destroy_buffer(allocator, texture.upload_buffer);
     if (texture.sampler)
-        vkDestroySampler(generation.device, texture.sampler, nullptr);
+        vkDestroySampler(device, texture.sampler, nullptr);
     draxul::vkresources::destroy_attachment(
-        generation.device, generation.allocator, texture.attachment);
+        device, allocator, texture.attachment);
     texture = {};
+}
+
+void destroy_surface(VkDevice device, VmaAllocator allocator,
+    VulkanSurfaceResource& surface)
+{
+    if (surface.sampler)
+        vkDestroySampler(device, surface.sampler, nullptr);
+    draxul::vkresources::destroy_attachment(
+        device, allocator, surface.attachment);
+    draxul::vkresources::destroy_buffer(allocator, surface.upload_buffer);
+    for (auto& buffer : surface.audio_upload_buffers)
+        draxul::vkresources::destroy_buffer(allocator, buffer);
+    surface = {};
+}
+
+void destroy_model(VkDevice device, VmaAllocator allocator,
+    PFN_vkDestroyAccelerationStructureKHR destroy_acceleration_structure,
+    VulkanModelResource& model)
+{
+    if (model.tlas && destroy_acceleration_structure)
+        destroy_acceleration_structure(device, model.tlas, nullptr);
+    if (model.blas && destroy_acceleration_structure)
+        destroy_acceleration_structure(device, model.blas, nullptr);
+    if (model.descriptor_pool)
+        vkDestroyDescriptorPool(device, model.descriptor_pool, nullptr);
+    if (model.descriptor_layout)
+        vkDestroyDescriptorSetLayout(device, model.descriptor_layout, nullptr);
+    for (auto& slots : model.textures)
+        for (auto& texture : slots)
+            destroy_model_texture(device, allocator, texture);
+    draxul::vkresources::destroy_buffer(allocator, model.vertex_buffer);
+    draxul::vkresources::destroy_buffer(allocator, model.index_buffer);
+    draxul::vkresources::destroy_buffer(allocator, model.material_buffer);
+    draxul::vkresources::destroy_buffer(allocator, model.as_instance_buffer);
+    draxul::vkresources::destroy_buffer(allocator, model.as_scratch_buffer);
+    draxul::vkresources::destroy_buffer(allocator, model.tlas_buffer);
+    draxul::vkresources::destroy_buffer(allocator, model.blas_buffer);
+    model = {};
+}
+
+void destroy_pass_program(VkDevice device, VmaAllocator allocator,
+    VulkanPassProgram& program)
+{
+    if (program.pipeline)
+        vkDestroyPipeline(device, program.pipeline, nullptr);
+    if (program.layout)
+        vkDestroyPipelineLayout(device, program.layout, nullptr);
+    if (program.render_pass && !program.direct)
+        vkDestroyRenderPass(device, program.render_pass, nullptr);
+    if (program.uniform_layout)
+        vkDestroyDescriptorSetLayout(device, program.uniform_layout, nullptr);
+    if (program.sampler_layout)
+        vkDestroyDescriptorSetLayout(device, program.sampler_layout, nullptr);
+    if (program.ray_layout)
+        vkDestroyDescriptorSetLayout(device, program.ray_layout, nullptr);
+    draxul::vkresources::destroy_buffer(
+        allocator, program.shader_binding_table);
+    program = {};
+}
+
+// Wraps a native resource in shared ownership whose last release destroys it
+// with the device and allocator that created it.
+template <typename Resource, typename Destroy>
+std::shared_ptr<Resource> share_native(Resource resource, Destroy destroy)
+{
+    return std::shared_ptr<Resource>(new Resource(std::move(resource)),
+        [destroy](Resource* owned) {
+            destroy(*owned);
+            delete owned;
+        });
+}
+
+std::shared_ptr<VulkanSurfaceResource> share_surface(
+    const VulkanGeneration& generation, VulkanSurfaceResource&& surface)
+{
+    return share_native(std::move(surface),
+        [device = generation.device, allocator = generation.allocator](
+            VulkanSurfaceResource& owned) {
+            destroy_surface(device, allocator, owned);
+        });
+}
+
+std::shared_ptr<VulkanModelResource> share_model(
+    const VulkanGeneration& generation)
+{
+    return share_native(VulkanModelResource{},
+        [device = generation.device, allocator = generation.allocator,
+            destroy_acceleration_structure
+            = generation.ray.destroy_acceleration_structure](
+            VulkanModelResource& owned) {
+            destroy_model(
+                device, allocator, destroy_acceleration_structure, owned);
+        });
+}
+
+std::shared_ptr<VulkanPassProgram> share_pass_program(
+    const VulkanGeneration& generation)
+{
+    return share_native(VulkanPassProgram{},
+        [device = generation.device, allocator = generation.allocator](
+            VulkanPassProgram& owned) {
+            destroy_pass_program(device, allocator, owned);
+        });
 }
 
 void destroy_generation(VulkanGeneration& generation)
 {
+    // Per-generation bindings first; shared programs, surfaces, and models
+    // are destroyed here only when this was their last generation.
     for (auto& pass : generation.passes)
     {
-        if (pass.pipeline)
-            vkDestroyPipeline(generation.device, pass.pipeline, nullptr);
-        if (pass.layout)
-            vkDestroyPipelineLayout(generation.device, pass.layout, nullptr);
         if (pass.framebuffer)
             vkDestroyFramebuffer(generation.device, pass.framebuffer, nullptr);
-        if (pass.render_pass && !pass.direct)
-            vkDestroyRenderPass(generation.device, pass.render_pass, nullptr);
         if (pass.descriptor_pool)
             vkDestroyDescriptorPool(generation.device, pass.descriptor_pool, nullptr);
-        if (pass.uniform_layout)
-            vkDestroyDescriptorSetLayout(generation.device, pass.uniform_layout, nullptr);
-        if (pass.sampler_layout)
-            vkDestroyDescriptorSetLayout(generation.device, pass.sampler_layout, nullptr);
-        if (pass.ray_layout)
-            vkDestroyDescriptorSetLayout(
-                generation.device, pass.ray_layout, nullptr);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, pass.shader_binding_table);
+        pass.program.reset();
     }
-    for (auto& surface : generation.surfaces)
-    {
-        if (surface.sampler)
-            vkDestroySampler(generation.device, surface.sampler, nullptr);
-        draxul::vkresources::destroy_attachment(
-            generation.device, generation.allocator, surface.attachment);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, surface.upload_buffer);
-        for (auto& buffer : surface.audio_upload_buffers)
-            draxul::vkresources::destroy_buffer(
-                generation.allocator, buffer);
-    }
-    for (auto& model : generation.models)
-    {
-        if (model.tlas && generation.ray.destroy_acceleration_structure)
-            generation.ray.destroy_acceleration_structure(
-                generation.device, model.tlas, nullptr);
-        if (model.blas && generation.ray.destroy_acceleration_structure)
-            generation.ray.destroy_acceleration_structure(
-                generation.device, model.blas, nullptr);
-        if (model.descriptor_pool)
-            vkDestroyDescriptorPool(
-                generation.device, model.descriptor_pool, nullptr);
-        if (model.descriptor_layout)
-            vkDestroyDescriptorSetLayout(
-                generation.device, model.descriptor_layout, nullptr);
-        for (auto& slots : model.textures)
-            for (auto& texture : slots)
-                destroy_model_texture(generation, texture);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, model.vertex_buffer);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, model.index_buffer);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, model.material_buffer);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, model.as_instance_buffer);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, model.as_scratch_buffer);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, model.tlas_buffer);
-        draxul::vkresources::destroy_buffer(
-            generation.allocator, model.blas_buffer);
-    }
+    generation.passes.clear();
+    generation.surfaces.clear();
+    generation.models.clear();
     draxul::vkresources::destroy_buffer(
         generation.allocator, generation.uniform_buffer);
     generation = {};
@@ -430,7 +496,7 @@ std::optional<size_t> find_surface(
     const VulkanGeneration& generation, std::string_view name)
 {
     for (size_t index = 0; index < generation.surfaces.size(); ++index)
-        if (generation.surfaces[index].name == name)
+        if (generation.surfaces[index]->name == name)
             return index;
     return std::nullopt;
 }
@@ -559,7 +625,8 @@ bool create_surface(VulkanGeneration& generation,
         vmaFlushAllocation(generation.allocator,
             surface.upload_buffer.allocation, 0, byte_size);
     }
-    generation.surfaces.push_back(std::move(surface));
+    generation.surfaces.push_back(
+        share_surface(generation, std::move(surface)));
     return true;
 }
 
@@ -654,7 +721,8 @@ bool create_model_texture(VulkanGeneration& generation,
                 && candidate.upload_buffer.mapped != nullptr;
         },
         [&](VulkanModelTextureResource& candidate) {
-            destroy_model_texture(generation, candidate);
+            destroy_model_texture(
+                generation.device, generation.allocator, candidate);
         },
         [&](VulkanModelTextureResource&& candidate) {
             texture = std::move(candidate);
@@ -1002,68 +1070,13 @@ bool create_model(VulkanGeneration& generation,
             generation, source, model, error);
 }
 
-bool create_pass_render_target(VulkanGeneration& generation,
-    const ShaderBuild::Pass& source, VulkanPassResource& pass,
-    std::string& error)
+bool create_offscreen_render_pass(const VulkanGeneration& generation,
+    const ShaderBuild::Pass& source,
+    const std::vector<VkAttachmentDescription>& attachments,
+    const std::vector<VkAttachmentReference>& colors,
+    const std::optional<VkAttachmentReference>& depth,
+    VkRenderPass& output, std::string& error)
 {
-    std::vector<VkAttachmentDescription> attachments;
-    std::vector<VkAttachmentReference> colors;
-    std::optional<VkAttachmentReference> depth;
-    std::vector<VkImageView> views;
-    for (const std::string& target : source.targets)
-    {
-        if (target == "default_color" || target == "default_depth")
-        {
-            if (target == "default_color")
-                pass.direct = true;
-            continue;
-        }
-        const auto index = find_surface(generation, target);
-        if (!index)
-        {
-            error = "Pass '" + source.name
-                + "' references unknown target '" + target + "'";
-            return false;
-        }
-        pass.target_surfaces.push_back(*index);
-        const auto& surface = generation.surfaces[*index];
-        VkAttachmentDescription attachment{};
-        attachment.format = surface.format;
-        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-        attachment.loadOp = source.has_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                             : VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachment.initialLayout
-            = surface.aspect == VK_IMAGE_ASPECT_DEPTH_BIT
-            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        attachment.finalLayout = attachment.initialLayout;
-        const uint32_t attachment_index
-            = static_cast<uint32_t>(attachments.size());
-        attachments.push_back(attachment);
-        views.push_back(surface.attachment.view);
-        if (surface.aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
-            depth = VkAttachmentReference{ attachment_index,
-                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-        else
-            colors.push_back({ attachment_index,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
-    }
-    if (pass.direct)
-    {
-        pass.render_pass = generation.render_pass;
-        return true;
-    }
-    if (colors.empty())
-    {
-        error = "Pass '" + source.name + "' has no color target";
-        return false;
-    }
-    if (!rezonality::detail::validate_color_target_count(source.name,
-            colors.size(), generation.max_color_attachments, error))
-        return false;
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = static_cast<uint32_t>(colors.size());
@@ -1115,17 +1128,95 @@ bool create_pass_render_target(VulkanGeneration& generation,
     render_pass.dependencyCount = 2;
     render_pass.pDependencies = dependencies;
     if (vkCreateRenderPass(generation.device, &render_pass, nullptr,
-            &pass.render_pass)
+            &output)
         != VK_SUCCESS)
     {
         error = "Rezonality could not create render pass '" + source.name + "'";
         return false;
     }
-    const auto& first = generation.surfaces[pass.target_surfaces.front()];
+    return true;
+}
+
+// Resolves the pass's targets and creates its framebuffer. A fresh program
+// also gets its offscreen render pass; a reused program keeps the one it has,
+// which stays compatible because the formats and load operations come from
+// the same source build.
+bool create_pass_render_target(VulkanGeneration& generation,
+    const ShaderBuild::Pass& source, VulkanPassResource& pass,
+    bool reuse_program, std::string& error)
+{
+    VulkanPassProgram& program = *pass.program;
+    std::vector<VkAttachmentDescription> attachments;
+    std::vector<VkAttachmentReference> colors;
+    std::optional<VkAttachmentReference> depth;
+    std::vector<VkImageView> views;
+    for (const std::string& target : source.targets)
+    {
+        if (target == "default_color" || target == "default_depth")
+        {
+            if (target == "default_color")
+                pass.direct = true;
+            continue;
+        }
+        const auto index = find_surface(generation, target);
+        if (!index)
+        {
+            error = "Pass '" + source.name
+                + "' references unknown target '" + target + "'";
+            return false;
+        }
+        pass.target_surfaces.push_back(*index);
+        const auto& surface = *generation.surfaces[*index];
+        VkAttachmentDescription attachment{};
+        attachment.format = surface.format;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = source.has_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                             : VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.initialLayout
+            = surface.aspect == VK_IMAGE_ASPECT_DEPTH_BIT
+            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        attachment.finalLayout = attachment.initialLayout;
+        const uint32_t attachment_index
+            = static_cast<uint32_t>(attachments.size());
+        attachments.push_back(attachment);
+        views.push_back(surface.attachment.view);
+        if (surface.aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+            depth = VkAttachmentReference{ attachment_index,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+        else
+            colors.push_back({ attachment_index,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
+    }
+    if (pass.direct)
+    {
+        if (!reuse_program)
+        {
+            program.direct = true;
+            program.render_pass = generation.render_pass;
+        }
+        return true;
+    }
+    if (colors.empty())
+    {
+        error = "Pass '" + source.name + "' has no color target";
+        return false;
+    }
+    if (!rezonality::detail::validate_color_target_count(source.name,
+            colors.size(), generation.max_color_attachments, error))
+        return false;
+    if (!reuse_program
+        && !create_offscreen_render_pass(generation, source, attachments,
+            colors, depth, program.render_pass, error))
+        return false;
+    const auto& first = *generation.surfaces[pass.target_surfaces.front()];
     VkFramebufferCreateInfo framebuffer{
         VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
     };
-    framebuffer.renderPass = pass.render_pass;
+    framebuffer.renderPass = program.render_pass;
     framebuffer.attachmentCount = static_cast<uint32_t>(views.size());
     framebuffer.pAttachments = views.data();
     framebuffer.width = first.width;
@@ -1141,9 +1232,8 @@ bool create_pass_render_target(VulkanGeneration& generation,
     return true;
 }
 
-bool create_pass_descriptors(VulkanGeneration& generation,
-    const ShaderBuild::Pass& source, VulkanPassResource& pass,
-    std::string& error)
+bool create_pass_set_layouts(VulkanGeneration& generation,
+    const ShaderBuild::Pass& source, VulkanPassProgram& program)
 {
     VkDescriptorSetLayoutBinding uniform_binding{};
     uniform_binding.binding = 0;
@@ -1158,7 +1248,7 @@ bool create_pass_descriptors(VulkanGeneration& generation,
     uniform_info.bindingCount = 1;
     uniform_info.pBindings = &uniform_binding;
     if (vkCreateDescriptorSetLayout(generation.device, &uniform_info,
-            nullptr, &pass.uniform_layout)
+            nullptr, &program.uniform_layout)
         != VK_SUCCESS)
         return false;
 
@@ -1173,9 +1263,20 @@ bool create_pass_descriptors(VulkanGeneration& generation,
     sampler_info.bindingCount
         = static_cast<uint32_t>(sampler_bindings.size());
     sampler_info.pBindings = sampler_bindings.data();
-    if (vkCreateDescriptorSetLayout(generation.device, &sampler_info,
-            nullptr, &pass.sampler_layout)
-        != VK_SUCCESS)
+    return vkCreateDescriptorSetLayout(generation.device, &sampler_info,
+               nullptr, &program.sampler_layout)
+        == VK_SUCCESS;
+}
+
+// Allocates and writes the pass's per-generation descriptor sets. A fresh
+// program also gets its set layouts and pipeline layout; a reused program's
+// layouts already match this source build.
+bool create_pass_descriptors(VulkanGeneration& generation,
+    const ShaderBuild::Pass& source, VulkanPassResource& pass,
+    bool reuse_program, std::string& error)
+{
+    VulkanPassProgram& program = *pass.program;
+    if (!reuse_program && !create_pass_set_layouts(generation, source, program))
         return false;
 
     const VkDescriptorPoolSize sizes[] = {
@@ -1192,7 +1293,7 @@ bool create_pass_descriptors(VulkanGeneration& generation,
         != VK_SUCCESS)
         return false;
     const VkDescriptorSetLayout layouts[]
-        = { pass.uniform_layout, pass.sampler_layout };
+        = { program.uniform_layout, program.sampler_layout };
     VkDescriptorSet sets[2]{};
     VkDescriptorSetAllocateInfo allocation{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
@@ -1228,14 +1329,14 @@ bool create_pass_descriptors(VulkanGeneration& generation,
         const auto surface_index
             = find_surface(generation, source.samplers[index].surface);
         if (!surface_index
-            || generation.surfaces[*surface_index].aspect
+            || generation.surfaces[*surface_index]->aspect
                 != VK_IMAGE_ASPECT_COLOR_BIT)
         {
             error = "Pass '" + source.name + "' references unknown sampler '"
                 + source.samplers[index].surface + "'";
             return false;
         }
-        const auto& surface = generation.surfaces[*surface_index];
+        const auto& surface = *generation.surfaces[*surface_index];
         images.push_back({ surface.sampler, surface.attachment.view,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
         VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
@@ -1250,7 +1351,7 @@ bool create_pass_descriptors(VulkanGeneration& generation,
         vkUpdateDescriptorSets(generation.device,
             static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     std::vector<VkDescriptorSetLayout> set_layouts
-        = { pass.uniform_layout, pass.sampler_layout };
+        = { program.uniform_layout, program.sampler_layout };
     if (source.model_index)
     {
         if (*source.model_index >= generation.models.size())
@@ -1261,8 +1362,10 @@ bool create_pass_descriptors(VulkanGeneration& generation,
         }
         pass.model_index = source.model_index;
         set_layouts.push_back(
-            generation.models[*source.model_index].descriptor_layout);
+            generation.models[*source.model_index]->descriptor_layout);
     }
+    if (reuse_program)
+        return true;
     VkPipelineLayoutCreateInfo layout{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
     };
@@ -1277,7 +1380,7 @@ bool create_pass_descriptors(VulkanGeneration& generation,
         layout.pPushConstantRanges = &material_index;
     }
     if (vkCreatePipelineLayout(generation.device, &layout, nullptr,
-            &pass.layout)
+            &program.layout)
         != VK_SUCCESS)
     {
         error = "Rezonality could not create descriptors for pass '"
@@ -1353,34 +1456,9 @@ bool load_ray_functions(VulkanGeneration& generation,
     return true;
 }
 
-bool create_ray_pass(VulkanGeneration& generation,
-    const ShaderBuild::Pass& source, VulkanPassResource& pass,
-    VkPhysicalDevice physical_device, std::string& error)
+bool create_ray_set_layouts(
+    VulkanGeneration& generation, VulkanPassProgram& program)
 {
-    if (!source.model_index
-        || *source.model_index >= generation.models.size())
-    {
-        error = "Ray pass '" + source.name + "' has no valid model";
-        return false;
-    }
-    if (source.targets.size() != 1)
-    {
-        error = "Ray pass '" + source.name
-            + "' must have exactly one storage-image target";
-        return false;
-    }
-    const auto target = find_surface(generation, source.targets.front());
-    if (!target
-        || generation.surfaces[*target].aspect != VK_IMAGE_ASPECT_COLOR_BIT)
-    {
-        error = "Ray pass '" + source.name
-            + "' references an invalid storage-image target";
-        return false;
-    }
-    pass.ray_trace = true;
-    pass.model_index = source.model_index;
-    pass.target_surfaces.push_back(*target);
-
     VkDescriptorSetLayoutBinding uniform_binding{};
     uniform_binding.binding = 0;
     uniform_binding.descriptorType
@@ -1394,7 +1472,7 @@ bool create_ray_pass(VulkanGeneration& generation,
     uniform_info.bindingCount = 1;
     uniform_info.pBindings = &uniform_binding;
     if (vkCreateDescriptorSetLayout(generation.device, &uniform_info,
-            nullptr, &pass.uniform_layout)
+            nullptr, &program.uniform_layout)
         != VK_SUCCESS)
         return false;
     const std::array ray_bindings{
@@ -1413,9 +1491,44 @@ bool create_ray_pass(VulkanGeneration& generation,
     };
     ray_layout.bindingCount = static_cast<uint32_t>(ray_bindings.size());
     ray_layout.pBindings = ray_bindings.data();
-    if (vkCreateDescriptorSetLayout(generation.device, &ray_layout,
-            nullptr, &pass.ray_layout)
-        != VK_SUCCESS)
+    return vkCreateDescriptorSetLayout(generation.device, &ray_layout,
+               nullptr, &program.ray_layout)
+        == VK_SUCCESS;
+}
+
+// Resolves the ray pass and writes its per-generation descriptor sets (the
+// storage-image target is viewport sized). A fresh program also gets its
+// layouts, ray pipeline, and shader binding table.
+bool create_ray_pass(VulkanGeneration& generation,
+    const ShaderBuild::Pass& source, VulkanPassResource& pass,
+    VkPhysicalDevice physical_device, bool reuse_program, std::string& error)
+{
+    VulkanPassProgram& program = *pass.program;
+    if (!source.model_index
+        || *source.model_index >= generation.models.size())
+    {
+        error = "Ray pass '" + source.name + "' has no valid model";
+        return false;
+    }
+    if (source.targets.size() != 1)
+    {
+        error = "Ray pass '" + source.name
+            + "' must have exactly one storage-image target";
+        return false;
+    }
+    const auto target = find_surface(generation, source.targets.front());
+    if (!target
+        || generation.surfaces[*target]->aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+    {
+        error = "Ray pass '" + source.name
+            + "' references an invalid storage-image target";
+        return false;
+    }
+    pass.ray_trace = true;
+    pass.model_index = source.model_index;
+    pass.target_surfaces.push_back(*target);
+
+    if (!reuse_program && !create_ray_set_layouts(generation, program))
         return false;
     const std::array pool_sizes{
         VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 },
@@ -1435,7 +1548,7 @@ bool create_ray_pass(VulkanGeneration& generation,
         != VK_SUCCESS)
         return false;
     const VkDescriptorSetLayout layouts[]
-        = { pass.uniform_layout, pass.ray_layout };
+        = { program.uniform_layout, program.ray_layout };
     VkDescriptorSet sets[2]{};
     VkDescriptorSetAllocateInfo allocation{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
@@ -1462,14 +1575,14 @@ bool create_ray_pass(VulkanGeneration& generation,
     vkUpdateDescriptorSets(
         generation.device, 1, &uniform_write, 0, nullptr);
 
-    auto& model = generation.models[*source.model_index];
+    auto& model = *generation.models[*source.model_index];
     VkWriteDescriptorSetAccelerationStructureKHR acceleration_write{
         VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
     };
     acceleration_write.accelerationStructureCount = 1;
     acceleration_write.pAccelerationStructures = &model.tlas;
     VkDescriptorImageInfo target_image{ VK_NULL_HANDLE,
-        generation.surfaces[*target].attachment.view,
+        generation.surfaces[*target]->attachment.view,
         VK_IMAGE_LAYOUT_GENERAL };
     const VkDescriptorBufferInfo vertex_buffer{
         model.vertex_buffer.buffer, 0, VK_WHOLE_SIZE
@@ -1499,13 +1612,15 @@ bool create_ray_pass(VulkanGeneration& generation,
     writes[3].pBufferInfo = &index_buffer;
     vkUpdateDescriptorSets(generation.device,
         static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (reuse_program)
+        return true;
     VkPipelineLayoutCreateInfo pipeline_layout{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
     };
     pipeline_layout.setLayoutCount = 2;
     pipeline_layout.pSetLayouts = layouts;
     if (vkCreatePipelineLayout(generation.device, &pipeline_layout,
-            nullptr, &pass.layout)
+            nullptr, &program.layout)
         != VK_SUCCESS)
         return false;
 
@@ -1562,10 +1677,10 @@ bool create_ray_pass(VulkanGeneration& generation,
     pipeline.groupCount = static_cast<uint32_t>(groups.size());
     pipeline.pGroups = groups.data();
     pipeline.maxPipelineRayRecursionDepth = 1;
-    pipeline.layout = pass.layout;
+    pipeline.layout = program.layout;
     const VkResult pipeline_result = generation.ray.create_pipeline(
         generation.device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipeline,
-        nullptr, &pass.pipeline);
+        nullptr, &program.pipeline);
     vkDestroyShaderModule(generation.device, raygen, nullptr);
     vkDestroyShaderModule(generation.device, miss, nullptr);
     vkDestroyShaderModule(generation.device, closest, nullptr);
@@ -1590,7 +1705,7 @@ bool create_ray_pass(VulkanGeneration& generation,
     const size_t section_stride
         = align_up(handle_stride, properties.shaderGroupBaseAlignment);
     std::vector<uint8_t> handles(handle_size * groups.size());
-    if (generation.ray.get_group_handles(generation.device, pass.pipeline,
+    if (generation.ray.get_group_handles(generation.device, program.pipeline,
             0, static_cast<uint32_t>(groups.size()), handles.size(),
             handles.data())
             != VK_SUCCESS
@@ -1599,31 +1714,37 @@ bool create_ray_pass(VulkanGeneration& generation,
                 | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             draxul::vkresources::MemoryPolicy::HostSequentialWrite,
             "rezonality-ray-sbt", nullptr,
-            pass.shader_binding_table, error))
+            program.shader_binding_table, error))
         return false;
-    auto* mapped = static_cast<uint8_t*>(pass.shader_binding_table.mapped);
+    auto* mapped = static_cast<uint8_t*>(program.shader_binding_table.mapped);
     std::memset(mapped, 0, section_stride * groups.size());
     for (size_t index = 0; index < groups.size(); ++index)
         std::memcpy(mapped + section_stride * index,
             handles.data() + handle_size * index, handle_size);
     vmaFlushAllocation(generation.allocator,
-        pass.shader_binding_table.allocation, 0,
+        program.shader_binding_table.allocation, 0,
         section_stride * groups.size());
     const VkDeviceAddress sbt_address = buffer_address(
-        generation.device, pass.shader_binding_table.buffer);
-    pass.raygen_region
+        generation.device, program.shader_binding_table.buffer);
+    program.raygen_region
         = { sbt_address, handle_stride, handle_stride };
-    pass.miss_region = { sbt_address + section_stride,
+    program.miss_region = { sbt_address + section_stride,
         handle_stride, handle_stride };
-    pass.hit_region = { sbt_address + section_stride * 2,
+    program.hit_region = { sbt_address + section_stride * 2,
         handle_stride, handle_stride };
     return true;
 }
 
+// Prepares a generation for `build`. When `reuse` is the active generation
+// of the same source build on the same device, its models and static images
+// are shared; with `reuse_programs` (same presentation target) its pass
+// programs are shared too, so only viewport-sized surfaces, framebuffers,
+// descriptor sets, and uniforms are created.
 std::optional<VulkanGeneration> create_generation(BackendState& backend,
     const ShaderBuild& build, const DraxulPluginVulkanFrameV2& frame,
     double animation_seconds, const rezonality::Camera& camera,
-    std::string& error)
+    const VulkanGeneration* reuse, bool reuse_programs,
+    rezonality::BackendResourceStats& stats, std::string& error)
 {
     if (!ensure_vertex_buffer(backend, frame, error))
         return std::nullopt;
@@ -1661,21 +1782,57 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
         && !load_ray_functions(generation,
             static_cast<VkPhysicalDevice>(frame.physical_device), error))
         return std::nullopt;
-    for (const auto& surface : build.surfaces)
-        if (!create_surface(generation, surface, generation.width,
+    // A reused generation came from this exact source build, so surface and
+    // model indices line up; the name check only guards that invariant.
+    if (reuse
+        && (reuse->surfaces.size() != build.surfaces.size()
+            || reuse->models.size() != build.models.size()
+            || reuse->passes.size() != build.passes.size()))
+    {
+        reuse = nullptr;
+        reuse_programs = false;
+    }
+    for (size_t index = 0; index < build.surfaces.size(); ++index)
+    {
+        const auto& source = build.surfaces[index];
+        if (reuse && reuse->surfaces[index]
+            && reuse->surfaces[index]->name == source.name
+            && rezonality::surface_is_viewport_independent(build, index))
+        {
+            generation.surfaces.push_back(reuse->surfaces[index]);
+            ++stats.surfaces_reused;
+            continue;
+        }
+        if (!create_surface(generation, source, generation.width,
                 generation.height, error))
         {
             destroy_generation(generation);
             return std::nullopt;
         }
-    generation.models.resize(build.models.size());
+        ++stats.surfaces_created;
+        stats.asset_upload_bytes += rezonality::surface_upload_bytes(source);
+    }
     for (size_t index = 0; index < build.models.size(); ++index)
+    {
+        if (reuse && reuse->models[index])
+        {
+            generation.models.push_back(reuse->models[index]);
+            ++stats.models_reused;
+            continue;
+        }
+        // Owned before population so a partial model is destroyed with the
+        // failed generation.
+        generation.models.push_back(share_model(generation));
         if (!create_model(generation, build.models[index],
-                generation.models[index], error))
+                *generation.models.back(), error))
         {
             destroy_generation(generation);
             return std::nullopt;
         }
+        ++stats.models_created;
+        stats.asset_upload_bytes
+            += rezonality::model_upload_bytes(build.models[index]);
+    }
     generation.uniform_stride = align_up(sizeof(CommonUniformBlock),
         static_cast<size_t>(device_properties.limits
                                 .minUniformBufferOffsetAlignment));
@@ -1786,32 +1943,49 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
     };
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates = states;
-    for (const auto& source : build.passes)
+    for (size_t pass_index = 0; pass_index < build.passes.size();
+         ++pass_index)
     {
+        const auto& source = build.passes[pass_index];
         VulkanPassResource pass;
         pass.has_clear = source.has_clear;
         std::copy(std::begin(source.clear), std::end(source.clear),
             std::begin(pass.clear));
+        const bool reuse_program = reuse_programs
+            && reuse->passes[pass_index].program
+            && reuse->passes[pass_index].ray_trace == source.ray_trace;
+        pass.program = reuse_program ? reuse->passes[pass_index].program
+                                     : share_pass_program(generation);
+        if (reuse_program)
+            ++stats.programs_reused;
         if (source.ray_trace)
         {
             if (!create_ray_pass(generation, source, pass,
                     static_cast<VkPhysicalDevice>(frame.physical_device),
-                    error))
+                    reuse_program, error))
             {
                 generation.passes.push_back(std::move(pass));
                 destroy_generation(generation);
                 return std::nullopt;
             }
+            if (!reuse_program)
+                ++stats.programs_created;
             generation.passes.push_back(std::move(pass));
             continue;
         }
         if (!create_pass_render_target(
-                generation, source, pass, error)
-            || !create_pass_descriptors(generation, source, pass, error))
+                generation, source, pass, reuse_program, error)
+            || !create_pass_descriptors(
+                generation, source, pass, reuse_program, error))
         {
             generation.passes.push_back(std::move(pass));
             destroy_generation(generation);
             return std::nullopt;
+        }
+        if (reuse_program)
+        {
+            generation.passes.push_back(std::move(pass));
+            continue;
         }
         const VkShaderModule vertex
             = create_shader(generation.device, source.vertex_spirv);
@@ -1845,7 +2019,7 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
             color_count = 0;
             for (size_t surface_index : pass.target_surfaces)
             {
-                if (generation.surfaces[surface_index].aspect
+                if (generation.surfaces[surface_index]->aspect
                     == VK_IMAGE_ASPECT_DEPTH_BIT)
                     has_depth = true;
                 else
@@ -1882,13 +2056,12 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
         pipeline_info.pDepthStencilState = &depth_stencil;
         pipeline_info.pColorBlendState = &blend;
         pipeline_info.pDynamicState = &dynamic;
-        pipeline_info.layout = pass.layout;
-        pipeline_info.renderPass = pass.render_pass;
+        pipeline_info.layout = pass.program->layout;
+        pipeline_info.renderPass = pass.program->render_pass;
         pipeline_info.subpass = 0;
-        VkPipeline pipeline = VK_NULL_HANDLE;
         const VkResult pipeline_result = vkCreateGraphicsPipelines(
             generation.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
-            &pass.pipeline);
+            &pass.program->pipeline);
         vkDestroyShaderModule(generation.device, vertex, nullptr);
         vkDestroyShaderModule(generation.device, fragment, nullptr);
         if (pipeline_result != VK_SUCCESS)
@@ -1899,16 +2072,19 @@ std::optional<VulkanGeneration> create_generation(BackendState& backend,
                 + source.name + "'";
             return std::nullopt;
         }
+        ++stats.programs_created;
         generation.passes.push_back(std::move(pass));
     }
+    ++stats.generations_prepared;
     return generation;
 }
 
 void initialize_generation_images(
     VkCommandBuffer command, VulkanGeneration& generation)
 {
-    for (auto& surface : generation.surfaces)
+    for (auto& shared_surface : generation.surfaces)
     {
+        auto& surface = *shared_surface;
         if (surface.initialized)
             continue;
         const bool depth = surface.aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -1970,7 +2146,7 @@ void initialize_generation_images(
         surface.initialized = true;
     }
     for (auto& model : generation.models)
-        for (auto& slots : model.textures)
+        for (auto& slots : model->textures)
             for (auto& texture : slots)
             {
                 if (texture.initialized)
@@ -2017,8 +2193,9 @@ void update_audio_surfaces(VkCommandBuffer command,
     if (audio.rgba.empty())
         return;
     const VkDeviceSize byte_size = audio.rgba.size() * sizeof(float);
-    for (auto& surface : generation.surfaces)
+    for (auto& shared_surface : generation.surfaces)
     {
+        auto& surface = *shared_surface;
         if (!surface.audio_analysis
             || surface.audio_generation == audio.generation
             || surface.audio_upload_buffers.empty())
@@ -2168,6 +2345,29 @@ void transition_ray_target(VkCommandBuffer command,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+uint64_t handle_identity(const void* handle)
+{
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+}
+
+rezonality::GenerationShape generation_shape(
+    const VulkanGeneration& generation)
+{
+    return { generation.source_generation,
+        handle_identity(generation.device),
+        handle_identity(generation.render_pass),
+        generation.target_generation, generation.width, generation.height };
+}
+
+rezonality::GenerationShape frame_shape(
+    const DraxulPluginVulkanFrameV2& frame, uint64_t source_generation)
+{
+    return { source_generation, handle_identity(frame.device),
+        frame.continuation_render_pass, frame.target_generation,
+        static_cast<uint32_t>(std::max(1, frame.viewport.width)),
+        static_cast<uint32_t>(std::max(1, frame.viewport.height)) };
+}
+
 } // namespace
 
 namespace rezonality
@@ -2180,6 +2380,7 @@ struct NativeBackend::Impl
     const DraxulPluginVulkanFrameV2* frame = nullptr;
     const Camera* camera = nullptr;
     double animation_seconds = 0.0;
+    BackendResourceStats stats;
 };
 
 NativeBackend::NativeBackend()
@@ -2189,6 +2390,10 @@ NativeBackend::NativeBackend()
 
 NativeBackend::~NativeBackend()
 {
+    // Shared resources are released by their last generation; every
+    // generation must go before the allocator does.
+    if (impl_->prepared)
+        destroy_generation(*impl_->prepared);
     destroy_backend(impl_->backend);
 }
 
@@ -2204,25 +2409,45 @@ bool NativeBackend::active_compatible() const
 {
     if (!impl_->frame || !impl_->backend.active)
         return false;
-    const VkRenderPass render_pass = reinterpret_cast<VkRenderPass>(
-        static_cast<uintptr_t>(impl_->frame->continuation_render_pass));
-    return impl_->backend.active->target_generation
-            == impl_->frame->target_generation
-        && impl_->backend.active->render_pass == render_pass
-        && impl_->backend.active->width
-            == static_cast<uint32_t>(impl_->frame->viewport.width)
-        && impl_->backend.active->height
-            == static_cast<uint32_t>(impl_->frame->viewport.height);
+    const auto active = generation_shape(*impl_->backend.active);
+    return classify_generation_reuse(&active,
+               frame_shape(*impl_->frame, active.source_generation))
+        == GenerationReuse::Compatible;
 }
 
 BackendPreparation NativeBackend::prepare(const ShaderBuild& build)
 {
     if (!impl_->frame || !impl_->camera)
         return { false, "Rezonality Vulkan backend has no bound frame" };
+    // Reuse is decided before preparation touches the backend: a device
+    // change classifies as Rebuild, so no pointer into a generation that
+    // ensure_vertex_buffer() may destroy is retained.
+    const VulkanGeneration* reuse = nullptr;
+    bool reuse_programs = false;
+    GenerationReuse reuse_kind = GenerationReuse::Rebuild;
+    if (impl_->backend.active)
+    {
+        const auto active = generation_shape(*impl_->backend.active);
+        reuse_kind = classify_generation_reuse(
+            &active, frame_shape(*impl_->frame, build.generation));
+        reuse = reuse_kind == GenerationReuse::Rebuild
+            ? nullptr
+            : &*impl_->backend.active;
+        reuse_programs = reuse_kind == GenerationReuse::ResizeTargets
+            || reuse_kind == GenerationReuse::Compatible;
+    }
     std::string error;
     impl_->prepared = create_generation(impl_->backend, build,
-        *impl_->frame, impl_->animation_seconds, *impl_->camera, error);
+        *impl_->frame, impl_->animation_seconds, *impl_->camera, reuse,
+        reuse_programs, impl_->stats, error);
+    if (impl_->prepared)
+        impl_->stats.last_reuse = reuse_kind;
     return { impl_->prepared.has_value(), std::move(error) };
+}
+
+BackendResourceStats NativeBackend::resource_stats() const
+{
+    return impl_->stats;
 }
 
 void NativeBackend::activate_prepared()
@@ -2301,23 +2526,25 @@ DraxulPluginRenderResultV2 NativeBackend::record(
     {
         if (pass.ray_trace)
         {
-            auto& model = impl_->backend.active->models[*pass.model_index];
+            auto& model = *impl_->backend.active->models[*pass.model_index];
             build_model_acceleration_structures(
                 command, *impl_->backend.active, model);
-            const auto& target = impl_->backend.active->surfaces[pass.target_surfaces.front()];
+            const auto& target = *impl_->backend.active->surfaces[pass.target_surfaces.front()];
+            const VulkanPassProgram& program = *pass.program;
             transition_ray_target(command, target, true);
             vkCmdBindPipeline(command,
-                VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pass.pipeline);
+                VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, program.pipeline);
             const VkDescriptorSet sets[]
                 = { pass.uniform_set, pass.ray_set };
             const uint32_t dynamic_offset
                 = static_cast<uint32_t>(uniform_offset);
             vkCmdBindDescriptorSets(command,
-                VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pass.layout, 0, 2,
+                VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, program.layout, 0, 2,
                 sets, 1, &dynamic_offset);
             impl_->backend.active->ray.cmd_trace(command,
-                &pass.raygen_region, &pass.miss_region, &pass.hit_region,
-                &pass.callable_region, target.width, target.height, 1);
+                &program.raygen_region, &program.miss_region,
+                &program.hit_region, &program.callable_region, target.width,
+                target.height, 1);
             transition_ray_target(command, target, false);
             continue;
         }
@@ -2337,14 +2564,14 @@ DraxulPluginRenderResultV2 NativeBackend::record(
         }
         else if (!pass.target_surfaces.empty())
         {
-            const auto& target = impl_->backend.active->surfaces[pass.target_surfaces.front()];
+            const auto& target = *impl_->backend.active->surfaces[pass.target_surfaces.front()];
             target_width = target.width;
             target_height = target.height;
         }
         std::vector<VkClearValue> clears(pass.target_surfaces.size());
         for (size_t index = 0; index < pass.target_surfaces.size(); ++index)
         {
-            const auto& target = impl_->backend.active->surfaces[pass.target_surfaces[index]];
+            const auto& target = *impl_->backend.active->surfaces[pass.target_surfaces[index]];
             if (target.aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
                 clears[index].depthStencil = { 1.0f, 0 };
             else
@@ -2354,7 +2581,7 @@ DraxulPluginRenderResultV2 NativeBackend::record(
         VkRenderPassBeginInfo begin{
             VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
         };
-        begin.renderPass = pass.render_pass;
+        begin.renderPass = pass.program->render_pass;
         begin.framebuffer = framebuffer;
         begin.renderArea.extent = { target_width, target_height };
         begin.clearValueCount = static_cast<uint32_t>(clears.size());
@@ -2383,26 +2610,26 @@ DraxulPluginRenderResultV2 NativeBackend::record(
         vkCmdSetViewport(command, 0, 1, &viewport);
         vkCmdSetScissor(command, 0, 1, &scissor);
         vkCmdBindPipeline(
-            command, VK_PIPELINE_BIND_POINT_GRAPHICS, pass.pipeline);
+            command, VK_PIPELINE_BIND_POINT_GRAPHICS, pass.program->pipeline);
         std::vector<VkDescriptorSet> sets
             = { pass.uniform_set, pass.sampler_set };
         if (pass.model_index)
-            sets.push_back(impl_->backend.active->models[*pass.model_index].descriptor_set);
+            sets.push_back(impl_->backend.active->models[*pass.model_index]->descriptor_set);
         const uint32_t dynamic_offset
             = static_cast<uint32_t>(uniform_offset);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pass.layout, 0, static_cast<uint32_t>(sets.size()),
+            pass.program->layout, 0, static_cast<uint32_t>(sets.size()),
             sets.data(), 1, &dynamic_offset);
         if (pass.model_index)
         {
-            const auto& model = impl_->backend.active->models[*pass.model_index];
+            const auto& model = *impl_->backend.active->models[*pass.model_index];
             vkCmdBindVertexBuffers(command, 0, 1,
                 &model.vertex_buffer.buffer, &offset);
             vkCmdBindIndexBuffer(command, model.index_buffer.buffer, 0,
                 VK_INDEX_TYPE_UINT32);
             for (const auto& part : model.parts)
             {
-                vkCmdPushConstants(command, pass.layout,
+                vkCmdPushConstants(command, pass.program->layout,
                     VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t),
                     &part.material_index);
                 vkCmdDrawIndexed(command, part.index_count, 1,

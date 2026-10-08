@@ -2,6 +2,7 @@
 
 #include "runtime_controller.h"
 #include "animation_clock.h"
+#include "generation_reuse.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -270,4 +271,75 @@ TEST_CASE("Rezonality runtime preserves last good state after failures",
     CHECK(activated_retry.surface_count == 3);
     REQUIRE(runtime.active_build());
     CHECK(runtime.active_build()->generation == 7);
+}
+
+// Both native backends (Vulkan cannot run on macOS CI) share this rule, so it
+// is pinned here independently of a GPU.
+TEST_CASE("Rezonality native generations keep source assets across resizes",
+    "[rezonality][runtime][resize]")
+{
+    using rezonality::GenerationReuse;
+    const rezonality::GenerationShape active{ 4, 10, 20, 3, 640, 480 };
+    CHECK(rezonality::classify_generation_reuse(nullptr, active)
+        == GenerationReuse::Rebuild);
+    CHECK(rezonality::classify_generation_reuse(&active, active)
+        == GenerationReuse::Compatible);
+
+    auto resized = active;
+    resized.width = 800;
+    CHECK(rezonality::classify_generation_reuse(&active, resized)
+        == GenerationReuse::ResizeTargets);
+    resized.width = active.width;
+    resized.height = 1;
+    CHECK(rezonality::classify_generation_reuse(&active, resized)
+        == GenerationReuse::ResizeTargets);
+
+    // A new presentation target (Vulkan swapchain render pass or target
+    // generation, Metal pixel format) keeps models and images only.
+    auto retargeted = resized;
+    retargeted.presentation = 21;
+    CHECK(rezonality::classify_generation_reuse(&active, retargeted)
+        == GenerationReuse::ReuseAssets);
+    retargeted.presentation = active.presentation;
+    retargeted.presentation_generation = 4;
+    CHECK(rezonality::classify_generation_reuse(&active, retargeted)
+        == GenerationReuse::ReuseAssets);
+
+    // A different source build or device shares nothing.
+    auto reloaded = resized;
+    reloaded.source_generation = 5;
+    CHECK(rezonality::classify_generation_reuse(&active, reloaded)
+        == GenerationReuse::Rebuild);
+    auto other_device = active;
+    other_device.device = 11;
+    CHECK(rezonality::classify_generation_reuse(&active, other_device)
+        == GenerationReuse::Rebuild);
+
+    rezonality::ShaderBuild build;
+    build.surfaces.resize(5);
+    build.surfaces[0].name = "Color";
+    build.surfaces[1].name = "Image";
+    build.surfaces[1].image_width = 2;
+    build.surfaces[1].image_height = 2;
+    build.surfaces[1].image_pixels.assign(16, 255);
+    build.surfaces[2].name = "Audio";
+    build.surfaces[2].image_width = 2;
+    build.surfaces[2].image_height = 2;
+    build.surfaces[2].image_float_pixels.assign(16, 0.0f);
+    build.surfaces[2].audio_analysis = true;
+    build.surfaces[3] = build.surfaces[1];
+    build.surfaces[3].name = "PaintedImage";
+    build.surfaces[4] = build.surfaces[1];
+    build.surfaces[4].name = "SizedTarget";
+    build.surfaces[4].image_pixels.clear();
+    build.passes.resize(1);
+    build.passes[0].targets = { "Color", "PaintedImage", "SizedTarget" };
+    CHECK_FALSE(rezonality::surface_is_viewport_independent(build, 0));
+    CHECK(rezonality::surface_is_viewport_independent(build, 1));
+    CHECK_FALSE(rezonality::surface_is_viewport_independent(build, 2));
+    CHECK_FALSE(rezonality::surface_is_viewport_independent(build, 3));
+    CHECK_FALSE(rezonality::surface_is_viewport_independent(build, 4));
+    CHECK_FALSE(rezonality::surface_is_viewport_independent(build, 5));
+    CHECK(rezonality::surface_upload_bytes(build.surfaces[1]) == 16);
+    CHECK(rezonality::surface_upload_bytes(build.surfaces[2]) == 0);
 }
